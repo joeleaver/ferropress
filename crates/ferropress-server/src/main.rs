@@ -30,7 +30,7 @@ use ferropress_http::AppState;
 use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
-use ferropress_serve::ServeEngine;
+use ferropress_serve::{ServeEngine, default_theme};
 use ferropress_store_embedded::EmbeddedStore;
 
 use crate::config::{ServerConfig, TlsMode};
@@ -59,18 +59,24 @@ async fn main() -> Result<()> {
     // 2. Build the owned subsystems over the ports.
     let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs));
     let plugins = PluginHost::new();
-    let app_state = AppState {
-        store: Arc::clone(&store),
-        blobs: Arc::clone(&blobs),
-    };
+    // Build the page-chrome theme once (its template registered) and share it.
+    let theme = Arc::new(default_theme().context("building the page-chrome theme")?);
+    let app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme);
 
-    // Keep the wired-but-not-yet-driven handles named so the seam above is real.
-    let _ = (&secrets, &scheduler, &certs, &serve, &plugins, &app_state);
+    // Wired but not yet driven in v1: the scheduler, secret store, cert source,
+    // the prerender/regen `ServeEngine`, and the plugin host all come online in
+    // later increments. Named so the composition seam is real and they stay
+    // constructed (the regen loop is intentionally NOT spawned — its body is a
+    // stub today and would panic).
+    let _ = (&secrets, &scheduler, &certs, &serve, &plugins);
 
-    // 3. Boot: spawn the regen loop, then run the HTTP server until shutdown.
-    //    tokio::spawn(async move { if let Err(e) = serve.regen_loop().await { error!(?e) } });
-    //    ferropress_http::serve(app_state, cfg.bind).await?;
-    todo!("spawn the serve regen loop and run ferropress_http::serve(app_state, cfg.bind)")
+    // 3. Boot the owned HTTP server (v1 SSR-on-demand: every page renders on
+    //    request; the static-first prerender cache + change-driven regen is a
+    //    later increment).
+    ferropress_http::serve(app_state, cfg.bind)
+        .await
+        .context("running the HTTP server")?;
+    Ok(())
 }
 
 /// Select the `SecretStore` adapter: dotenv-seeded env when an env file is

@@ -13,8 +13,22 @@ ferropress-core = { workspace = true }
 ferropress-serve = { workspace = true }
 ferropress-theme = { workspace = true }
 ferropress-render = { workspace = true }
-# Owned HTTP stack. The Router/handlers land on these once routes are filled in;
-# declared now as the intended in-process serving edge (invariant #6).
+# Owned HTTP stack (invariant #6: serving is owned, never delegated).
 axum = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
+# Request/response + error logging (causes logged, never leaked to the client).
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The end-to-end test drives the real router against a real embedded store +
+# local-FS blobs (proving store -> render -> theme -> http). Depending on
+# `ferropress-store-embedded` here pulls NO rhypedb edge into http's own
+# manifest — store-embedded is the membrane (dep-graph lint flags only DIRECT
+# `rhypedb-*` deps, which stay on store-embedded/schema-sdl).
+ferropress-store-embedded = { workspace = true }
+ferropress-blob-localfs = { workspace = true }
+# `tower::ServiceExt::oneshot` feeds a synthetic request through the router with
+# no socket; tempfile gives each test run an isolated store/blob dir.
+tower = { workspace = true }
+tempfile = { workspace = true }

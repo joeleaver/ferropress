@@ -1350,12 +1350,17 @@ name = "ferropress-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ferropress-blob-localfs",
  "ferropress-core",
  "ferropress-render",
  "ferropress-serve",
+ "ferropress-store-embedded",
  "ferropress-theme",
+ "tempfile",
  "tokio",
+ "tower",
  "tower-http",
+ "tracing",
 ]
 
 [[package]]

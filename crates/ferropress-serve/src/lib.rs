@@ -10,13 +10,26 @@
 //! This crate owns the *policy* (what a change invalidates, what to re-render);
 //! it delegates the actual block-tree -> HTML to `ferropress-render` and the page
 //! chrome to `ferropress-theme`, and it never talks to a concrete store/blob
-//! backend — only the [`RhypeStore`] / [`BlobStore`] ports. STUB scaffold.
+//! backend — only the [`RhypeStore`] / [`BlobStore`] ports.
+//!
+//! Two read paths live here:
+//!   * [`content`] — the v1 **SSR-on-demand** resolver: request path -> published
+//!     entity -> rendered HTML document. This is what the HTTP fallback calls
+//!     today, and it is fully implemented.
+//!   * [`ServeEngine`] — the prerender cache + change-driven regeneration loop.
+//!     This is a later increment; its loop bodies are still `todo!()`/STUB.
 
 use std::sync::Arc;
 
 use ferropress_core::ports::BlobStore;
 use ferropress_core::query::{Change, SubscribeFilter};
 use ferropress_core::store::RhypeStore;
+
+pub mod content;
+
+pub use content::{
+    PAGE_TEMPLATE, PAGE_TEMPLATE_SRC, Resolved, default_theme, resolve_path, slug_from_path,
+};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it
