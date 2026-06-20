@@ -1,7 +1,23 @@
 # Rust
 /target/
+# xtask is a separate (excluded) crate with its own target dir, which the root
+# `/target/` rule above does not cover.
+/xtask/target/
 **/*.rs.bk
 *.pdb
+
+# fastembed downloads the ONNX embedding model here (relative to the server's CWD)
+# on first vector-search use. Never commit the model.
+.fastembed_cache/
+
+# Browser-driven verification scratch (playwright-mcp snapshots/screenshots).
+.playwright-mcp/
+
+# ferropress-islands is a wasm cdylib OUTSIDE the workspace: it has its own target
+# dir, and `cargo xtask build-islands` emits the wasm-bindgen bundle into dist/.
+# (Its Cargo.lock IS committed — reproducible wasm builds for an artifact crate.)
+/crates/ferropress-islands/target/
+/crates/ferropress-islands/dist/
 
 # Env / secrets (Ferropress uses a dotenv-style SecretStore adapter)
 .env
