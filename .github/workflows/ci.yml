@@ -1,0 +1,85 @@
+# Ferropress CI — quality gates (house style: warnings = errors, fmt from day
+# one) plus a dependency-graph lint that enforces the architecture invariants
+# (core has no rhypedb/rinch/jkbase; rhypedb lives only in the embedded adapter +
+# schema-sdl; exactly one render impl) and a zero-upstream portability leg that
+# proves ferropress-core builds with no external upstream at all.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # onnx-dynamic means the build does not download ONNX; tests that actually
+      # embed need ORT_DYLIB_PATH set in the runner (deferred until vector tests).
+      - run: cargo test --workspace
+
+  dep-graph-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Enforces: core depends on no rhypedb/rinch/jkbase; only
+      # ferropress-store-embedded touches rhypedb-engine/-subscribe; only
+      # ferropress-store-embedded + ferropress-schema-sdl touch rhypedb-schema;
+      # all rhypedb-* deps share one git rev; no rinch dep anywhere.
+      - run: cargo run --manifest-path xtask/Cargo.toml -- dep-graph-lint
+
+  # Portability boundary: ferropress-core must build entirely on its own, naming
+  # ZERO external upstream (no rhypedb, no rinch, no jkbase). Building just this
+  # package — and nothing else in the workspace — proves the boundary holds.
+  zero-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferropress-core

@@ -1,0 +1,123 @@
+# Ferropress — virtual workspace manifest.
+#
+# House style (joeleaver): virtual manifest at the root (no [package]); every
+# member lives under crates/<prefix>-<name>; all shared deps are declared ONCE
+# here and inherited with `{ workspace = true }`. Edition 2024.
+#
+# Upstream policy (CLAUDE.md §2): rinch / rhypedb / jkbase are REAL external
+# upstreams. They are NEVER depended on via `path = "../…"`. rhypedb is pulled
+# by git, pinned to an exact rev so every rhypedb-* crate resolves to the same
+# tree (they share version 0.1.0 in one repo — mixing revs is unsupported).
+#
+# rinch is DEFERRED: it has NO entry in [workspace.dependencies] yet. The admin /
+# islands / render-form crates are rinch-free compiling placeholders until the
+# upstream rinch features land.
+#
+# Dependency-graph invariant (enforced by xtask + CI): rhypedb appears ONLY on
+# ferropress-store-embedded (engine/subscribe) and ferropress-schema-sdl
+# (schema only). ferropress-core carries no rhypedb, no rinch, no jkbase.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# xtask is intentionally OUT of the workspace: it is a CI lint tool and we do not
+# want its (heavier) deps polluting the workspace dependency graph that the same
+# tool audits. It is invoked via `--manifest-path xtask/Cargo.toml`.
+exclude = ["xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joeleaver/ferropress"
+rust-version = "1.85"
+
+# ---------------------------------------------------------------------------
+# Workspace lints. Members opt in with `[lints] workspace = true`. CI gates on
+# `-D warnings`, so this is the single place the warning posture is set.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+# --- First-party crates (path; listed first per house style) -----------------
+ferropress-core            = { path = "crates/ferropress-core" }
+ferropress-schema-sdl      = { path = "crates/ferropress-schema-sdl" }
+ferropress-store-embedded  = { path = "crates/ferropress-store-embedded" }
+ferropress-render          = { path = "crates/ferropress-render" }
+ferropress-render-form     = { path = "crates/ferropress-render-form" }
+ferropress-theme           = { path = "crates/ferropress-theme" }
+ferropress-secrets-env     = { path = "crates/ferropress-secrets-env" }
+ferropress-blob-localfs    = { path = "crates/ferropress-blob-localfs" }
+ferropress-sched-tokiocron = { path = "crates/ferropress-sched-tokiocron" }
+ferropress-cert-acme       = { path = "crates/ferropress-cert-acme" }
+ferropress-plugin-host     = { path = "crates/ferropress-plugin-host" }
+ferropress-serve           = { path = "crates/ferropress-serve" }
+ferropress-http            = { path = "crates/ferropress-http" }
+ferropress-admin           = { path = "crates/ferropress-admin" }
+ferropress-islands         = { path = "crates/ferropress-islands" }
+
+# --- rhypedb (UPSTREAM, git, pinned rev) -------------------------------------
+# ALL rhypedb-* deps MUST share this exact pinned rev (the crates share one repo
+# + version 0.1.0; mixing revs is unsupported upstream). The pin is deliberate.
+# engine: default-features = false + onnx-dynamic so `cargo build` needs no
+# network and ONNX is dlopen'd at runtime (ORT_DYLIB_PATH) — the offline build
+# posture. Only ferropress-store-embedded enables engine/subscribe;
+# ferropress-schema-sdl uses rhypedb-schema (no ONNX feature surface at all).
+rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", rev = "e735be47bec1f6934be075d0dbb3fe22ccc3680f" }
+rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", rev = "e735be47bec1f6934be075d0dbb3fe22ccc3680f", default-features = false, features = ["onnx-dynamic"] }
+rhypedb-subscribe = { git = "https://github.com/joeleaver/rhypedb.git", rev = "e735be47bec1f6934be075d0dbb3fe22ccc3680f" }
+
+# --- Async runtime -----------------------------------------------------------
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures-core = "0.3"
+futures-util = "0.3"
+
+# --- HTTP / server stack -----------------------------------------------------
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+# rustls, never native-tls (house invariant). Only used if a crate needs an
+# outbound client; kept here so the pick is centralized.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# --- Serialization -----------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# --- WASM plugin runtime -----------------------------------------------------
+# Pin major; capability sandbox uses epoch_interruption + StoreLimits.
+wasmtime = "27"
+
+# --- Templating / rendering --------------------------------------------------
+minijinja = { version = "2", features = ["loader"] }
+html-escape = "0.2"
+
+# --- Scheduler / certs / secrets adapters ------------------------------------
+cron = "0.12"
+rustls-acme = "0.13"
+dotenvy = "0.15"
+
+# --- CLI / logging -----------------------------------------------------------
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- Error handling ----------------------------------------------------------
+thiserror = "2"
+anyhow = "1"
+
+# --- Common utilities --------------------------------------------------------
+bytes = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+parking_lot = "0.12"
+
+# --- Dev / test --------------------------------------------------------------
+tempfile = "3"

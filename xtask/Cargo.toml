@@ -1,0 +1,15 @@
+# xtask — Ferropress repo-maintenance / CI lint tool.
+#
+# Deliberately OUTSIDE the workspace (root Cargo.toml `exclude`): it audits the
+# workspace dependency graph, so it must not be part of it. Run via
+# `cargo run --manifest-path xtask/Cargo.toml -- <subcommand>`.
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,11 @@
+# Pinned toolchain for Ferropress.
+#
+# channel = "stable": rhypedb declares no MSRV and we are edition-2024 (needs
+# Rust 1.85+); stable tracks that. We pin an exact channel only if a build turns
+# fragile (jkbase does "1.95.0") — for now stable + the two components below.
+# wasm32 target is here because ferropress-admin / ferropress-islands compile to
+# the browser via rinch-web (once the rinch surface lands).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
