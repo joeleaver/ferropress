@@ -61,6 +61,36 @@ pub trait RhypeStore: Send + Sync + 'static {
     /// (transparently uses the reverse-edge index for `@inverse` fields).
     async fn get_links(&self, from: &Edge) -> Result<Vec<(ObjectId, FieldMap)>>;
 
+    /// Batched relation traversal: for ONE relation `field` of `type_`, resolve
+    /// the linked target ids for EACH source id in `ids`, returning one
+    /// `Vec<ObjectId>` per input id in the SAME order. This is the id-only fast
+    /// path that collapses what would otherwise be N separate [`get_links`] calls
+    /// into a single store round-trip (e.g. resolving the `parent` of every
+    /// comment on a page at once). Edge fields are intentionally dropped — callers
+    /// that need them use [`get_links`].
+    ///
+    /// The default implementation simply loops [`get_links`] (correct, but N
+    /// round-trips); the embedded adapter overrides it with the engine's native
+    /// batched traversal so production never pays the N+1.
+    async fn get_links_many(
+        &self,
+        type_: &TypeName,
+        ids: &[ObjectId],
+        field: &str,
+    ) -> Result<Vec<Vec<ObjectId>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let edge = Edge {
+                type_name: type_.clone(),
+                id,
+                field: field.to_owned(),
+            };
+            let links = self.get_links(&edge).await?;
+            out.push(links.into_iter().map(|(tid, _edge_fields)| tid).collect());
+        }
+        Ok(out)
+    }
+
     /// Indexed single-predicate scan (maps to the engine's `filter_scan*` fast
     /// path). Returns matching objects.
     async fn filter(&self, spec: FilterSpec) -> Result<Vec<Object>>;

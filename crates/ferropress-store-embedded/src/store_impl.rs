@@ -169,6 +169,33 @@ impl RhypeStore for EmbeddedStore {
             .collect())
     }
 
+    async fn get_links_many(
+        &self,
+        type_: &TypeName,
+        ids: &[ObjectId],
+        field: &str,
+    ) -> CoreResult<Vec<Vec<ObjectId>>> {
+        let db = Arc::clone(self.db());
+        let type_name = type_.as_str().to_owned();
+        let field_name = field.to_owned();
+        // `get_links_many` borrows `&[u64]`; materialize an owned Vec and lend it
+        // the slice from inside the blocking closure.
+        let source_ids: Vec<u64> = ids.iter().map(|&ObjectId(n)| n).collect();
+        let groups = join(
+            tokio::task::spawn_blocking(move || {
+                db.get_links_many(&type_name, &source_ids, &field_name)
+            })
+            .await,
+        )?;
+        // The engine returns one group per input id (same order), each a
+        // `(target_id, edge_value_bytes)` list. We only need the ids here — the
+        // raw cover bytes feed the engine's own fusion path, not this port.
+        Ok(groups
+            .into_iter()
+            .map(|pairs| pairs.into_iter().map(|(id, _bytes)| ObjectId(id)).collect())
+            .collect())
+    }
+
     async fn filter(&self, spec: FilterSpec) -> CoreResult<Vec<Object>> {
         let db = Arc::clone(self.db());
         let type_name = spec.type_name.as_str().to_owned();
