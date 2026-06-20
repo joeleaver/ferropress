@@ -57,22 +57,36 @@ async fn main() -> Result<()> {
     let store = select_store(&cfg)?;
 
     // 2. Build the owned subsystems over the ports.
-    let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs));
-    let plugins = PluginHost::new();
-    // Build the page-chrome theme once (its template registered) and share it.
+    // Build the page-chrome theme once (its template registered) and share it
+    // across BOTH the HTTP read path (`AppState`) and the regen loop
+    // (`ServeEngine`) so a prerendered page is byte-for-byte what an on-demand
+    // render would produce.
     let theme = Arc::new(default_theme().context("building the page-chrome theme")?);
+    let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), Arc::clone(&theme));
+    let plugins = PluginHost::new();
     let app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme);
 
     // Wired but not yet driven in v1: the scheduler, secret store, cert source,
-    // the prerender/regen `ServeEngine`, and the plugin host all come online in
-    // later increments. Named so the composition seam is real and they stay
-    // constructed (the regen loop is intentionally NOT spawned — its body is a
-    // stub today and would panic).
-    let _ = (&secrets, &scheduler, &certs, &serve, &plugins);
+    // and the plugin host all come online in later increments. Named so the
+    // composition seam is real and they stay constructed. (The regen loop IS now
+    // driven — spawned below — so `serve` is no longer in this discard tuple.)
+    let _ = (&secrets, &scheduler, &certs, &plugins);
 
-    // 3. Boot the owned HTTP server (v1 SSR-on-demand: every page renders on
-    //    request; the static-first prerender cache + change-driven regen is a
-    //    later increment).
+    // 3. Spawn the static-first regeneration loop as a background task BEFORE the
+    //    HTTP server boots. It subscribes to the change feed and write-throughs /
+    //    evicts the prerender cache as content changes; the HTTP read path
+    //    (`serve_path`) serves from that cache and renders-on-miss. `regen_loop`
+    //    borrows `&self`, so move `serve` into the task and own it there.
+    let serve = Arc::new(serve);
+    let regen = Arc::clone(&serve);
+    tokio::spawn(async move {
+        if let Err(e) = regen.regen_loop().await {
+            tracing::error!(error = %e, "regen loop exited");
+        }
+    });
+
+    // 4. Boot the owned HTTP server. The static-first prerender cache is now live
+    //    (cache-first read path + change-driven regen loop above).
     ferropress_http::serve(app_state, cfg.bind)
         .await
         .context("running the HTTP server")?;

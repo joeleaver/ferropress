@@ -119,9 +119,10 @@ pub fn router(state: AppState) -> Router {
             "/api/comments",
             get(island_not_implemented).post(island_not_implemented),
         )
-        // Static-first hot path is the fallback: today it always SSR-renders on
-        // demand. TODO: consult the prerender BlobStore cache first and only fall
-        // through to SSR on a miss.
+        // Static-first hot path is the fallback: it consults the prerender
+        // BlobStore cache first (via `ferropress_serve::serve_path`) and only
+        // falls through to an on-demand SSR render — populating the cache — on a
+        // miss.
         .fallback(serve_page)
         .with_state(state)
 }
@@ -139,13 +140,18 @@ async fn island_not_implemented() -> impl IntoResponse {
     (StatusCode::NOT_IMPLEMENTED, "island API not implemented")
 }
 
-/// The page fallback: resolve the request path to a published entity and render
-/// it on demand (v1 SSR). Maps the resolution outcome to a status code, logging —
-/// but never leaking — the cause of a 500.
+/// The page fallback: serve the request path **cache-first**.
+///
+/// Delegates to [`ferropress_serve::serve_path`], which tries the prerender
+/// [`BlobStore`] cache and only renders-on-demand (then populates the cache) on a
+/// miss — so the steady state is a static blob read, not a fresh render. The
+/// `Resolved` outcome maps to a status code exactly as before; the cache is
+/// best-effort inside `serve_path`, so a blob fault degrades to SSR rather than a
+/// 500. The real cause of a 500 is logged but never leaked.
 async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_owned();
 
-    match ferropress_serve::resolve_path(&state.store, &state.theme, &path).await {
+    match ferropress_serve::serve_path(&state.store, &state.blobs, &state.theme, &path).await {
         Resolved::Found(html) => (StatusCode::OK, Html(html)).into_response(),
         Resolved::NotFound => (StatusCode::NOT_FOUND, "Not Found").into_response(),
         Resolved::Error(err) => {

@@ -1439,11 +1439,15 @@ dependencies = [
 name = "ferropress-serve"
 version = "0.1.0"
 dependencies = [
+ "ferropress-blob-localfs",
  "ferropress-core",
  "ferropress-render",
+ "ferropress-store-embedded",
  "ferropress-theme",
+ "tempfile",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -1462,6 +1466,7 @@ dependencies = [
  "ferropress-serve",
  "ferropress-store-embedded",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

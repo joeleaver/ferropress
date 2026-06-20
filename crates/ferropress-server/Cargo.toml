@@ -28,5 +28,8 @@ ferropress-cert-acme = { workspace = true }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# `tracing` for the spawned regen-loop task's structured logs; `-subscriber`
+# installs the global collector at boot.
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }

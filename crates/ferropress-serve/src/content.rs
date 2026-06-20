@@ -25,11 +25,14 @@
 use std::sync::Arc;
 
 use ferropress_core::error::CoreError;
+use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{TypeName, Value};
 use ferropress_core::{BlockTree, Compare, FilterSpec, Object, PAGE_TYPE, POST_TYPE, Status};
 use ferropress_render::{RenderMode, render};
 use ferropress_theme::{PageContext, SandboxLimits, ThemeEngine, ThemeError};
+
+use crate::cache_key;
 
 /// The name of the built-in chrome template the content service renders into.
 /// Named `.html` so the MiniJinja host auto-escapes interpolations like
@@ -87,27 +90,87 @@ pub fn slug_from_path(path: &str) -> &str {
 /// hit, the stored `block_tree` JSON string is parsed, rendered in
 /// [`RenderMode::Publish`], and wrapped in the `PAGE_TEMPLATE` chrome.
 ///
-/// TODO (prerender cache): before this on-demand render, consult the prerender
-/// `BlobStore` cache for the path and serve the stored HTML on a hit; on a miss,
-/// render here and (optionally) populate the cache. The change-driven regen loop
-/// ([`ServeEngine::regen_loop`](crate::ServeEngine::regen_loop)) then keeps that
-/// cache fresh. v1 renders every request on demand and does not cache.
+/// This is the *uncached* render. The cache-first hot path is [`serve_path`],
+/// which consults the prerender [`BlobStore`] before falling through to here.
 pub async fn resolve_path(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
     path: &str,
 ) -> Resolved {
-    match resolve_inner(store, theme, path).await {
+    match render_path(store, theme, path).await {
         Ok(Some(html)) => Resolved::Found(html),
         Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
     }
 }
 
-/// Inner resolution returning `Result<Option<html>>` so the `?` operator can
+/// Cache-first resolution: the static-first hot path the HTTP fallback calls.
+///
+/// 1. Try the prerender cache (`blobs.get(cache_key(path))`). On a hit, return
+///    the stored UTF-8 HTML verbatim — **no store lookup, no re-render**. This is
+///    what makes serving "static-first": once a page is prerendered (on first
+///    request here, or by the regen loop), it is served straight from blob bytes.
+/// 2. On a miss, fall through to the uncached [`render_path`]. If it produces
+///    HTML, write it *through* to the cache (`blobs.put`) so the next request
+///    hits, then return `Found`. `NotFound` / `Error` pass through unchanged (we
+///    never cache a 404 or a fault).
+///
+/// The cache is **best-effort**: a blob read or write failure never fails the
+/// request. A read error is treated as a miss (we just render), and a
+/// write-through error is logged and swallowed (we still return the freshly
+/// rendered HTML). Cache I/O faults degrade us to v1 SSR-on-demand, never to a
+/// 500. The change-driven regen loop
+/// ([`ServeEngine::regen_loop`](crate::ServeEngine::regen_loop)) keeps populated
+/// entries fresh.
+pub async fn serve_path(
+    store: &Arc<dyn RhypeStore>,
+    blobs: &Arc<dyn BlobStore>,
+    theme: &ThemeEngine,
+    path: &str,
+) -> Resolved {
+    let key = cache_key(path);
+
+    // 1. Cache read. A hit short-circuits; a `NotFound` is an ordinary miss; any
+    //    other error means the cache is degraded — log and treat it as a miss so
+    //    the request still succeeds via a fresh render.
+    match blobs.get(&key).await {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(html) => return Resolved::Found(html),
+            Err(e) => {
+                // A non-UTF-8 cache entry should never happen (we only ever put
+                // rendered HTML), but if it does, don't serve garbage — log and
+                // re-render below.
+                tracing::warn!(%path, error = %e, "prerender cache held non-UTF-8 bytes; re-rendering");
+            }
+        },
+        Err(CoreError::NotFound { .. }) => {
+            // Ordinary cache miss — fall through to render-on-demand.
+        }
+        Err(e) => {
+            tracing::warn!(%path, error = %e, "prerender cache read failed; falling back to render");
+        }
+    }
+
+    // 2. Miss: render on demand, then populate the cache (write-through).
+    match render_path(store, theme, path).await {
+        Ok(Some(html)) => {
+            if let Err(e) = blobs.put(&key, html.clone().into_bytes()).await {
+                // Populate-on-miss is best-effort: a write failure must not fail
+                // the request — log it and serve the rendered HTML anyway.
+                tracing::warn!(%path, error = %e, "prerender cache write-through failed; serving uncached render");
+            }
+            Resolved::Found(html)
+        }
+        Ok(None) => Resolved::NotFound,
+        Err(e) => Resolved::Error(e),
+    }
+}
+
+/// Uncached resolution returning `Result<Option<html>>` so the `?` operator can
 /// carry `CoreError`s and `Ok(None)` cleanly distinguishes "not found" from
-/// "rendered". [`resolve_path`] folds this into [`Resolved`].
-async fn resolve_inner(
+/// "rendered". [`resolve_path`] folds this into [`Resolved`]; [`serve_path`] and
+/// the regen loop call it on a cache miss / regeneration.
+pub(crate) async fn render_path(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
     path: &str,
@@ -161,7 +224,11 @@ async fn find_published(
 
 /// Published iff the `status` field is the string `"published"`
 /// (== [`Status::Published`]`.as_str()`; statuses are stored as plain strings).
-fn is_published(obj: &Object) -> bool {
+///
+/// `pub(crate)` so the regen loop can apply the SAME publish gate the read path
+/// uses when it re-`get`s a changed object (a draft/unpublished entity must be
+/// evicted from the cache, not regenerated).
+pub(crate) fn is_published(obj: &Object) -> bool {
     matches!(obj.get("status"), Some(Value::String(s)) if s == Status::Published.as_str())
 }
 
@@ -171,7 +238,11 @@ fn is_published(obj: &Object) -> bool {
 /// No `BlockKind` is inspected here — block markup is produced solely by
 /// `ferropress_render::render` (the one-shared-renderer invariant). The `title`
 /// is read off the object's `title` field (empty if absent).
-fn render_object(theme: &ThemeEngine, obj: &Object) -> Result<String, CoreError> {
+///
+/// `pub(crate)` so the regen loop's `render_page` can render an object it has
+/// already `get`-fetched (by id, off a change) without going back through the
+/// slug-based [`render_path`] lookup.
+pub(crate) fn render_object(theme: &ThemeEngine, obj: &Object) -> Result<String, CoreError> {
     // `block_tree` is persisted as a JSON *String* (not Bytes / Json scalar).
     let tree = match obj.get("block_tree") {
         Some(Value::String(s)) => BlockTree::from_json_str(s)?,

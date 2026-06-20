@@ -18,3 +18,16 @@ ferropress-theme = { workspace = true }
 # The change stream is awaited via tokio-stream's StreamExt; tokio drives the loop.
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+# Best-effort cache + regen log their swallowed faults (never fail the request /
+# tear down the loop).
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The cache + regen tests drive a REAL embedded store and local-FS blobs (no
+# mocks) so read-through / cache-hit / write-through are proven end-to-end.
+# Depending on `ferropress-store-embedded` here pulls NO rhypedb edge into
+# serve's own manifest — store-embedded is the membrane (the dep-graph lint
+# flags only DIRECT `rhypedb-*` deps).
+ferropress-store-embedded = { workspace = true }
+ferropress-blob-localfs = { workspace = true }
+tempfile = { workspace = true }
