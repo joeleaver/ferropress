@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// How TLS is handled. Mirrors the two `ferropress-cert-acme` modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -19,12 +19,46 @@ pub enum TlsMode {
     Acme,
 }
 
-/// Top-level server configuration.
-#[derive(Debug, Clone, Parser)]
-#[command(
-    name = "ferropress-server",
-    about = "Ferropress server (composition root)"
-)]
+/// Top-level CLI: the `serve` and `post` subcommands.
+#[derive(Debug, Parser)]
+#[command(name = "ferropress-server", about = "Ferropress server + admin")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// CLI subcommands.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run the owned HTTP server.
+    Serve(ServerConfig),
+    /// Create a published post, then exit (admin / seeding).
+    Post(PostArgs),
+}
+
+/// Arguments for `post`: create a published post from the command line.
+#[derive(Debug, Args)]
+pub struct PostArgs {
+    /// Directory holding the embedded rhypedb database (must match the server's).
+    #[arg(long, env = "FERROPRESS_DATA_DIR", default_value = "./data/db")]
+    pub data_dir: PathBuf,
+
+    /// URL slug — the post is served at `/<slug>`.
+    #[arg(long)]
+    pub slug: String,
+
+    /// Post title (the page `<title>`).
+    #[arg(long)]
+    pub title: String,
+
+    /// Body text, wrapped as a single paragraph block.
+    #[arg(long)]
+    pub body: String,
+}
+
+/// Server (serve) configuration — the knobs the composition root reads to SELECT
+/// and parameterize adapters.
+#[derive(Debug, Clone, Args)]
 pub struct ServerConfig {
     /// Directory holding the embedded rhypedb database.
     #[arg(long, env = "FERROPRESS_DATA_DIR", default_value = "./data/db")]

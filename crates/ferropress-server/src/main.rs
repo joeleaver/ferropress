@@ -16,13 +16,17 @@
 
 mod config;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use uuid::Uuid;
 
 use ferropress_core::ports::{BlobStore, CertSource, Scheduler, SecretStore};
 use ferropress_core::store::RhypeStore;
+use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
+use ferropress_core::{Block, BlockKind, BlockTree, InlineRun, POST_TYPE, Status};
 
 use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_cert_acme::{AcmeCertSource, AcmeConfig};
@@ -33,7 +37,7 @@ use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{ServeEngine, default_theme};
 use ferropress_store_embedded::EmbeddedStore;
 
-use crate::config::{ServerConfig, TlsMode};
+use crate::config::{Cli, Command, PostArgs, ServerConfig, TlsMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,8 +45,15 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let cfg = ServerConfig::parse();
+    match Cli::parse().command {
+        Command::Serve(cfg) => run_server(cfg).await,
+        Command::Post(args) => create_post_cmd(args).await,
+    }
+}
 
+/// Run the owned HTTP server (the `serve` subcommand): SELECT the concrete
+/// adapters, wire them into the ports, spawn the static-first regen loop, serve.
+async fn run_server(cfg: ServerConfig) -> Result<()> {
     // ----------------------------------------------------------------------
     // 1. SELECT adapters and inject them into the ports. This is the ONLY place
     //    concrete adapter types are named; everything downstream sees only the
@@ -91,6 +102,57 @@ async fn main() -> Result<()> {
         .await
         .context("running the HTTP server")?;
     Ok(())
+}
+
+/// The `post` subcommand: create a published post in the embedded store, then
+/// exit. Opens the SAME data dir the server reads, so a later `serve` (or a
+/// running server's render-on-demand) picks the post up at `/<slug>`.
+async fn create_post_cmd(args: PostArgs) -> Result<()> {
+    let store: Arc<dyn RhypeStore> = Arc::new(
+        EmbeddedStore::open(&args.data_dir)
+            .with_context(|| format!("opening embedded store at {}", args.data_dir.display()))?,
+    );
+    let id = create_post(&store, &args.slug, &args.title, &args.body).await?;
+    println!("created post id={} at /{}", id.0, args.slug);
+    Ok(())
+}
+
+/// Build a one-paragraph published post and insert it through the store port.
+async fn create_post(
+    store: &Arc<dyn RhypeStore>,
+    slug: &str,
+    title: &str,
+    body: &str,
+) -> Result<ObjectId> {
+    let tree = BlockTree::from_blocks(vec![Block {
+        uid: Uuid::now_v7().to_string(),
+        kind: BlockKind::Paragraph {
+            runs: vec![InlineRun {
+                text: body.to_owned(),
+                marks: Vec::new(),
+                href: None,
+            }],
+        },
+        children: Vec::new(),
+    }]);
+    let block_tree = tree
+        .to_json_string()
+        .context("serializing the block tree")?;
+
+    let mut fields: FieldMap = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(Status::Published.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String(title.to_owned()));
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert("block_tree".to_owned(), Value::String(block_tree));
+
+    store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .context("creating the post")
 }
 
 /// Select the `SecretStore` adapter: dotenv-seeded env when an env file is
