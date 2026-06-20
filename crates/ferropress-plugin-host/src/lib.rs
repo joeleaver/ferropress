@@ -167,16 +167,14 @@ struct HostCtx {
 }
 
 impl PluginHost {
-    /// Build a host: an `Engine` configured with `epoch_interruption`, plus the
-    /// background ticker that advances the epoch on a timer.
+    /// Build an empty plugin host. Engine-free and infallible: the wasmtime
+    /// `Engine` (with `epoch_interruption`) and the epoch ticker are constructed
+    /// lazily on the first [`load_plugin`](Self::load_plugin), so a server with no
+    /// plugins boots without a runtime present (the runtime is a later increment).
     pub fn new() -> Self {
-        // TODO:
-        //   let mut cfg = wasmtime::Config::new();
-        //   cfg.epoch_interruption(true);
-        //   // cfg.consume_fuel(true) when any plugin uses a fuel budget.
-        //   let engine = wasmtime::Engine::new(&cfg)?;
-        //   spawn a tokio task that loops: sleep(tick); engine.increment_epoch();
-        todo!("build wasmtime::Engine with epoch_interruption + start the epoch ticker")
+        Self {
+            bus: HookBus::new(),
+        }
     }
 
     /// Load a plugin module's bytes under `plugin_id`, with the given capability
