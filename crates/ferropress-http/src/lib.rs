@@ -5,8 +5,9 @@
 //! portability rule. This crate:
 //!   * serves rendered HTML pages (v1: SSR-on-demand via [`ferropress_serve`];
 //!     the prerendered-from-[`BlobStore`] hot path is a later increment),
-//!   * exposes the small rhypedb-backed **island API**: semantic search via
-//!     [`RhypeStore::vector_search`] and live comments (deferred — see below).
+//!   * exposes the small rhypedb-backed **island API** (see [`island`]): semantic
+//!     search via [`RhypeStore::vector_search`] and live comments over the
+//!     `Comment` entity.
 //!
 //! INVARIANT (#6): routing / static serving / the island API are OWNED in
 //! process — there is no port trait for HTTP. Only the data side ([`RhypeStore`],
@@ -27,6 +28,8 @@ use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_serve::Resolved;
 use ferropress_theme::ThemeEngine;
+
+pub mod island;
 
 /// Shared HTTP application state, cloned into every axum handler. Holds the
 /// injected data ports plus the render-side collaborators the SSR fallback needs
@@ -111,13 +114,13 @@ pub async fn serve(state: AppState, addr: SocketAddr) -> ferropress_core::error:
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        // Island API (deferred): real routes, 501 bodies until the rhypedb-backed
-        // search + comments handlers land. TODO: implement against
-        // `RhypeStore::vector_search` (search) and the Comment entity (comments).
-        .route("/api/search", get(island_not_implemented))
+        // Island API: the rhypedb-backed JSON endpoints the public-site islands
+        // call. Semantic search over `Post.search`; live comments (list approved +
+        // accept a pending comment) over the `Comment` entity. See [`island`].
+        .route("/api/search", get(island::search::search))
         .route(
             "/api/comments",
-            get(island_not_implemented).post(island_not_implemented),
+            get(island::comments::list).post(island::comments::create),
         )
         // Static-first hot path is the fallback: it consults the prerender
         // BlobStore cache first (via `ferropress_serve::serve_path`) and only
@@ -130,14 +133,6 @@ pub fn router(state: AppState) -> Router {
 /// Liveness probe. Always 200 once the process is up and routing.
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
-}
-
-/// Island API placeholder. v1 returns `501 Not Implemented` with a plain body;
-/// the client never sees internals because there are none yet.
-// TODO: replace with real semantic-search / comments handlers (the rhypedb
-// island API) — `RhypeStore::vector_search` and the Comment entity.
-async fn island_not_implemented() -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "island API not implemented")
 }
 
 /// The page fallback: serve the request path **cache-first**.

@@ -17,6 +17,13 @@ ferropress-render = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
+# Island API request/response bodies (search results, comment list/create) are
+# JSON; serde derives the DTOs, serde_json is the codec axum's `Json` uses.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Comment timestamps (RFC3339 — lexicographically chronological, so list sort is
+# a plain string compare).
+time = { workspace = true }
 # Request/response + error logging (causes logged, never leaked to the client).
 tracing = { workspace = true }
 
@@ -32,3 +39,9 @@ ferropress-blob-localfs = { workspace = true }
 # no socket; tempfile gives each test run an isolated store/blob dir.
 tower = { workspace = true }
 tempfile = { workspace = true }
+# The search test drives the handler with a `RhypeStore` DOUBLE (canned
+# vector_search + get_many) so the mapping / ranking / publish-gate logic is
+# tested WITHOUT the runtime ONNX model. async-trait writes the trait impl;
+# futures-core names `BoxStream` in the (unused) `subscribe` signature.
+async-trait = { workspace = true }
+futures-core = { workspace = true }
