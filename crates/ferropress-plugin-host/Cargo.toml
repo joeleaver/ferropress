@@ -1,0 +1,14 @@
+[package]
+name = "ferropress-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded wasmtime plugin runtime: epoch-interruption + StoreLimits resource control, a deny-by-default Linker capability model, and a WordPress-style action/filter hook bus. Stub scaffold."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferropress-core = { workspace = true }
+wasmtime = { workspace = true }
+tokio = { workspace = true }

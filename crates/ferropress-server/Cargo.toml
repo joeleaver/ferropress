@@ -1,0 +1,32 @@
+[package]
+name = "ferropress-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferropress composition root: the only place adapters are selected and wired into ports, then boots HTTP + serve loop + plugin host."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ferropress-server"
+path = "src/main.rs"
+
+[dependencies]
+# Ports + the owned subsystems.
+ferropress-core = { workspace = true }
+ferropress-store-embedded = { workspace = true }
+ferropress-serve = { workspace = true }
+ferropress-http = { workspace = true }
+ferropress-plugin-host = { workspace = true }
+
+# The concrete adapters this root selects (the ONLY crate that names all four).
+ferropress-secrets-env = { workspace = true }
+ferropress-blob-localfs = { workspace = true }
+ferropress-sched-tokiocron = { workspace = true }
+ferropress-cert-acme = { workspace = true }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }

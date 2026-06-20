@@ -1,0 +1,21 @@
+[package]
+name = "ferropress-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferropress schema + migration dev tool: prints the canonical SDL, validates it, and drives additive open-time reconcile / migrations against a data dir."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ferropress-schema"
+path = "src/main.rs"
+
+[dependencies]
+ferropress-schema-sdl = { workspace = true }
+# The embedded store is opened by `migrate` to run rhypedb's additive reconcile.
+ferropress-store-embedded = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

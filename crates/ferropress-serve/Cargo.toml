@@ -1,0 +1,20 @@
+[package]
+name = "ferropress-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Static-first hybrid orchestration: prerender cache + an incremental regen loop driven by RhypeStore::subscribe (regenerate only affected pages). Stub scaffold."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferropress-core = { workspace = true }
+# Render/theme are the page-production collaborators the regen loop calls into.
+# Wired as edges now (the manifest's intended graph); used once regen_loop /
+# render_page get real bodies.
+ferropress-render = { workspace = true }
+ferropress-theme = { workspace = true }
+# The change stream is awaited via tokio-stream's StreamExt; tokio drives the loop.
+tokio = { workspace = true }
+tokio-stream = { workspace = true }

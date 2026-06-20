@@ -1,0 +1,15 @@
+[package]
+name = "ferropress-cert-acme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CertSource baseline adapter: no-op (behind a TLS-terminating reverse proxy) or embedded rustls-acme (ALPN/HTTP-01). No DNS-01 / host coupling."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferropress-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+rustls-acme = { workspace = true }
