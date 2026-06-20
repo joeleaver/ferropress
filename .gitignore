@@ -11,3 +11,6 @@
 # OS / editor cruft
 .DS_Store
 *.swp
+
+# Local, machine-specific Claude instructions (imported by CLAUDE.md)
+CLAUDE.local.md

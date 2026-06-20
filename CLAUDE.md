@@ -11,6 +11,12 @@ content/block model, and upstream status live in the project memory — read it 
 
 These instructions OVERRIDE default behavior. Follow them exactly.
 
+Machine-local rules — read-only access to the sibling upstream repos (rinch, jkbase, rhypedb) with
+absolute local paths — live in an untracked, git-ignored `CLAUDE.local.md` alongside this file,
+imported here so they still load:
+
+@CLAUDE.local.md
+
 ## 1. Correctness over speed — always
 
 We have **unlimited time and unlimited budget**. When the choice is between the easy way and the
@@ -19,25 +25,13 @@ now," no stubbing-around a problem, no deferring correctness for convenience. If
 bigger, harder, or slower, do the proper fix anyway. If something can't be done correctly yet, say so
 plainly rather than shipping a shortcut.
 
-## 2. Sibling repos (rinch, jkbase, rhypedb) are UPSTREAM — read-only from here
-
-We also own `rinch`, `jkbase`, and `rhypedb` (sibling dirs under `/home/joe/dev`), so you MAY read
-them for reference. But treat them as **real external upstreams**, not as part of this working tree:
-
-- **Never write to or edit files in those repos directly.** Not even a one-line fix.
-- **Never use relative paths** (`../rinch`, …) to reach or depend on them. Use absolute paths
-  (`/home/joe/dev/rinch`) when reading them, and depend on them the way you'd depend on any published
-  upstream — *not* via Cargo `path = "../…"` dependencies.
-- **To change them, act like an upstream contributor:** file an issue, or create a branch and open a
-  PR against that repo. Do not reach across and mutate them in place to unblock Ferropress.
-
-## 3. UX design: HTML first, then port to rinch
+## 2. UX design: HTML first, then port to rinch
 
 rinch is HTML/CSS under the hood. When designing new UI/UX, prefer to design it in plain HTML/CSS
 first (use the **frontend-design** skill), get the structure and visual design right, *then* port it
 to rinch. This keeps design iteration fast and decoupled from the framework port.
 
-## 4. Use the rinch skill
+## 3. Use the rinch skill
 
 Whenever writing or editing rinch code (`rsx!`, `Signal`, `#[component]`, rinch components), invoke
 the **`rinch:rinch`** skill. Don't hand-write rinch from memory — let the skill guide correct use of
