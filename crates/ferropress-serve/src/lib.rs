@@ -32,8 +32,8 @@ use ferropress_theme::ThemeEngine;
 pub mod content;
 
 pub use content::{
-    PAGE_TEMPLATE, PAGE_TEMPLATE_SRC, Resolved, default_theme, resolve_path, serve_path,
-    slug_from_path,
+    PAGE_TEMPLATE, PAGE_TEMPLATE_SRC, Resolved, default_theme, resolve_path,
+    resolve_published_entity, serve_path, slug_from_path,
 };
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path

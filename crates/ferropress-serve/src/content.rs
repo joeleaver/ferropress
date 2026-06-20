@@ -176,22 +176,46 @@ pub(crate) async fn render_path(
     path: &str,
 ) -> Result<Option<String>, CoreError> {
     let slug = slug_from_path(path);
-    if slug.is_empty() {
-        // No flat entity has an empty slug (site root is not yet a home page).
-        return Ok(None);
-    }
 
-    // Permalinks v1: published Post first, then published Page.
-    let object = match find_published(store, POST_TYPE, slug).await? {
-        Some(obj) => obj,
-        None => match find_published(store, PAGE_TYPE, slug).await? {
-            Some(obj) => obj,
-            None => return Ok(None),
-        },
+    // Permalinks v1: the published Post, then the published Page, behind this
+    // slug. The shared resolver is the single definition of "published at this
+    // slug" (also used by the island comment API).
+    let object = match resolve_published_entity(store, slug).await? {
+        Some((_type_name, obj)) => obj,
+        None => return Ok(None),
     };
 
     let html = render_object(theme, &object)?;
     Ok(Some(html))
+}
+
+/// Resolve a request slug to the PUBLISHED entity behind it, returning its store
+/// type-name ([`POST_TYPE`] or [`PAGE_TYPE`]) and the materialized object.
+///
+/// This is the single definition of the v1 permalink rule: a published `Post` by
+/// slug takes precedence, then a published `Page`. `Ok(None)` means no published
+/// entity matched (callers map that to a 404). An empty slug never matches (no
+/// flat entity has an empty slug; the site root is not yet a home page).
+///
+/// Shared by [`render_path`] (page rendering) and the island comment API, so a
+/// comment can only ever attach to — and be listed for — content that is actually
+/// publicly served, under ONE definition of "published at this slug". Returning
+/// the type-name lets the comment API pick the correct `Post.comments` /
+/// `Page.comments` relation to traverse.
+pub async fn resolve_published_entity(
+    store: &Arc<dyn RhypeStore>,
+    slug: &str,
+) -> Result<Option<(&'static str, Object)>, CoreError> {
+    if slug.is_empty() {
+        return Ok(None);
+    }
+    if let Some(obj) = find_published(store, POST_TYPE, slug).await? {
+        return Ok(Some((POST_TYPE, obj)));
+    }
+    if let Some(obj) = find_published(store, PAGE_TYPE, slug).await? {
+        return Ok(Some((PAGE_TYPE, obj)));
+    }
+    Ok(None)
 }
 
 /// Look up a single PUBLISHED object of `type_name` by exact slug.
