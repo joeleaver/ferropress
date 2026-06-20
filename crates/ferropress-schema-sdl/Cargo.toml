@@ -1,0 +1,16 @@
+[package]
+name = "ferropress-schema-sdl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The canonical rhypedb SDL for the Ferropress content model, plus a parse/validate helper. Depends on rhypedb-schema ONLY (no engine)."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Schema crate only — NOT the engine. This is the second (and only other)
+# allowed rhypedb edge besides ferropress-store-embedded. No ONNX surface here.
+# `parsed_schema()` returns rhypedb_schema's own `SchemaResult`/`SchemaError`,
+# so no local thiserror enum is needed here.
+rhypedb-schema = { workspace = true }

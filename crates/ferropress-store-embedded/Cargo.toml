@@ -1,0 +1,31 @@
+[package]
+name = "ferropress-store-embedded"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The embedded rhypedb adapter: the ONLY crate that depends on rhypedb-engine. Implements the RhypeStore port over an in-process Database + Vectorizer."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferropress-core = { workspace = true }
+ferropress-schema-sdl = { workspace = true }
+
+# rhypedb UPSTREAM (git, pinned rev via [workspace.dependencies]). engine +
+# subscribe carry default-features=false + onnx-dynamic so the build is offline
+# and ONNX is dlopen'd at runtime. This is the single rhypedb-engine edge in the
+# whole workspace.
+rhypedb-engine = { workspace = true }
+rhypedb-schema = { workspace = true }
+rhypedb-subscribe = { workspace = true }
+
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures-core = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
