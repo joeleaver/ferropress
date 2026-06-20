@@ -13,3 +13,8 @@ ferropress-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 cron = { workspace = true }
+# `time` does the instant arithmetic: cron 0.12's next-fire API is chrono-typed
+# and chrono is not a workspace dep, so we parse with cron + compute with `time`.
+time = { workspace = true }
+# Failed ticks are logged (not propagated) so a recurring loop survives them.
+tracing = { workspace = true }
