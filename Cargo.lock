@@ -1318,6 +1318,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ferropress-core",
+ "tempfile",
  "tokio",
 ]
 
@@ -1396,7 +1397,9 @@ dependencies = [
  "async-trait",
  "cron",
  "ferropress-core",
+ "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1424,6 +1427,7 @@ dependencies = [
  "async-trait",
  "dotenvy",
  "ferropress-core",
+ "tokio",
 ]
 
 [[package]]
