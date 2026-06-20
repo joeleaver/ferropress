@@ -13,14 +13,14 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use ferropress_core::query::{Change, ChangeKind, Compare};
+use ferropress_core::query::{Change, ChangeKind, Compare, SubscribeFilter};
 use ferropress_core::value::{
     FieldMap as CoreFieldMap, Object as CoreObject, ObjectId, TypeName, Value as CoreValue,
 };
 
 use rhypedb_engine::CompareOp;
 use rhypedb_engine::object::{FieldMap as DbFieldMap, Object as DbObject, Value as DbValue};
-use rhypedb_subscribe::{ChangeEvent, ChangeKind as DbChangeKind};
+use rhypedb_subscribe::{ChangeEvent, ChangeKind as DbChangeKind, SubscriptionFilter};
 
 /// core::Value -> rhypedb Value. Total: every core variant has a 1:1 rhypedb
 /// counterpart (core deliberately mirrors only the live rhypedb variants).
@@ -103,6 +103,26 @@ pub fn to_compare_op(op: Compare) -> CompareOp {
 /// ```
 pub fn to_restrict_set(restrict: Option<Vec<ObjectId>>) -> Option<HashSet<u64>> {
     restrict.map(|ids| ids.into_iter().map(|ObjectId(n)| n).collect())
+}
+
+/// core::SubscribeFilter -> rhypedb `SubscriptionFilter`. The two structs are
+/// field-for-field equivalent (type/object are optional narrowings, `kinds` empty
+/// means "all kinds"); this just unwraps the core newtypes and maps the kind enum.
+pub fn to_subscription_filter(filter: SubscribeFilter) -> SubscriptionFilter {
+    SubscriptionFilter {
+        type_name: filter.type_name.map(|TypeName(s)| s),
+        object_id: filter.object_id.map(|ObjectId(n)| n),
+        kinds: filter.kinds.into_iter().map(to_db_change_kind).collect(),
+    }
+}
+
+/// core::ChangeKind -> rhypedb `ChangeKind`. Used when narrowing a subscription.
+fn to_db_change_kind(kind: ChangeKind) -> DbChangeKind {
+    match kind {
+        ChangeKind::Create => DbChangeKind::Create,
+        ChangeKind::Update => DbChangeKind::Update,
+        ChangeKind::Delete => DbChangeKind::Delete,
+    }
 }
 
 /// rhypedb ChangeEvent -> core::Change. One-directional (the feed is read-only).

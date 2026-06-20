@@ -15,9 +15,12 @@
 //!
 //! Translation between rhypedb's value types and core's lives in `convert`.
 
-pub mod convert;
-pub mod error;
-pub mod store_impl;
+// Private: these modules name rhypedb types, so they must NOT be reachable
+// through this crate's public API — that is the whole point of the membrane.
+// The only public escape hatch is `AdapterError`, re-exported below.
+mod convert;
+mod error;
+mod store_impl;
 
 use std::path::Path;
 use std::sync::Arc;
