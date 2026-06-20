@@ -1,0 +1,13 @@
+[package]
+name = "ferropress-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "THE single block-tree -> HTML renderer. Used by both the editor preview and the public site (WYSIWYG parity)."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferropress-core = { workspace = true }
+html-escape = { workspace = true }

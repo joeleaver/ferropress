@@ -1,0 +1,15 @@
+[package]
+name = "ferropress-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MiniJinja host for page chrome + the theme sandbox. Receives the single pre-rendered content string from ferropress-render; templates never see blocks."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferropress-core = { workspace = true }
+ferropress-render = { workspace = true }
+minijinja = { workspace = true }
+thiserror = { workspace = true }
