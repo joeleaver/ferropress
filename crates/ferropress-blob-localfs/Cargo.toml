@@ -12,3 +12,6 @@ workspace = true
 ferropress-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
