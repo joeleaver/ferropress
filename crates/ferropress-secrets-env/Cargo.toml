@@ -12,3 +12,8 @@ workspace = true
 ferropress-core = { workspace = true }
 async-trait = { workspace = true }
 dotenvy = { workspace = true }
+
+[dev-dependencies]
+# Needed only to drive the async `SecretStore` trait methods in tests; the
+# adapter itself is pure `std::env` and needs no runtime.
+tokio = { workspace = true }
