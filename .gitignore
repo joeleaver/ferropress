@@ -1,0 +1,13 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Env / secrets (Ferropress uses a dotenv-style SecretStore adapter)
+.env
+.env.*
+!.env.example
+
+# OS / editor cruft
+.DS_Store
+*.swp
