@@ -1,0 +1,191 @@
+<!doctype html>
+<!--
+  HTML-first design reference (CLAUDE.md §2) for the two public-site islands:
+  live comments + semantic search. This is the structure + visual hierarchy the
+  rinch components port to (crates/ferropress-islands/src/*.rs). It is a static
+  reference, NOT shipped. Tokens here mirror rinch theme CSS variables so the port
+  inherits the host site's theme; the fallbacks below just make this file viewable
+  standalone.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferropress islands — design reference</title>
+<style>
+  :root {
+    /* Mirror rinch theme variables; fallbacks make the mockup viewable alone. */
+    --fp-fg: var(--rinch-color-text, #1f2328);
+    --fp-muted: var(--rinch-color-dimmed, #6b7280);
+    --fp-border: var(--rinch-color-gray-3, #e5e7eb);
+    --fp-surface: var(--rinch-color-body, #ffffff);
+    --fp-surface-2: var(--rinch-color-gray-1, #f6f7f9);
+    --fp-accent: var(--rinch-color-primary, #2f6f4f);
+    --fp-danger: var(--rinch-color-red, #b42318);
+    --fp-radius: 8px;
+    --fp-gap: 16px;
+  }
+  body {
+    font-family: var(--rinch-font, system-ui, -apple-system, Segoe UI, Roboto, sans-serif);
+    color: var(--fp-fg);
+    margin: 0; padding: 40px 20px; background: #fafafa;
+    line-height: 1.55;
+  }
+  .page { max-width: 680px; margin: 0 auto; display: grid; gap: 40px; }
+
+  /* ---- shared island shell ---- */
+  .fp-island { font-size: 0.95rem; }
+  .fp-island h2 {
+    font-size: 1.05rem; font-weight: 650; letter-spacing: -0.01em;
+    margin: 0 0 var(--fp-gap); display: flex; align-items: baseline; gap: 8px;
+  }
+  .fp-count { color: var(--fp-muted); font-weight: 400; font-size: 0.85rem; }
+  .fp-state { color: var(--fp-muted); padding: 8px 0; }
+  .fp-state.err { color: var(--fp-danger); }
+
+  /* ---- comments ---- */
+  .fp-thread { display: grid; gap: var(--fp-gap); }
+  .fp-comment { display: grid; gap: 4px; }
+  .fp-comment-head { display: flex; align-items: baseline; gap: 8px; }
+  .fp-author { font-weight: 600; }
+  .fp-author a { color: var(--fp-accent); text-decoration: none; }
+  .fp-author a:hover { text-decoration: underline; }
+  .fp-time { color: var(--fp-muted); font-size: 0.8rem; }
+  .fp-body { margin: 0; white-space: pre-wrap; }
+  /* Threading rail: replies hang off a vertical rule — the one structural
+     signature, and it's content-true (a comment thread IS a tree). */
+  .fp-replies {
+    margin: 12px 0 0 6px; padding-left: 16px;
+    border-left: 2px solid var(--fp-border); display: grid; gap: var(--fp-gap);
+  }
+
+  /* ---- compose form ---- */
+  .fp-form {
+    margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--fp-border);
+    display: grid; gap: 10px;
+  }
+  .fp-form-title { font-weight: 600; }
+  .fp-row { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+  .fp-field { display: grid; gap: 4px; }
+  .fp-field label { font-size: 0.8rem; color: var(--fp-muted); }
+  .fp-input, .fp-textarea {
+    font: inherit; color: inherit; background: var(--fp-surface);
+    border: 1px solid var(--fp-border); border-radius: var(--fp-radius);
+    padding: 8px 10px;
+  }
+  .fp-input:focus, .fp-textarea:focus {
+    outline: 2px solid color-mix(in srgb, var(--fp-accent) 40%, transparent);
+    outline-offset: 1px; border-color: var(--fp-accent);
+  }
+  .fp-textarea { min-height: 84px; resize: vertical; }
+  .fp-btn {
+    justify-self: start; font: inherit; font-weight: 550; cursor: pointer;
+    background: var(--fp-accent); color: #fff; border: 0;
+    border-radius: var(--fp-radius); padding: 9px 16px;
+  }
+  .fp-btn:hover { filter: brightness(1.05); }
+  /* Inline moderation confirmation replaces the form on submit. */
+  .fp-confirm {
+    margin-top: 28px; padding: 14px 16px; border-radius: var(--fp-radius);
+    background: var(--fp-surface-2); border: 1px solid var(--fp-border);
+    color: var(--fp-fg);
+  }
+  .fp-confirm strong { display: block; }
+
+  /* ---- search ---- */
+  .fp-search-bar { display: flex; gap: 8px; }
+  .fp-search-bar .fp-input { flex: 1; }
+  .fp-results { margin: var(--fp-gap) 0 0; display: grid; gap: 14px; }
+  .fp-result { display: grid; gap: 2px; }
+  .fp-result a { color: var(--fp-accent); text-decoration: none; font-weight: 600; }
+  .fp-result a:hover { text-decoration: underline; }
+  .fp-excerpt { color: var(--fp-muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ============ SEMANTIC SEARCH ISLAND ============ -->
+  <section class="fp-island" id="fp-search">
+    <h2>Search</h2>
+    <form class="fp-search-bar" onsubmit="return false">
+      <input class="fp-input" type="search" placeholder="Search the site…" value="static rendering">
+      <button class="fp-btn" type="submit">Search</button>
+    </form>
+    <ul class="fp-results" style="list-style:none; padding:0;">
+      <li class="fp-result">
+        <a href="/static-first-hybrid">The static-first hybrid model</a>
+        <span class="fp-excerpt">Pre-render content to HTML, regenerate only what changed, and serve dynamic bits as islands.</span>
+      </li>
+      <li class="fp-result">
+        <a href="/why-rust-cms">Why a Rust CMS</a>
+        <span class="fp-excerpt">Security and performance as the headline edge over the PHP incumbent.</span>
+      </li>
+    </ul>
+    <!-- alt states: <p class="fp-state">Searching…</p> /
+         <p class="fp-state">No results for “…”.</p> /
+         <p class="fp-state err">Search is unavailable right now.</p> -->
+  </section>
+
+  <!-- ============ LIVE COMMENTS ISLAND ============ -->
+  <section class="fp-island" id="fp-comments">
+    <h2>Comments <span class="fp-count">2</span></h2>
+
+    <div class="fp-thread">
+      <div class="fp-comment">
+        <div class="fp-comment-head">
+          <span class="fp-author"><a href="https://example.com">Ada</a></span>
+          <span class="fp-time">Jun 19, 2026</span>
+        </div>
+        <p class="fp-body">The regenerate-on-change story is the part I keep coming back to.</p>
+
+        <div class="fp-replies">
+          <div class="fp-comment">
+            <div class="fp-comment-head">
+              <span class="fp-author">Joe</span>
+              <span class="fp-time">Jun 20, 2026</span>
+            </div>
+            <p class="fp-body">Agreed — it's the native equivalent of the Redis pub/sub bolt-on.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="fp-comment">
+        <div class="fp-comment-head">
+          <span class="fp-author">Grace</span>
+          <span class="fp-time">Jun 20, 2026</span>
+        </div>
+        <p class="fp-body">Does search work without shipping a model to the client?</p>
+      </div>
+    </div>
+
+    <!-- compose -->
+    <form class="fp-form" onsubmit="return false">
+      <div class="fp-form-title">Leave a comment</div>
+      <div class="fp-row">
+        <div class="fp-field">
+          <label for="n">Name</label>
+          <input class="fp-input" id="n" placeholder="Your name">
+        </div>
+        <div class="fp-field">
+          <label for="e">Email <span style="opacity:.7">(optional)</span></label>
+          <input class="fp-input" id="e" type="email" placeholder="you@example.com">
+        </div>
+      </div>
+      <div class="fp-field">
+        <label for="b">Comment</label>
+        <textarea class="fp-textarea" id="b" placeholder="Add to the discussion…"></textarea>
+      </div>
+      <button class="fp-btn" type="submit">Post comment</button>
+    </form>
+
+    <!-- post-submit state (replaces the form): -->
+    <div class="fp-confirm" hidden>
+      <strong>Thanks for your comment.</strong>
+      It's awaiting moderation and will appear once approved.
+    </div>
+  </section>
+
+</div>
+</body>
+</html>

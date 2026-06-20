@@ -91,4 +91,13 @@ pub struct ServerConfig {
     /// Cache directory for issued ACME certs + account key.
     #[arg(long, env = "FERROPRESS_ACME_CACHE", default_value = "./data/acme")]
     pub acme_cache: PathBuf,
+
+    /// Directory holding the built wasm island bundle (the `dist/` output of
+    /// `cargo xtask build-islands`). Served at `/_fp/islands`.
+    #[arg(
+        long,
+        env = "FERROPRESS_ISLANDS_DIR",
+        default_value = "./crates/ferropress-islands/dist"
+    )]
+    pub islands_dir: PathBuf,
 }

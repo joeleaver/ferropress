@@ -75,7 +75,10 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let theme = Arc::new(default_theme().context("building the page-chrome theme")?);
     let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), Arc::clone(&theme));
     let plugins = PluginHost::new();
-    let app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme);
+    // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
+    // the matching mount points + boot script). Built by `cargo xtask build-islands`.
+    let app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
+        .with_islands_dir(cfg.islands_dir.clone());
 
     // Wired but not yet driven in v1: the scheduler, secret store, cert source,
     // and the plugin host all come online in later increments. Named so the

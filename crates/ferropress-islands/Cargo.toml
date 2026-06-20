@@ -1,18 +1,56 @@
+# ferropress-islands — public-site rinch WASM islands (live comments + semantic
+# search) that hydrate into the otherwise-static prerendered HTML.
+#
+# This crate is EXCLUDED from the root workspace (see the root Cargo.toml): it is
+# a wasm32-only `cdylib` depending on `rinch-web` (browser/web_sys only), so it
+# cannot build for the host target the workspace's `cargo check --workspace`
+# uses. It therefore carries its OWN Cargo.lock and declares its dependencies
+# directly (no `workspace = true`). rinch is an UPSTREAM (CLAUDE.local.md):
+# consumed via a pinned git rev, never a path dep, never edited in place.
+#
+# Build it with `cargo xtask build-islands`, which compiles it for
+# wasm32-unknown-unknown and runs wasm-bindgen into `dist/`; the server serves
+# that bundle at `/_fp/islands`.
 [package]
 name = "ferropress-islands"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Public-site rinch island components (semantic-search box, live comments). rinch implementation pending upstream; rinch-free placeholder for now."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Public-site rinch WASM islands (live comments, semantic search) hydrated into prerendered HTML."
+publish = false
 
-[lints]
-workspace = true
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
-# NOTE: rinch is DEFERRED. These are the public-site island components that
-# hydrate into prerendered HTML; they need rinch multi-root mount, which is
-# upstream rinch #53 (the furthest-out of the rinch blockers). Once that lands
-# this crate gains the rinch / rinch-web dependency, `crate-type = ["cdylib"]`,
-# and a wasm32 target. For now it is a rinch-FREE placeholder so the workspace
-# compiles on the host.
-ferropress-core = { workspace = true }
+# rinch — UPSTREAM, pinned git rev (rinch-web islands #53 + CE-serde #50 landed
+# at this rev). default-features=false drops the desktop/wgpu stack; the web DOM
+# backend is rinch-web.
+rinch = { git = "https://github.com/joeleaver/rinch.git", rev = "0f5db819c09f83d19f393be2101dcfa52a508fa2", default-features = false, features = ["components", "theme"] }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", rev = "0f5db819c09f83d19f393be2101dcfa52a508fa2", features = ["theme"] }
+rinch-web = { git = "https://github.com/joeleaver/rinch.git", rev = "0f5db819c09f83d19f393be2101dcfa52a508fa2" }
+
+# WASM glue.
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Location",
+    "Element",
+    "Node",
+    "HtmlHeadElement",
+] }
+
+# HTTP (fetch) + JSON for the island API calls.
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+serde = { version = "1", features = ["derive"] }
+
+# Smaller, faster wasm in dev (mirrors the rinch islands-web example).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,25 +1,32 @@
-//! xtask — Ferropress CI lint tool.
+//! xtask — Ferropress dev/CI tooling.
 //!
-//! Audits the workspace dependency graph to enforce the portability invariants
-//! (see CLAUDE.md and the `ferropress-portability` design notes):
+//! Subcommands:
+//!   * `dep-graph` (alias `dep-graph-lint`) — audit the workspace dependency
+//!     graph to enforce the portability invariants (see CLAUDE.md and the
+//!     `ferropress-portability` notes):
+//!       * `ferropress-core` depends on NO upstream (rhypedb / rinch / jkbase).
+//!       * Only `ferropress-store-embedded` and `ferropress-schema-sdl` may
+//!         depend on rhypedb.
+//!       * No *workspace member* may depend on rinch (rinch is consumed only by
+//!         the EXCLUDED `ferropress-islands` wasm crate, which the workspace
+//!         metadata never sees).
+//!       * jkbase must never appear in the graph at all.
+//!   * `build-islands` — compile the excluded `ferropress-islands` wasm `cdylib`
+//!     and run `wasm-bindgen` into `crates/ferropress-islands/dist/` (the bundle
+//!     the server serves at `/_fp/islands`).
 //!
-//!   * `ferropress-core` depends on NO upstream (rhypedb / rinch / jkbase).
-//!   * Only `ferropress-store-embedded` and `ferropress-schema-sdl` may depend
-//!     on rhypedb.
-//!   * No crate may depend on rinch yet (rinch is deferred).
-//!   * jkbase must never appear in the graph at all.
-//!
-//! Run from the repo root:
+//! Run from anywhere:
 //!
 //! ```text
 //! cargo run --manifest-path xtask/Cargo.toml -- dep-graph
+//! cargo run --manifest-path xtask/Cargo.toml -- build-islands
 //! ```
 //!
-//! Uses `cargo metadata --no-deps` so the audit is fast and offline — it reads
+//! The lint uses `cargo metadata --no-deps` so it is fast and offline — it reads
 //! the *declared* dependencies of each workspace member without resolving or
 //! fetching the (git) upstreams it is auditing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -47,19 +54,86 @@ struct Dependency {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("dep-graph") | None => dep_graph_lint(),
-        Some(other) => bail!("unknown xtask subcommand {other:?} (expected `dep-graph`)"),
+        // `dep-graph-lint` is the name CI invokes; `dep-graph` is the short form.
+        Some("dep-graph") | Some("dep-graph-lint") | None => dep_graph_lint(),
+        Some("build-islands") => build_islands(),
+        Some(other) => bail!(
+            "unknown xtask subcommand {other:?} (expected `dep-graph` or `build-islands`)"
+        ),
     }
+}
+
+/// The repo root (the directory holding the root `Cargo.toml`), derived from this
+/// crate's manifest dir so xtask works regardless of the current directory.
+fn repo_root() -> Result<PathBuf> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("xtask manifest has no parent directory")?
+        .to_path_buf())
+}
+
+/// Build the public-site wasm islands bundle: compile the excluded
+/// `ferropress-islands` `cdylib` for `wasm32-unknown-unknown` (release), then run
+/// `wasm-bindgen --target web` to emit the JS + `_bg.wasm` into
+/// `crates/ferropress-islands/dist/`.
+///
+/// `wasm-bindgen` (the CLI) must match the crate's `wasm-bindgen` version exactly;
+/// a mismatch produces a clear error from the tool. Install with
+/// `cargo install wasm-bindgen-cli --version <crate version>`.
+fn build_islands() -> Result<()> {
+    let root = repo_root()?;
+    let manifest = root.join("crates/ferropress-islands/Cargo.toml");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+
+    // 1. Compile the wasm cdylib (release).
+    let status = Command::new(&cargo)
+        .args([
+            "build",
+            "--manifest-path",
+            &manifest.to_string_lossy(),
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+        ])
+        .status()
+        .context("failed to run `cargo build` for ferropress-islands")?;
+    if !status.success() {
+        bail!("ferropress-islands wasm build failed");
+    }
+
+    // 2. wasm-bindgen into dist/. The excluded crate has its OWN target dir.
+    let wasm = root
+        .join("crates/ferropress-islands/target/wasm32-unknown-unknown/release/ferropress_islands.wasm");
+    let dist = root.join("crates/ferropress-islands/dist");
+    let status = Command::new("wasm-bindgen")
+        .args([
+            "--target",
+            "web",
+            "--no-typescript",
+            "--out-name",
+            "ferropress_islands",
+            "--out-dir",
+            &dist.to_string_lossy(),
+            &wasm.to_string_lossy(),
+        ])
+        .status()
+        .context(
+            "failed to run `wasm-bindgen` — install the matching CLI with \
+             `cargo install wasm-bindgen-cli --version <ferropress-islands' wasm-bindgen version>`",
+        )?;
+    if !status.success() {
+        bail!("wasm-bindgen failed");
+    }
+
+    println!("build-islands: OK -> {}", dist.display());
+    Ok(())
 }
 
 /// Enforce the dependency-graph invariants. Returns `Ok(())` when clean, or an
 /// error listing every violation (so CI fails with a useful message).
 fn dep_graph_lint() -> Result<()> {
     // Audit the *root* workspace regardless of the current directory.
-    let root_manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .context("xtask manifest has no parent directory")?
-        .join("Cargo.toml");
+    let root_manifest = repo_root()?.join("Cargo.toml");
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let output = Command::new(cargo)

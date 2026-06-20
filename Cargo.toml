@@ -9,9 +9,11 @@
 # by git, pinned to an exact rev so every rhypedb-* crate resolves to the same
 # tree (they share version 0.1.0 in one repo — mixing revs is unsupported).
 #
-# rinch is DEFERRED: it has NO entry in [workspace.dependencies] yet. The admin /
-# islands / render-form crates are rinch-free compiling placeholders until the
-# upstream rinch features land.
+# rinch is consumed ONLY by the excluded `crates/ferropress-islands` (a wasm32
+# cdylib, outside this workspace, which pins rinch by git rev directly) — so rinch
+# has NO entry in [workspace.dependencies] and never enters the host workspace
+# graph. The admin / render-form crates remain rinch-free compiling placeholders
+# until their upstream rinch features land.
 #
 # Dependency-graph invariant (enforced by xtask + CI): rhypedb appears ONLY on
 # ferropress-store-embedded (engine/subscribe) and ferropress-schema-sdl
@@ -20,10 +22,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-# xtask is intentionally OUT of the workspace: it is a CI lint tool and we do not
-# want its (heavier) deps polluting the workspace dependency graph that the same
-# tool audits. It is invoked via `--manifest-path xtask/Cargo.toml`.
-exclude = ["xtask"]
+# Two crates are intentionally OUT of the workspace:
+#   * xtask — a CI lint tool; we don't want its (heavier) deps polluting the
+#     workspace dependency graph it audits. Invoked via `--manifest-path xtask/`.
+#   * crates/ferropress-islands — a wasm32-only `cdylib` depending on rinch-web
+#     (browser/web_sys only). The workspace's host `cargo check --workspace`
+#     cannot build it, so it lives outside the workspace with its OWN Cargo.lock
+#     and is built for wasm via `cargo xtask build-islands`.
+exclude = ["xtask", "crates/ferropress-islands"]
 
 [workspace.package]
 version = "0.1.0"
@@ -58,7 +64,8 @@ ferropress-plugin-host     = { path = "crates/ferropress-plugin-host" }
 ferropress-serve           = { path = "crates/ferropress-serve" }
 ferropress-http            = { path = "crates/ferropress-http" }
 ferropress-admin           = { path = "crates/ferropress-admin" }
-ferropress-islands         = { path = "crates/ferropress-islands" }
+# NB: ferropress-islands is NOT listed here — it is excluded from the workspace
+# (wasm32-only cdylib, see [workspace].exclude) and declares its deps directly.
 
 # --- rhypedb (UPSTREAM, git, pinned rev) -------------------------------------
 # ALL rhypedb-* deps MUST share this exact pinned rev (the crates share one repo

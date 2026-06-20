@@ -1369,13 +1369,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferropress-islands"
-version = "0.1.0"
-dependencies = [
- "ferropress-core",
-]
-
-[[package]]
 name = "ferropress-plugin-host"
 version = "0.1.0"
 dependencies = [

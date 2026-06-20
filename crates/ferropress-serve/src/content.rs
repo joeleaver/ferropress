@@ -43,7 +43,27 @@ pub const PAGE_TEMPLATE: &str = "page.html";
 /// Source of the single built-in page-chrome template. Kept here so the
 /// composition root and the integration test share ONE source of truth (through
 /// [`default_theme`]); a real theme system will later load author templates.
-pub const PAGE_TEMPLATE_SRC: &str = "<!doctype html>\n<html>\n<head><title>{{ title }}</title></head>\n<body>{{ content | safe }}</body>\n</html>\n";
+///
+/// Besides the page title + pre-rendered content, the chrome emits the public-site
+/// **island** mount points (`#fp-search`, `#fp-comments`) and the ESM `<script>`
+/// that boots the wasm bundle served at `/_fp/islands`. The islands hydrate into
+/// those placeholders client-side; a page that never loads the bundle (or has the
+/// islands disabled) just shows empty placeholders. The comments island derives
+/// its slug from `window.location.pathname` (permalinks v1 are flat `/<slug>`).
+pub const PAGE_TEMPLATE_SRC: &str = r#"<!doctype html>
+<html>
+<head><title>{{ title }}</title></head>
+<body>
+<div id="fp-search"></div>
+{{ content | safe }}
+<div id="fp-comments"></div>
+<script type="module">
+import init from '/_fp/islands/ferropress_islands.js';
+init({ module_or_path: '/_fp/islands/ferropress_islands_bg.wasm' });
+</script>
+</body>
+</html>
+"#;
 
 /// Build the v1 [`ThemeEngine`] with [`PAGE_TEMPLATE`] registered. Both the
 /// composition root (`ferropress-server`) and the end-to-end test call this, so

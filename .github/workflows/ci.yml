@@ -70,8 +70,30 @@ jobs:
       # Enforces: core depends on no rhypedb/rinch/jkbase; only
       # ferropress-store-embedded touches rhypedb-engine/-subscribe; only
       # ferropress-store-embedded + ferropress-schema-sdl touch rhypedb-schema;
-      # all rhypedb-* deps share one git rev; no rinch dep anywhere.
+      # all rhypedb-* deps share one git rev; no rinch dep in any workspace member
+      # (rinch is used only by the EXCLUDED ferropress-islands wasm crate).
       - run: cargo run --manifest-path xtask/Cargo.toml -- dep-graph-lint
+
+  # The public-site wasm islands crate (ferropress-islands) is EXCLUDED from the
+  # workspace, so the --workspace jobs above never touch it. Lint + build it for
+  # wasm32 and run wasm-bindgen so it can't silently rot. The wasm-bindgen CLI
+  # version MUST match the crate's `wasm-bindgen` dependency — bump both together.
+  islands-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/ferropress-islands
+      - run: cargo clippy --manifest-path crates/ferropress-islands/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo install wasm-bindgen-cli --version 0.2.125 --locked
+      - run: cargo run --manifest-path xtask/Cargo.toml -- build-islands
 
   # Portability boundary: ferropress-core must build entirely on its own, naming
   # ZERO external upstream (no rhypedb, no rinch, no jkbase). Building just this

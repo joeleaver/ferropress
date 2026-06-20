@@ -15,6 +15,7 @@
 //! [`AppState`].
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -22,6 +23,7 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use tower_http::services::ServeDir;
 
 use ferropress_core::error::CoreError;
 use ferropress_core::ports::BlobStore;
@@ -46,10 +48,15 @@ pub struct AppState {
     /// The sandboxed MiniJinja chrome host, with the built-in page template
     /// already registered. Shared read-only across handlers.
     pub theme: Arc<ThemeEngine>,
+    /// Directory holding the built wasm island bundle (the `wasm-bindgen` output
+    /// of `ferropress-islands`). When set, it is served at `/_fp/islands`; `None`
+    /// (e.g. in tests) simply omits that route.
+    pub islands_dir: Option<PathBuf>,
 }
 
 impl AppState {
-    /// Assemble the shared state from the injected ports + theme host.
+    /// Assemble the shared state from the injected ports + theme host. Island
+    /// asset serving is off until set via [`with_islands_dir`](Self::with_islands_dir).
     pub fn new(
         store: Arc<dyn RhypeStore>,
         blobs: Arc<dyn BlobStore>,
@@ -59,7 +66,15 @@ impl AppState {
             store,
             blobs,
             theme,
+            islands_dir: None,
         }
+    }
+
+    /// Serve the wasm island bundle from `dir` (the `dist/` output of
+    /// `cargo xtask build-islands`) at `/_fp/islands`.
+    pub fn with_islands_dir(mut self, dir: PathBuf) -> Self {
+        self.islands_dir = Some(dir);
+        self
     }
 }
 
@@ -108,11 +123,13 @@ pub async fn serve(state: AppState, addr: SocketAddr) -> ferropress_core::error:
 /// graph the server serves, without binding a socket (via `tower::ServiceExt`
 /// `oneshot`).
 ///
-/// Static media is intentionally served from the [`BlobStore`] via a handler
-/// (not `tower-http` `ServeDir`) so the port stays the single source of bytes —
-/// that handler is a later increment.
+/// Static *media* (user content) is intentionally served from the [`BlobStore`]
+/// via a handler (not `ServeDir`) so the port stays the single source of content
+/// bytes — that handler is a later increment. The island bundle below is
+/// different: it is a *build artifact* (the `wasm-bindgen` output), not content,
+/// so it is served straight from the build dir via [`ServeDir`].
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         // Island API: the rhypedb-backed JSON endpoints the public-site islands
         // call. Semantic search over `Post.search`; live comments (list approved +
@@ -126,8 +143,16 @@ pub fn router(state: AppState) -> Router {
         // BlobStore cache first (via `ferropress_serve::serve_path`) and only
         // falls through to an on-demand SSR render — populating the cache — on a
         // miss.
-        .fallback(serve_page)
-        .with_state(state)
+        .fallback(serve_page);
+
+    // Serve the built wasm island bundle (JS + `_bg.wasm`) at `/_fp/islands` when
+    // a bundle dir is configured. `ServeDir`'s mime_guess returns the right
+    // `text/javascript` + `application/wasm` content types for ESM + wasm loading.
+    if let Some(dir) = &state.islands_dir {
+        app = app.nest_service("/_fp/islands", ServeDir::new(dir));
+    }
+
+    app.with_state(state)
 }
 
 /// Liveness probe. Always 200 once the process is up and routing.
