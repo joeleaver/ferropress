@@ -1,0 +1,20 @@
+[package]
+name = "ferropress-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The admin/editor SPA (will be a rinch WASM app). rinch implementation pending upstream; rinch-free compiling placeholder for now."
+
+[lints]
+workspace = true
+
+[dependencies]
+# NOTE: rinch is DEFERRED. This crate will become a rinch WASM SPA mounted via
+# `rinch-web::mount()` and gain `crate-type = ["cdylib"]` + a wasm32 target once
+# the upstream rinch features land (rinch #50 CE serde, #51 CE in WASM-DOM). For
+# now it is a rinch-FREE placeholder so the workspace compiles on the host.
+# Editor preview will call the SAME ferropress-render path as the public site
+# (WYSIWYG parity), and the edit UI comes from ferropress-render-form.
+ferropress-core = { workspace = true }
+ferropress-render = { workspace = true }
+ferropress-render-form = { workspace = true }

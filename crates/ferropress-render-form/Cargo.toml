@@ -1,0 +1,17 @@
+[package]
+name = "ferropress-render-form"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "THE single form-schema (JSON) -> edit-UI renderer (mirror of ferropress-render). rinch implementation pending upstream; rinch-free placeholder for now."
+
+[lints]
+workspace = true
+
+[dependencies]
+# NOTE: rinch is DEFERRED. This crate will gain a `rinch` git dependency and a
+# wasm target once the upstream rinch features land (rinch #50 CE serde, #51 CE
+# in WASM-DOM). For now it is a rinch-FREE placeholder so the whole workspace
+# keeps compiling on the host. Deps are exactly what the stub lib.rs uses.
+ferropress-core = { workspace = true }
+ferropress-render = { workspace = true }
