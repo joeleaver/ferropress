@@ -1,0 +1,20 @@
+[package]
+name = "ferropress-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferropress domain layer: content entities, value objects, and the storage/secret/blob/scheduler/cert PORT traits. rhypedb-free by construction."
+
+[lints]
+workspace = true
+
+[dependencies]
+# INVARIANT: this crate must NOT depend on rhypedb, rinch, or jkbase — not even
+# transitively-by-name. The CI dep-graph lint enforces it. Keep this list tiny.
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
