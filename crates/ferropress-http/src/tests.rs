@@ -262,6 +262,95 @@ fn comment_mod_built() -> bool {
         .exists()
 }
 
+/// Whether the wiki plugin wasm has been built.
+fn wiki_built() -> bool {
+    plugins_dist()
+        .join("wiki/ferropress_plugin_wiki.wasm")
+        .exists()
+}
+
+/// Seed a published post whose body is a single custom `wiki` block with `text`.
+async fn seed_wiki_post(store: &Arc<dyn RhypeStore>, slug: &str, text: &str) {
+    let tree = BlockTree::from_blocks(vec![Block {
+        uid: "01J0000000000000000000WIKI".to_owned(),
+        kind: BlockKind::Custom {
+            plugin: "wiki".to_owned(),
+            name: "wiki".to_owned(),
+            data: serde_json::json!({ "text": text }),
+        },
+        children: Vec::new(),
+    }]);
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(Status::Published.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String("Wiki".to_owned()));
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert(
+        "block_tree".to_owned(),
+        Value::String(tree.to_json_string().expect("serialize block tree")),
+    );
+    store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .expect("seed wiki post");
+}
+
+/// Full stack: a wiki custom block resolves `[[links]]` against LIVE content via
+/// the `content:read` capability, through the REAL router. The plugin host is
+/// wired with the real embedded store as its `ContentReader`; an existing target
+/// page renders a normal link, a missing one a red link.
+/// router -> serve -> render -> PluginHost -> wiki wasm -> fp_lookup_slug -> store.
+#[tokio::test]
+async fn serves_wiki_block_resolving_links_via_capability() {
+    if !wiki_built() {
+        eprintln!(
+            "skipping serves_wiki_block_resolving_links_via_capability: wiki wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // The CONCRETE store backs both the AppState's RhypeStore and the plugin host's
+    // ContentReader capability (the composition root does the same coercion).
+    let store_concrete =
+        Arc::new(EmbeddedStore::open(tmp.path().join("db")).expect("open embedded store"));
+    let store: Arc<dyn RhypeStore> = store_concrete.clone();
+    let blobs = Arc::new(LocalFsBlobStore::new(tmp.path().join("blobs")));
+    let theme = Arc::new(ferropress_serve::default_theme().expect("default theme builds"));
+
+    // A real plugin host loaded from plugins/dist (wiki's plugin.toml grants
+    // read_store), with the embedded store as the content-read backend.
+    let mut host = ferropress_plugin_host::PluginHost::new().with_content_reader(store_concrete);
+    host.load_dir(plugins_dist()).expect("load plugins dir");
+    let state = AppState::new(store.clone(), blobs, theme).with_custom_renderer(Arc::new(host));
+
+    // The link target exists (a published page); the wiki page links to it + a
+    // missing page.
+    seed_published_post(&store, "hello-world").await;
+    seed_wiki_post(
+        &store,
+        "my-wiki",
+        "See [[Hello World]] and [[No Such Page]].",
+    )
+    .await;
+
+    let (status, body) = get(&state, "/my-wiki").await;
+    assert_eq!(status, StatusCode::OK, "body=\n{body}");
+    // The existing target resolved to a normal link (capability read live content).
+    assert!(
+        body.contains("<a href=\"/hello-world\" class=\"wiki-link\""),
+        "existing [[link]] resolved to a normal wiki link; body=\n{body}"
+    );
+    // The missing target rendered as a red link.
+    assert!(
+        body.contains("<a href=\"/no-such-page\" class=\"wiki-link wiki-link-new\""),
+        "missing [[link]] rendered as a red link; body=\n{body}"
+    );
+}
+
 /// Seed a published Post and return its id (the comment path attaches to it).
 async fn seed_published_post(store: &Arc<dyn RhypeStore>, slug: &str) -> ObjectId {
     let mut fields: HashMap<String, Value> = HashMap::new();

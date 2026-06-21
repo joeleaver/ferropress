@@ -4,9 +4,13 @@
 //! having been built (`cargo xtask build-plugins`); if absent it skips with a
 //! message, mirroring the ONNX-gated tests elsewhere.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ferropress_core::error::{CoreError, Result as CoreResult};
 use ferropress_core::hook::{HookEvent, HookKind};
+use ferropress_core::plugin_caps::{ContentReader, PublishedRef};
 use ferropress_render::CustomBlockRenderer;
 
 use crate::{Capabilities, HookRegistration, HostLimits, PluginHost};
@@ -218,5 +222,123 @@ fn action_dispatch_ignores_guest_return() {
         out.payload["status"], "pending",
         "an action must not mutate the event payload: {}",
         out.payload
+    );
+}
+
+/// A [`ContentReader`] double: only the given slugs "exist" (as published Posts).
+struct StubReader {
+    existing: HashSet<String>,
+}
+
+impl ContentReader for StubReader {
+    fn lookup_published_slug(&self, slug: &str) -> CoreResult<Option<PublishedRef>> {
+        if self.existing.contains(slug) {
+            Ok(Some(PublishedRef {
+                id: 1,
+                type_name: "Post".to_owned(),
+                title: format!("Title of {slug}"),
+                slug: slug.to_owned(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Read the built wiki plugin wasm, or `None` if not built yet.
+fn wiki_wasm() -> Option<Vec<u8>> {
+    std::fs::read(repo_root().join("plugins/dist/wiki/ferropress_plugin_wiki.wasm")).ok()
+}
+
+/// The wiki plugin (granted `content:read`) resolves `[[links]]` through the
+/// `fp_lookup_slug` host function: an existing target renders a normal link with
+/// the page title as a tooltip; a missing target renders a "red link". This is the
+/// end-to-end proof that a capability host function works with a real wasm guest.
+#[test]
+fn wiki_plugin_resolves_links_via_capability() {
+    let Some(wasm) = wiki_wasm() else {
+        eprintln!(
+            "skipping wiki_plugin_resolves_links_via_capability: wiki wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    };
+
+    let reader = Arc::new(StubReader {
+        existing: ["hello-world".to_owned()].into_iter().collect(),
+    });
+    let mut host = PluginHost::new().with_content_reader(reader);
+    host.load_plugin(
+        "wiki",
+        &wasm,
+        Capabilities {
+            read_store: true,
+            ..Default::default()
+        },
+        HostLimits::default(),
+    )
+    .expect("load wiki plugin");
+
+    let html = host
+        .render(
+            "wiki",
+            "wiki",
+            &serde_json::json!({ "text": "See [[Hello World]] and [[No Such Page]]." }),
+        )
+        .expect("wiki renders Some(html)")
+        .into_string();
+
+    // The existing target: a normal link, with the real page title as the tooltip.
+    assert!(
+        html.contains(
+            "<a href=\"/hello-world\" class=\"wiki-link\" title=\"Title of hello-world\">Hello World</a>"
+        ),
+        "existing wiki link resolved via the capability: {html}"
+    );
+    // The missing target: a red link.
+    assert!(
+        html.contains(
+            "<a href=\"/no-such-page\" class=\"wiki-link wiki-link-new\" title=\"Page does not exist\">No Such Page</a>"
+        ),
+        "missing wiki link rendered as a red link: {html}"
+    );
+}
+
+/// Deny-by-default is STRUCTURAL: a plugin that declares `read_store` but is loaded
+/// with NO `ContentReader` wired has no `fp_lookup_slug` import, so it fails to
+/// instantiate rather than silently running without the capability.
+#[test]
+fn wiki_plugin_without_capability_backend_fails_to_load() {
+    let Some(wasm) = wiki_wasm() else {
+        eprintln!(
+            "skipping wiki_plugin_without_capability_backend_fails_to_load: wiki wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    };
+
+    // No `with_content_reader`, so the host function is never wired.
+    let mut host = PluginHost::new();
+    let err = host
+        .load_plugin(
+            "wiki",
+            &wasm,
+            Capabilities {
+                read_store: true,
+                ..Default::default()
+            },
+            HostLimits::default(),
+        )
+        .expect_err("a read_store plugin must fail to load when no ContentReader backs it");
+
+    // Pin the CAUSE so this proves the *structural* deny, not some unrelated load
+    // error: the failure is the unresolved `fp_lookup_slug` host import. The sibling
+    // test loads the SAME wasm bytes successfully once a ContentReader is wired, so
+    // together they prove the capability — not the wasm — gates loading.
+    assert!(
+        matches!(err, CoreError::Unavailable(_)),
+        "expected an instantiation failure, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("fp_lookup_slug"),
+        "the failure must be the unresolved fp_lookup_slug host import: {err}"
     );
 }

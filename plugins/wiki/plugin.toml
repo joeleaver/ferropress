@@ -1,0 +1,14 @@
+# Declarative manifest for the wiki plugin. `cargo xtask build-plugins` copies this
+# (alongside the built wasm) into plugins/dist/wiki/, which the server loads via
+# --plugins-dir. The host renders `wiki` custom blocks through `render_block`.
+id = "wiki"
+wasm = "ferropress_plugin_wiki.wasm"
+# Block names this plugin provides (editor/discovery metadata).
+blocks = ["wiki"]
+
+# This plugin is GRANTED content:read — the host wires the `fp_lookup_slug` host
+# function into its sandbox so it can check whether a `[[link]]` target exists.
+# Deny-by-default: without this grant the host function is absent and the plugin
+# could not call it (it would fail to instantiate).
+[capabilities]
+read_store = true

@@ -1,0 +1,34 @@
+# ferropress-plugin-wiki — a reference Ferropress plugin showing a CAPABILITY in
+# use: a wiki custom block that resolves `[[WikiLinks]]` against live content.
+#
+# It is granted `content:read` (`read_store` in plugin.toml), so the host wires the
+# `fp_lookup_slug` host function into its sandbox. The block render parses
+# `[[Target]]` / `[[Target|Label]]` links, slugifies each target, asks the host
+# whether a PUBLISHED page exists at that slug, and renders a normal link (exists)
+# or a "new page" red link (missing) — existence-aware wiki linking that WordPress
+# cannot sandbox.
+#
+# Outside the host workspace (the whole `plugins/` dir is excluded in the root
+# Cargo.toml): wasm32-only, pins its own deps. Build with `cargo xtask build-plugins`.
+[package]
+name = "ferropress-plugin-wiki"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Reference Ferropress plugin: a wiki-link custom block using the content:read capability (Extism PDK)."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde = { version = "1", features = ["derive"] }
+# Parses the `fp_lookup_slug` host result (a PublishedRef JSON, or `null`).
+serde_json = "1"
+# The plugin produces FINAL HTML, so it escapes its own text/attributes.
+html-escape = "0.2"
+
+[profile.release]
+opt-level = "z"
+strip = true
