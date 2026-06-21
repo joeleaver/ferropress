@@ -26,6 +26,7 @@ use axum::routing::get;
 use tower_http::services::ServeDir;
 
 use ferropress_core::error::CoreError;
+use ferropress_core::hook::{HookDispatcher, NoHooks};
 use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
@@ -57,6 +58,10 @@ pub struct AppState {
     /// [`NoCustomBlocks`] (custom blocks render as placeholders); the composition
     /// root injects the plugin host via [`with_custom_renderer`](Self::with_custom_renderer).
     pub custom: Arc<dyn CustomBlockRenderer>,
+    /// Runs WP-style hooks (e.g. the `comment.create` moderation filter). Defaults
+    /// to [`NoHooks`] (every event passes through unchanged); the composition root
+    /// injects the plugin host via [`with_hook_dispatcher`](Self::with_hook_dispatcher).
+    pub hooks: Arc<dyn HookDispatcher>,
 }
 
 impl AppState {
@@ -74,6 +79,7 @@ impl AppState {
             theme,
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
+            hooks: Arc::new(NoHooks),
         }
     }
 
@@ -88,6 +94,13 @@ impl AppState {
     /// (the `ferropress-plugin-host`).
     pub fn with_custom_renderer(mut self, custom: Arc<dyn CustomBlockRenderer>) -> Self {
         self.custom = custom;
+        self
+    }
+
+    /// Run hooks (e.g. the `comment.create` moderation filter) through `hooks`
+    /// (the `ferropress-plugin-host`).
+    pub fn with_hook_dispatcher(mut self, hooks: Arc<dyn HookDispatcher>) -> Self {
+        self.hooks = hooks;
         self
     }
 }

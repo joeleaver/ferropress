@@ -24,6 +24,7 @@
 //! (not N+1 traversals).
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
@@ -33,6 +34,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use ferropress_core::error::CoreError;
+use ferropress_core::hook::{HookEvent, HookKind};
 use ferropress_core::query::Edge;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
 use ferropress_core::{COMMENT_TYPE, CommentStatus, PAGE_TYPE, POST_TYPE};
@@ -64,6 +66,10 @@ const MAX_COMMENTS: usize = 500;
 const COMMENTS_FIELD: &str = "comments";
 /// The `Comment.parent` forward relation (threading).
 const PARENT_FIELD: &str = "parent";
+
+/// The hook fired (as a `filter`) just before a new comment is persisted, so an
+/// installed moderation plugin can classify it (e.g. set `status: "spam"`).
+const COMMENT_CREATE_HOOK: &str = "comment.create";
 
 /// `GET /api/comments?slug=…` query. `slug` is modeled as `Option` so a
 /// *missing* param is not an extractor rejection: the handler treats absent and
@@ -224,9 +230,42 @@ pub async fn list(
     Ok(Json(dtos))
 }
 
+/// The JSON payload sent to the `comment.create` filter hook: the proposed
+/// comment's moderation-relevant fields, with `status` defaulting to `pending`.
+/// A plugin returns the payload with `status` possibly changed; only `status` is
+/// read back ([`CommentCreateHookResult`]) — the server-validated body/author
+/// stay authoritative, so a filter *classifies* a comment but never rewrites its
+/// content.
+#[derive(Serialize)]
+struct CommentCreateHook<'a> {
+    slug: &'a str,
+    author_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_email: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_url: Option<&'a str>,
+    body: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_agent: Option<&'a str>,
+    status: &'a str,
+}
+
+/// What the server reads back from the filter's returned payload: the (possibly
+/// changed) moderation `status`. Unknown extra fields are ignored; an absent or
+/// unrecognized status leaves the comment `pending` — fail-closed, so a malformed
+/// plugin response holds the comment for manual review and never auto-publishes.
+#[derive(Deserialize)]
+struct CommentCreateHookResult {
+    #[serde(default)]
+    status: Option<CommentStatus>,
+}
+
 /// `POST /api/comments` — accept a new comment on the published entity behind
-/// `slug`. Created as [`CommentStatus::Pending`] (held for moderation), so it does
-/// not appear in [`list`] until approved.
+/// `slug`. Created [`CommentStatus::Pending`] by default (held for moderation) so
+/// it does not appear in [`list`] until approved; the `comment.create` filter hook
+/// may reclassify it first (e.g. a spam plugin sets [`CommentStatus::Spam`]).
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -328,10 +367,52 @@ pub async fn create(
         .map(|s| s.chars().take(MAX_UA_LEN).collect::<String>())
         .filter(|s| !s.is_empty());
 
+    // --- comment.create moderation FILTER hook ---
+    // Default moderation state is `pending`. An installed plugin may reclassify
+    // the comment (e.g. mark it spam) before it is persisted. The hook is skipped
+    // entirely when nothing is registered, so the common no-plugin path keeps zero
+    // overhead and no thread hop.
+    let mut status = CommentStatus::Pending;
+    if state.hooks.has_hooks(COMMENT_CREATE_HOOK) {
+        let payload = serde_json::to_value(CommentCreateHook {
+            slug,
+            author_name,
+            author_email: author_email.as_deref(),
+            author_url: author_url.as_deref(),
+            body: comment_body,
+            parent_id: body.parent_id,
+            user_agent: user_agent.as_deref(),
+            status: status.as_str(),
+        })
+        .map_err(|e| {
+            ApiError::Internal(CoreError::Store(format!("serializing hook payload: {e}")))
+        })?;
+        let event = HookEvent {
+            name: COMMENT_CREATE_HOOK.to_owned(),
+            kind: HookKind::Filter,
+            payload,
+        };
+        // extism calls are synchronous + CPU-bound; run dispatch off the async
+        // runtime. The dispatcher is `Arc`-shared and `Send + Sync`.
+        let hooks = Arc::clone(&state.hooks);
+        let filtered = tokio::task::spawn_blocking(move || hooks.dispatch(event))
+            .await
+            .map_err(|e| {
+                ApiError::Internal(CoreError::Store(format!("hook dispatch task failed: {e}")))
+            })?
+            .map_err(ApiError::Internal)?;
+        if let Ok(CommentCreateHookResult {
+            status: Some(decided),
+        }) = serde_json::from_value::<CommentCreateHookResult>(filtered.payload)
+        {
+            status = decided;
+        }
+    }
+
     let mut fields: FieldMap = FieldMap::new();
     fields.insert(
         "status".to_owned(),
-        Value::String(CommentStatus::Pending.as_str().to_owned()),
+        Value::String(status.as_str().to_owned()),
     );
     // The island form is plain text: store it as `body` and mirror it into the
     // `@vectorize` source `plaintext` so moderation search sees it.
@@ -379,12 +460,24 @@ pub async fn create(
         .create(&TypeName::from(COMMENT_TYPE), fields)
         .await?;
 
+    // The public response must NOT disclose a spam/trash classification — telling a
+    // spammer their comment was flagged lets them tune around the filter — so any
+    // non-approved outcome reports uniformly as `pending` / "awaiting moderation".
+    // (A filter that auto-approves a trusted commenter is reflected honestly.)
+    let (resp_status, message) = match status {
+        CommentStatus::Approved => (CommentStatus::Approved.as_str(), "comment posted"),
+        _ => (
+            CommentStatus::Pending.as_str(),
+            "comment received and awaiting moderation",
+        ),
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(CreateResponse {
             id: id.0,
-            status: CommentStatus::Pending.as_str(),
-            message: "comment received and awaiting moderation",
+            status: resp_status,
+            message,
         }),
     ))
 }

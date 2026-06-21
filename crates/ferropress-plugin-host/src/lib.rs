@@ -34,7 +34,7 @@ use extism::{Manifest, Plugin, PluginBuilder, Wasm};
 use serde::Deserialize;
 
 use ferropress_core::error::{CoreError, Result as CoreResult};
-use ferropress_core::hook::{HookEvent, HookKind};
+use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
 use ferropress_render::{CustomBlockRenderer, Html};
 
 /// The guest export a plugin must provide to render a custom block: it receives
@@ -143,6 +143,12 @@ impl HookBus {
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Whether any registration exists for a hook name. (`unregister_plugin` can
+    /// leave an empty vec behind, so this checks non-emptiness, not key presence.)
+    fn has_registrations(&self, name: &str) -> bool {
+        self.registrations.get(name).is_some_and(|v| !v.is_empty())
     }
 }
 
@@ -396,9 +402,32 @@ impl PluginHost {
         Ok(event)
     }
 
+    /// Whether any plugin registered a hook under `name` (so a caller can skip
+    /// [`dispatch`](Self::dispatch) — and the thread hop async callers need for
+    /// it — when nothing listens).
+    pub fn has_hooks(&self, name: &str) -> bool {
+        self.bus.has_registrations(name)
+    }
+
     /// Borrow the hook bus (register/unregister outside of manifest loading).
     pub fn bus_mut(&mut self) -> &mut HookBus {
         &mut self.bus
+    }
+}
+
+/// The plugin host is the [`HookDispatcher`] port (declared in `ferropress-core`
+/// so handlers can dispatch through `Arc<dyn HookDispatcher>` without depending on
+/// extism). Both methods forward to the inherent ones above: in method-call
+/// syntax an inherent method shadows a same-named trait method, so `self.dispatch`
+/// / `self.has_hooks` resolve to `PluginHost`'s own — this delegates, it does not
+/// recurse.
+impl HookDispatcher for PluginHost {
+    fn dispatch(&self, event: HookEvent) -> CoreResult<HookEvent> {
+        self.dispatch(event)
+    }
+
+    fn has_hooks(&self, name: &str) -> bool {
+        self.has_hooks(name)
     }
 }
 

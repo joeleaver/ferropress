@@ -96,9 +96,13 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     );
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
+    // The same plugin host is the custom-block renderer AND the hook dispatcher
+    // (the `comment.create` moderation filter runs through it); `plugins.clone()`
+    // coerces `Arc<PluginHost>` to each trait object at the call site.
     let app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
         .with_islands_dir(cfg.islands_dir.clone())
-        .with_custom_renderer(plugins.clone());
+        .with_custom_renderer(plugins.clone())
+        .with_hook_dispatcher(plugins.clone());
 
     // Wired but not yet driven in v1: the scheduler, secret store, and cert source
     // come online in later increments. Named so the composition seam is real and

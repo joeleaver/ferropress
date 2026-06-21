@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use ferropress_core::hook::{HookEvent, HookKind};
 use ferropress_render::CustomBlockRenderer;
 
 use crate::{Capabilities, HostLimits, PluginHost};
@@ -85,4 +86,75 @@ fn load_dir_loads_callout() {
         host.has_plugin("callout"),
         "callout loaded from plugins/dist"
     );
+}
+
+/// Build a `comment.create` filter event with the given body/author (the shape the
+/// island comment-create handler sends).
+fn comment_event(author_name: &str, body: &str) -> HookEvent {
+    HookEvent {
+        name: "comment.create".to_owned(),
+        kind: HookKind::Filter,
+        payload: serde_json::json!({
+            "slug": "hello",
+            "author_name": author_name,
+            "body": body,
+            "status": "pending",
+        }),
+    }
+}
+
+/// The comment-mod plugin, loaded from `plugins/dist` (which also registers its
+/// `comment.create` hook from `plugin.toml`), flags a spammy comment as `spam` and
+/// leaves a clean one `pending`. This is the dispatch + filter + hook-registration
+/// ABI proof — a real `extism-pdk` guest run through `PluginHost::dispatch`.
+#[test]
+fn comment_mod_plugin_flags_spam() {
+    let dist = repo_root().join("plugins/dist");
+    if !dist.join("comment-mod").exists() {
+        eprintln!(
+            "skipping comment_mod_plugin_flags_spam: comment-mod not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    }
+    let mut host = PluginHost::new();
+    host.load_dir(&dist).expect("load plugins dir");
+    assert!(
+        host.has_hooks("comment.create"),
+        "comment-mod registered its comment.create hook"
+    );
+
+    // A keyword-matching comment is reclassified spam …
+    let spam = host
+        .dispatch(comment_event("Spammer", "Cheap VIAGRA, click here now!"))
+        .expect("dispatch spam event");
+    assert_eq!(
+        spam.payload["status"], "spam",
+        "spammy comment flagged: {}",
+        spam.payload
+    );
+
+    // … a link-flooded one too (more than two URLs) …
+    let links = host
+        .dispatch(comment_event(
+            "Linker",
+            "see http://a.test http://b.test https://c.test",
+        ))
+        .expect("dispatch link-flood event");
+    assert_eq!(links.payload["status"], "spam", "link flood flagged");
+
+    // … while a genuine comment passes through untouched.
+    let clean = host
+        .dispatch(comment_event(
+            "Jo",
+            "Really enjoyed this — thanks for writing it.",
+        ))
+        .expect("dispatch clean event");
+    assert_eq!(
+        clean.payload["status"], "pending",
+        "clean comment stays pending: {}",
+        clean.payload
+    );
+    // The filter is faithful: it returns the rest of the payload unchanged.
+    assert_eq!(clean.payload["author_name"], "Jo");
+    assert_eq!(clean.payload["slug"], "hello");
 }

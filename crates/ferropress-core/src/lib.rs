@@ -36,7 +36,7 @@ pub mod value;
 pub use block::{BLOCK_SCHEMA_VERSION, Block, BlockKind, BlockTree, InlineRun};
 pub use entity::*;
 pub use error::{CoreError, Result};
-pub use hook::{HookEvent, HookKind};
+pub use hook::{HookDispatcher, HookEvent, HookKind, NoHooks};
 pub use ids::{SchemaVersion, Slug};
 pub use ports::{
     BlobKey, BlobStore, BoxFuture, CertSource, Certificate, ScheduleId, ScheduledJob, Scheduler,
