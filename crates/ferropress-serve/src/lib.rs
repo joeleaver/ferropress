@@ -27,6 +27,7 @@ use ferropress_core::query::{Change, ChangeKind, SubscribeFilter};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::Value;
 use ferropress_core::{PAGE_TYPE, POST_TYPE};
+use ferropress_render::CustomBlockRenderer;
 use ferropress_theme::ThemeEngine;
 
 pub mod content;
@@ -87,29 +88,33 @@ fn page_blob_key(page: &OutputPage) -> BlobKey {
 
 /// Drives prerender + incremental regeneration over the ports.
 ///
-/// Holds the same three collaborators the read path uses: the store (to read the
-/// changed entity), the blob cache (to write-through / evict), and the theme (to
-/// produce final chrome) — so a regenerated page is byte-for-byte what a fresh
-/// [`serve_path`] render would have produced.
+/// Holds the same collaborators the read path uses: the store (to read the
+/// changed entity), the blob cache (to write-through / evict), the theme (to
+/// produce final chrome), and the custom-block renderer (to resolve plugin
+/// blocks) — so a regenerated page is byte-for-byte what a fresh [`serve_path`]
+/// render would have produced.
 pub struct ServeEngine {
     store: Arc<dyn RhypeStore>,
     blobs: Arc<dyn BlobStore>,
     theme: Arc<ThemeEngine>,
+    custom: Arc<dyn CustomBlockRenderer>,
 }
 
 impl ServeEngine {
-    /// Build the engine over the injected ports + the shared theme host. The
-    /// concrete adapters (and the theme) are chosen in `ferropress-server` (the
-    /// composition root), never here.
+    /// Build the engine over the injected ports + the shared theme host + the
+    /// custom-block renderer. The concrete adapters (theme, plugin host) are chosen
+    /// in `ferropress-server` (the composition root), never here.
     pub fn new(
         store: Arc<dyn RhypeStore>,
         blobs: Arc<dyn BlobStore>,
         theme: Arc<ThemeEngine>,
+        custom: Arc<dyn CustomBlockRenderer>,
     ) -> Self {
         Self {
             store,
             blobs,
             theme,
+            custom,
         }
     }
 
@@ -271,7 +276,7 @@ impl ServeEngine {
         &self,
         page: &OutputPage,
     ) -> ferropress_core::error::Result<Option<String>> {
-        content::render_path(&self.store, &self.theme, &page.path).await
+        content::render_path(&self.store, &self.theme, self.custom.as_ref(), &page.path).await
     }
 }
 

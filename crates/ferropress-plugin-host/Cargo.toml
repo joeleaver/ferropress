@@ -3,12 +3,24 @@ name = "ferropress-plugin-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Embedded wasmtime plugin runtime: epoch-interruption + StoreLimits resource control, a deny-by-default Linker capability model, and a WordPress-style action/filter hook bus. Stub scaffold."
+description = "Embedded WASM plugin runtime (extism): owned timeout + memory limits, deny-by-default host functions, a WordPress-style action/filter hook bus, and a custom-block renderer."
 
 [lints]
 workspace = true
 
 [dependencies]
 ferropress-core = { workspace = true }
-wasmtime = { workspace = true }
+# Implements `ferropress_render::CustomBlockRenderer` (the seam render uses to ask
+# a plugin for a custom block's HTML).
+ferropress-render = { workspace = true }
+# Embedded WASM plugin runtime. extism gives us owned limits (timeout + memory),
+# deny-by-default host functions + allowed_hosts, and PDK compatibility; the
+# `PluginHost` API here is the seam so the runtime could be swapped later.
+extism = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Parses the per-plugin `plugin.toml` manifests in the plugins dir.
+toml = { workspace = true }
+# A failing plugin call/hook is logged (never leaked / never fatal).
+tracing = { workspace = true }

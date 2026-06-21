@@ -100,4 +100,10 @@ pub struct ServerConfig {
         default_value = "./crates/ferropress-islands/dist"
     )]
     pub islands_dir: PathBuf,
+
+    /// Directory of installed plugins — one subdirectory per plugin, each with a
+    /// `plugin.toml` + its wasm (the `dist/` output of `cargo xtask build-plugins`).
+    /// A missing directory just means no plugins are loaded.
+    #[arg(long, env = "FERROPRESS_PLUGINS_DIR", default_value = "./plugins/dist")]
+    pub plugins_dir: PathBuf,
 }

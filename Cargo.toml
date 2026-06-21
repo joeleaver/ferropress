@@ -22,14 +22,16 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-# Two crates are intentionally OUT of the workspace:
+# Intentionally OUT of the workspace:
 #   * xtask — a CI lint tool; we don't want its (heavier) deps polluting the
 #     workspace dependency graph it audits. Invoked via `--manifest-path xtask/`.
 #   * crates/ferropress-islands — a wasm32-only `cdylib` depending on rinch-web
 #     (browser/web_sys only). The workspace's host `cargo check --workspace`
-#     cannot build it, so it lives outside the workspace with its OWN Cargo.lock
-#     and is built for wasm via `cargo xtask build-islands`.
-exclude = ["xtask", "crates/ferropress-islands"]
+#     cannot build it, so it lives outside with its OWN Cargo.lock and is built
+#     for wasm via `cargo xtask build-islands`.
+#   * plugins/ — reference WASM plugins (Extism PDK, wasm32 `cdylib`s). Built via
+#     `cargo xtask build-plugins`; loaded at runtime by ferropress-plugin-host.
+exclude = ["xtask", "crates/ferropress-islands", "plugins"]
 
 [workspace.package]
 version = "0.1.0"
@@ -99,8 +101,13 @@ serde_json = "1"
 toml = "0.8"
 
 # --- WASM plugin runtime -----------------------------------------------------
-# Pin major; capability sandbox uses epoch_interruption + StoreLimits.
+# The embedded plugin runtime is the `extism` host SDK (it bundles wasmtime,
+# ">=27,<31"). It gives us owned limits (with_timeout + with_memory_max),
+# deny-by-default host functions + allowed_hosts, and PDK compatibility, behind
+# our own `PluginHost` seam. `wasmtime` stays declared in case a crate needs the
+# raw engine later, but `ferropress-plugin-host` uses `extism`.
 wasmtime = "27"
+extism = "1"
 
 # --- Templating / rendering --------------------------------------------------
 minijinja = { version = "2", features = ["loader"] }

@@ -1,114 +1,119 @@
 //! # ferropress-plugin-host
 //!
-//! Embedded **wasmtime** plugin runtime. Ferropress OWNS the resource limits and
-//! the capability surface; a plugin is a sandboxed WebAssembly module with an
-//! Extism-shaped bytes-in / bytes-out ABI.
+//! Ferropress's embedded WASM plugin runtime, built on the **`extism`** host SDK.
+//! Ferropress owns the resource limits and the capability surface; a plugin is a
+//! sandboxed WebAssembly module with the Extism bytes-in / bytes-out ABI (so the
+//! 11-language Extism PDK authors them).
 //!
-//! Three load-bearing mechanisms (all wasmtime-native, all configured by the
-//! host — never by the guest):
+//! Three load-bearing mechanisms, all configured by the host — never the guest:
 //!
-//! 1. **Resource limits.** [`HostLimits`] are enforced via
-//!    `Engine` `epoch_interruption` (a wall-clock deadline that interrupts a
-//!    runaway guest), `StoreLimits` (linear-memory / table / instance ceilings
-//!    via `Store::limiter`), and optional `fuel` (deterministic step budget).
-//! 2. **Capabilities are STRUCTURAL** ([`Capabilities`]). A guest can only call
-//!    host functions the [`Linker`] actually defines for it. Deny-by-default: an
-//!    empty capability set wires up NO host imports, so the plugin is pure
-//!    compute. There is no ambient authority, no `WASI` filesystem/network unless
-//!    a capability explicitly adds it.
-//! 3. **Hook bus** ([`HookBus`]). A WordPress-style action/filter dispatcher.
-//!    Actions observe an event; filters may transform its JSON payload. The store
-//!    change feed (`RhypeStore::subscribe`) is bridged into hook events so
-//!    plugins can react to content changes.
+//! 1. **Resource limits** ([`HostLimits`]) — a wall-clock `timeout` and a
+//!    linear-memory page ceiling, applied to every plugin's extism [`Manifest`].
+//! 2. **Capabilities are deny-by-default** ([`Capabilities`]). A plugin gets NO
+//!    host access unless granted: no WASI, no network (`allowed_hosts` empty), and
+//!    only the host functions a granted capability wires in. An empty capability
+//!    set is a pure-compute plugin.
+//! 3. **Hook bus** ([`HookBus`]) — a WordPress-style action/filter dispatcher.
+//!    Actions observe an event; filters transform its JSON payload.
 //!
-//! STATUS: stub scaffold — real types + signatures, `todo!()` bodies. The whole
-//! crate compiles on host so the composition root can name these types now.
-
-#![allow(dead_code)]
+//! The host also implements [`ferropress_render::CustomBlockRenderer`], so the one
+//! shared render crate can resolve `BlockKind::Custom` blocks by calling a
+//! plugin's `render_block` export — without taking any wasmtime/extism dependency
+//! itself.
+//!
+//! `extism` is the runtime, but [`PluginHost`] is the seam: the public API here
+//! (load / call / dispatch + [`Capabilities`]/[`HostLimits`]) is runtime-agnostic,
+//! so the implementation could move to raw wasmtime later without touching callers.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::Duration;
 
-use ferropress_core::error::Result as CoreResult;
+use extism::{Manifest, Plugin, PluginBuilder, Wasm};
+use serde::Deserialize;
+
+use ferropress_core::error::{CoreError, Result as CoreResult};
 use ferropress_core::hook::{HookEvent, HookKind};
+use ferropress_render::{CustomBlockRenderer, Html};
+
+/// The guest export a plugin must provide to render a custom block: it receives
+/// JSON `{ "name": <block name>, "data": <block payload> }` and returns HTML bytes.
+const BLOCK_RENDER_EXPORT: &str = "render_block";
 
 // ---------------------------------------------------------------------------
 // Resource limits
 // ---------------------------------------------------------------------------
 
-/// Per-plugin resource ceilings the host enforces. None of these are negotiable
-/// by the guest.
+/// Per-plugin resource ceilings the host enforces (mapped onto extism's
+/// [`Manifest`]). Not negotiable by the guest.
 #[derive(Debug, Clone)]
 pub struct HostLimits {
-    /// Number of epoch ticks a single guest call may run before it is
-    /// interrupted. The host increments the engine epoch on a timer; this is the
-    /// wall-clock deadline guard against an infinite loop.
-    pub epoch_deadline_ticks: u64,
-    /// Maximum linear memory (bytes) the guest may grow to (enforced via
-    /// `StoreLimits`).
-    pub max_memory_bytes: usize,
-    /// Maximum number of WebAssembly tables / table elements (enforced via
-    /// `StoreLimits`).
-    pub max_table_elements: usize,
-    /// Optional deterministic fuel budget per call. `None` = rely on epoch
-    /// interruption only (fuel adds overhead; use it when determinism matters).
-    pub fuel: Option<u64>,
+    /// Wall-clock budget for a single guest call; extism interrupts the plugin if
+    /// it meets or exceeds this (`Manifest::with_timeout`).
+    pub timeout: Duration,
+    /// Maximum WebAssembly linear-memory pages (64 KiB each) the guest may grow to
+    /// (`Manifest::with_memory_max`). `None` leaves it at extism's default.
+    pub max_memory_pages: Option<u32>,
 }
 
 impl Default for HostLimits {
     fn default() -> Self {
-        // Conservative defaults; the server config can tighten/loosen these.
+        // Conservative defaults; a deployment can tighten/loosen these.
         Self {
-            epoch_deadline_ticks: 1,
-            max_memory_bytes: 64 * 1024 * 1024, // 64 MiB
-            max_table_elements: 10_000,
-            fuel: None,
+            timeout: Duration::from_millis(1000),
+            max_memory_pages: Some(256), // 256 * 64 KiB = 16 MiB
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Capabilities (structural, deny-by-default)
+// Capabilities (deny-by-default)
 // ---------------------------------------------------------------------------
 
-/// The structural capability set granted to a plugin. Each `true` flag tells the
-/// host to wire the corresponding group of host functions into that plugin's
-/// [`Linker`]. The default (`Default::default()` -> all `false`) is a pure
-/// compute plugin with no host access whatsoever.
+/// The capability set granted to a plugin. Default = all denied (a pure-compute
+/// plugin: no WASI, no network, no host functions).
+///
+/// v1's bundled plugins are capability-zero, so the store/settings host-function
+/// wiring is intentionally not built yet — when a plugin needs `read_store` etc.,
+/// the granted host functions are added to [`PluginHost::load_plugin`]'s builder
+/// here (deny-by-default falls out of only-wiring-what-is-granted). `http_fetch`
+/// maps to extism's `allowed_hosts`.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
-    /// May call host functions that READ from the `RhypeStore` port.
+    /// May call host functions that READ from the store.
     pub read_store: bool,
-    /// May call host functions that WRITE to the `RhypeStore` port.
+    /// May call host functions that WRITE to the store.
     pub write_store: bool,
-    /// May call the host's outbound HTTP fetch shim.
+    /// May make outbound HTTP requests — only to [`Self::allowed_hosts`].
     pub http_fetch: bool,
-    /// May read/write a scoped key/value area in `Setting` (namespaced to the
-    /// plugin id).
+    /// May read/write a plugin-scoped settings area.
     pub plugin_settings: bool,
+    /// Hosts the plugin may reach when `http_fetch` is granted (extism
+    /// `allowed_hosts`). Empty = none (deny-by-default).
+    pub allowed_hosts: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Hook bus
 // ---------------------------------------------------------------------------
 
-/// A registration tying a plugin to a named hook. `priority` orders execution
-/// (lower runs first, mirroring WordPress).
+/// A registration tying a plugin export to a named hook. `priority` orders
+/// execution (lower runs first, mirroring WordPress).
 #[derive(Debug, Clone)]
 pub struct HookRegistration {
     pub plugin_id: String,
     pub hook_name: String,
     pub kind: HookKind,
     pub priority: i32,
-    /// The exported guest function name to invoke for this hook.
+    /// The exported guest function to invoke for this hook.
     pub export: String,
 }
 
-/// WordPress-style action/filter dispatcher. Holds the registration table and,
-/// at dispatch time, invokes each matching plugin export under its
-/// [`HostLimits`] + [`Capabilities`].
+/// WordPress-style action/filter dispatcher: the registration table, kept
+/// priority-sorted per hook.
 #[derive(Default)]
 pub struct HookBus {
-    /// hook_name -> ordered registrations.
     registrations: HashMap<String, Vec<HookRegistration>>,
 }
 
@@ -117,119 +122,281 @@ impl HookBus {
         Self::default()
     }
 
-    /// Register a plugin export against a hook. (Re-sorts that hook's list by
-    /// priority.)
-    pub fn register(&mut self, _reg: HookRegistration) {
-        // TODO: push into registrations[hook_name], then sort_by_key(priority).
-        todo!("insert registration and keep the per-hook list priority-sorted")
+    /// Register a plugin export against a hook (keeps the per-hook list
+    /// priority-sorted, lowest first).
+    pub fn register(&mut self, reg: HookRegistration) {
+        let list = self.registrations.entry(reg.hook_name.clone()).or_default();
+        list.push(reg);
+        list.sort_by_key(|r| r.priority);
     }
 
-    /// Remove all registrations for a plugin (on unload).
-    pub fn unregister_plugin(&mut self, _plugin_id: &str) {
-        // TODO: retain registrations whose plugin_id != plugin_id across all hooks.
-        todo!("drop every registration belonging to this plugin id")
+    /// Remove every registration belonging to a plugin (on unload).
+    pub fn unregister_plugin(&mut self, plugin_id: &str) {
+        for list in self.registrations.values_mut() {
+            list.retain(|r| r.plugin_id != plugin_id);
+        }
     }
+
+    /// The (priority-ordered) registrations for a hook name.
+    fn for_hook(&self, name: &str) -> &[HookRegistration] {
+        self.registrations
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declarative plugin manifest (`plugin.toml`)
+// ---------------------------------------------------------------------------
+
+/// A plugin's `plugin.toml`, read from each subdirectory of the plugins dir.
+#[derive(Debug, Deserialize)]
+struct PluginManifest {
+    /// Stable plugin id (matches `BlockKind::Custom.plugin`).
+    id: String,
+    /// Wasm filename, relative to the plugin's directory.
+    wasm: String,
+    #[serde(default)]
+    capabilities: CapabilitiesManifest,
+    #[serde(default)]
+    hooks: Vec<HookManifest>,
+    /// Block names this plugin renders — discovery metadata for the editor; the
+    /// renderer routes by plugin id + the `render_block` export, so this is not
+    /// load-bearing here.
+    #[serde(default)]
+    #[allow(dead_code)]
+    blocks: Vec<String>,
+}
+
+/// `[capabilities]` table (all default-deny).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct CapabilitiesManifest {
+    read_store: bool,
+    write_store: bool,
+    http_fetch: bool,
+    plugin_settings: bool,
+    allowed_hosts: Vec<String>,
+}
+
+impl From<CapabilitiesManifest> for Capabilities {
+    fn from(m: CapabilitiesManifest) -> Self {
+        Capabilities {
+            read_store: m.read_store,
+            write_store: m.write_store,
+            http_fetch: m.http_fetch,
+            plugin_settings: m.plugin_settings,
+            allowed_hosts: m.allowed_hosts,
+        }
+    }
+}
+
+/// One `[[hooks]]` entry.
+#[derive(Debug, Deserialize)]
+struct HookManifest {
+    event: String,
+    /// `"action"` or `"filter"`.
+    kind: String,
+    export: String,
+    #[serde(default)]
+    priority: i32,
 }
 
 // ---------------------------------------------------------------------------
 // The host
 // ---------------------------------------------------------------------------
 
-/// The plugin host. Owns the shared wasmtime `Engine` (with epoch interruption
-/// enabled), the loaded plugin instances, and the [`HookBus`]. One per server.
+/// The plugin host. Owns the loaded plugins and the [`HookBus`]. One per server,
+/// shared as `Arc<PluginHost>`.
+///
+/// Each [`Plugin`] is single-threaded, so it is held behind a `Mutex` — calls to
+/// one plugin serialize, which is exactly extism's requirement, while different
+/// plugins run independently.
 pub struct PluginHost {
-    // engine: wasmtime::Engine,                  // epoch_interruption = true
-    // plugins: HashMap<String, LoadedPlugin>,    // module + per-plugin Capabilities
-    // bus: HookBus,
-    // epoch_ticker: tokio::task::JoinHandle<()>, // increments engine.increment_epoch()
+    plugins: HashMap<String, Mutex<Plugin>>,
     bus: HookBus,
 }
 
-/// Per-plugin runtime state held by the host. A `wasmtime::Store` carries the
-/// `StoreLimits` + the per-call epoch deadline; the `Linker` carries exactly the
-/// host functions this plugin's [`Capabilities`] allow.
-struct LoadedPlugin {
-    // module: wasmtime::Module,
-    // linker: wasmtime::Linker<HostCtx>,
-    // capabilities: Capabilities,
-    // limits: HostLimits,
-    capabilities: Capabilities,
-    limits: HostLimits,
-}
-
-/// Host-side store data threaded through every guest call. Carries the
-/// `StoreLimits` (so `Store::limiter` can borrow it) plus handles to the host
-/// services a capability may expose.
-struct HostCtx {
-    // limits: wasmtime::StoreLimits,
-    // capabilities: Capabilities,
-    // (store/http/setting handles wired in per capability)
-}
-
 impl PluginHost {
-    /// Build an empty plugin host. Engine-free and infallible: the wasmtime
-    /// `Engine` (with `epoch_interruption`) and the epoch ticker are constructed
-    /// lazily on the first [`load_plugin`](Self::load_plugin), so a server with no
-    /// plugins boots without a runtime present (the runtime is a later increment).
+    /// An empty host (no plugins). Plugins are added via [`load_plugin`] /
+    /// [`load_dir`].
     pub fn new() -> Self {
         Self {
+            plugins: HashMap::new(),
             bus: HookBus::new(),
         }
     }
 
-    /// Load a plugin module's bytes under `plugin_id`, with the given capability
-    /// set and limits. Builds a deny-by-default [`Linker`] and adds ONLY the host
-    /// functions the capabilities allow.
+    /// Scan a plugins directory: each subdirectory with a `plugin.toml` is loaded
+    /// (its wasm under the declared capabilities, its hooks registered). A missing
+    /// directory is not an error (a deployment may run with no plugins). A single
+    /// malformed plugin is logged and skipped so it can't stop the others.
+    pub fn load_dir(&mut self, dir: impl AsRef<Path>) -> CoreResult<()> {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            tracing::info!(dir = %dir.display(), "no plugins dir; running without plugins");
+            return Ok(());
+        }
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            CoreError::Unavailable(format!("reading plugins dir {}: {e}", dir.display()))
+        })?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| CoreError::Unavailable(format!("reading plugins dir entry: {e}")))?;
+            let sub = entry.path();
+            if !sub.is_dir() {
+                continue;
+            }
+            let manifest_path = sub.join("plugin.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            if let Err(e) = self.load_manifest(&manifest_path) {
+                // One bad plugin must not abort the rest.
+                tracing::error!(path = %manifest_path.display(), error = %e, "skipping plugin");
+            }
+        }
+        Ok(())
+    }
+
+    /// Load one plugin from its `plugin.toml` path.
+    fn load_manifest(&mut self, manifest_path: &Path) -> CoreResult<()> {
+        let dir = manifest_path
+            .parent()
+            .ok_or_else(|| CoreError::Validation("plugin.toml has no parent dir".to_owned()))?;
+        let text = std::fs::read_to_string(manifest_path).map_err(|e| {
+            CoreError::Unavailable(format!("reading {}: {e}", manifest_path.display()))
+        })?;
+        let manifest: PluginManifest = toml::from_str(&text).map_err(|e| {
+            CoreError::Validation(format!("parsing {}: {e}", manifest_path.display()))
+        })?;
+
+        let wasm_path = dir.join(&manifest.wasm);
+        let wasm = std::fs::read(&wasm_path)
+            .map_err(|e| CoreError::Unavailable(format!("reading {}: {e}", wasm_path.display())))?;
+
+        self.load_plugin(
+            &manifest.id,
+            &wasm,
+            manifest.capabilities.into(),
+            HostLimits::default(),
+        )?;
+
+        for hook in manifest.hooks {
+            let kind = parse_hook_kind(&hook.kind)?;
+            self.bus.register(HookRegistration {
+                plugin_id: manifest.id.clone(),
+                hook_name: hook.event,
+                kind,
+                priority: hook.priority,
+                export: hook.export,
+            });
+        }
+        tracing::info!(id = %manifest.id, "loaded plugin");
+        Ok(())
+    }
+
+    /// Load a plugin module under `id` with the given capabilities + limits.
+    /// Builds an extism [`Manifest`] (timeout + memory ceiling + `allowed_hosts`)
+    /// and a deny-by-default [`PluginBuilder`] (`with_wasi(false)`, host functions
+    /// added only for granted capabilities).
     pub fn load_plugin(
         &mut self,
-        _plugin_id: &str,
-        _wasm_bytes: &[u8],
-        _capabilities: Capabilities,
-        _limits: HostLimits,
+        id: &str,
+        wasm_bytes: &[u8],
+        capabilities: Capabilities,
+        limits: HostLimits,
     ) -> CoreResult<()> {
-        // TODO:
-        //   let module = Module::new(&engine, wasm_bytes)?;
-        //   let mut linker = Linker::new(&engine);
-        //   if capabilities.read_store  { wire read_store host fns }
-        //   if capabilities.write_store { wire write_store host fns }
-        //   if capabilities.http_fetch  { wire http host fns }
-        //   if capabilities.plugin_settings { wire setting host fns }
-        //   store the LoadedPlugin.
-        todo!("compile module + build a deny-by-default Linker per Capabilities")
+        let mut manifest =
+            Manifest::new([Wasm::data(wasm_bytes.to_vec())]).with_timeout(limits.timeout);
+        if let Some(pages) = limits.max_memory_pages {
+            manifest = manifest.with_memory_max(pages);
+        }
+        if capabilities.http_fetch {
+            for host in &capabilities.allowed_hosts {
+                manifest = manifest.with_allowed_host(host);
+            }
+        }
+
+        // Deny-by-default: WASI off; host functions are added ONLY for granted
+        // capabilities. (v1 plugins are capability-zero; store/settings host
+        // functions are wired here when a plugin first needs them.)
+        let builder = PluginBuilder::new(manifest).with_wasi(false);
+
+        let plugin = builder
+            .build()
+            .map_err(|e| CoreError::Unavailable(format!("building plugin {id}: {e}")))?;
+
+        self.plugins.insert(id.to_owned(), Mutex::new(plugin));
+        Ok(())
     }
 
-    /// Invoke one plugin export (the Extism-shaped bytes-in/bytes-out ABI) under
-    /// the plugin's limits. Sets the per-call epoch deadline + StoreLimits on a
-    /// fresh `Store`, writes `input` into guest memory, calls the export, and
-    /// reads back the output bytes.
-    pub async fn call(
-        &self,
-        _plugin_id: &str,
-        _export: &str,
-        _input: &[u8],
-    ) -> CoreResult<Vec<u8>> {
-        // TODO:
-        //   let mut store = Store::new(&engine, HostCtx{ limits: StoreLimitsBuilder...});
-        //   store.limiter(|ctx| &mut ctx.limits);
-        //   store.set_epoch_deadline(limits.epoch_deadline_ticks);
-        //   if let Some(f) = limits.fuel { store.set_fuel(f)?; }
-        //   instantiate via the plugin's Linker, run the export on a blocking-safe
-        //   path, map a Trap (epoch/fuel/oom) -> CoreError::Unavailable.
-        todo!("instantiate under limits, run the bytes-in/bytes-out export")
+    /// Invoke one plugin export (Extism bytes-in/bytes-out) under its limits.
+    /// Synchronous (an extism call is CPU-bound); async callers should
+    /// `spawn_blocking`.
+    pub fn call(&self, plugin_id: &str, export: &str, input: &[u8]) -> CoreResult<Vec<u8>> {
+        let plugin = self
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| CoreError::Unavailable(format!("plugin {plugin_id} is not loaded")))?;
+        let mut guard = plugin
+            .lock()
+            .map_err(|_| CoreError::Store(format!("plugin {plugin_id} mutex poisoned")))?;
+        guard
+            .call::<&[u8], Vec<u8>>(export, input)
+            .map_err(|e| CoreError::Store(format!("plugin {plugin_id}.{export} failed: {e}")))
     }
 
-    /// Dispatch a hook event to every subscribed plugin. Actions observe the
-    /// payload (return value ignored); filters may transform it — the transformed
-    /// payload feeds the next filter and is finally returned.
-    pub async fn dispatch(&self, _event: HookEvent) -> CoreResult<HookEvent> {
-        let _ = &self.bus;
-        // TODO: look up self.bus.registrations[event.name]; for each, serialize the
-        // payload, self.call(plugin, export, bytes), and for Filter hooks replace
-        // event.payload with the (deserialized) result. Return the final event.
-        todo!("route the hook through its registered plugins under limits + caps")
+    /// Whether a plugin id is loaded.
+    pub fn has_plugin(&self, plugin_id: &str) -> bool {
+        self.plugins.contains_key(plugin_id)
     }
 
-    /// Borrow the hook bus to register/unregister hooks.
+    /// Dispatch a hook event to every registered plugin, in priority order.
+    /// **Filter** hooks replace the payload with the guest's returned JSON (fed to
+    /// the next filter and finally returned); **Action** hooks ignore the return.
+    /// A failing hook is logged and skipped — one bad plugin never breaks the
+    /// request. Synchronous; async callers should `spawn_blocking`.
+    pub fn dispatch(&self, mut event: HookEvent) -> CoreResult<HookEvent> {
+        let regs = self.bus.for_hook(&event.name);
+        if regs.is_empty() {
+            return Ok(event);
+        }
+        let input = serde_json::to_vec(&event.payload)
+            .map_err(|e| CoreError::Store(format!("serializing hook payload: {e}")))?;
+        // The payload may be transformed by filters; track the current bytes.
+        let mut current = input;
+        for reg in regs {
+            match self.call(&reg.plugin_id, &reg.export, &current) {
+                Ok(out) => {
+                    if reg.kind == HookKind::Filter {
+                        match serde_json::from_slice::<serde_json::Value>(&out) {
+                            Ok(value) => {
+                                event.payload = value;
+                                current = out;
+                            }
+                            Err(e) => tracing::error!(
+                                hook = %event.name,
+                                plugin = %reg.plugin_id,
+                                error = %e,
+                                "filter returned invalid JSON; ignoring its output",
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::error!(
+                    hook = %event.name,
+                    plugin = %reg.plugin_id,
+                    error = %e,
+                    "hook plugin failed; skipping",
+                ),
+            }
+        }
+        Ok(event)
+    }
+
+    /// Borrow the hook bus (register/unregister outside of manifest loading).
     pub fn bus_mut(&mut self) -> &mut HookBus {
         &mut self.bus
     }
@@ -240,3 +407,54 @@ impl Default for PluginHost {
         Self::new()
     }
 }
+
+/// Resolve `BlockKind::Custom` blocks by calling the owning plugin's
+/// `render_block` export. An absent plugin or a failing call yields `None`, so the
+/// renderer falls back to its placeholder rather than erroring the whole page.
+impl CustomBlockRenderer for PluginHost {
+    fn render(&self, plugin: &str, name: &str, data: &serde_json::Value) -> Option<Html> {
+        if !self.has_plugin(plugin) {
+            return None;
+        }
+        let input = serde_json::to_vec(&serde_json::json!({ "name": name, "data": data }))
+            .map_err(|e| tracing::error!(plugin, name, error = %e, "serializing block input"))
+            .ok()?;
+        match self.call(plugin, BLOCK_RENDER_EXPORT, &input) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(html) => Some(Html(html)),
+                Err(e) => {
+                    tracing::error!(plugin, name, error = %e, "custom block output was not UTF-8");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::error!(plugin, name, error = %e, "custom block render failed");
+                None
+            }
+        }
+    }
+}
+
+// PluginHost is shared as `Arc<PluginHost>` across async tasks (it implements
+// CustomBlockRenderer and is dispatched to from request handlers), so it must stay
+// Send + Sync. `Mutex<Plugin>` provides that as long as extism's `Plugin: Send` —
+// this assertion fails to compile if that ever stops holding (then switch to
+// extism's `Pool`).
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PluginHost>();
+};
+
+/// Map a manifest hook-kind string to [`HookKind`].
+fn parse_hook_kind(s: &str) -> CoreResult<HookKind> {
+    match s {
+        "action" => Ok(HookKind::Action),
+        "filter" => Ok(HookKind::Filter),
+        other => Err(CoreError::Validation(format!(
+            "unknown hook kind {other:?} (expected \"action\" or \"filter\")"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests;

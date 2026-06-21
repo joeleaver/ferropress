@@ -9,12 +9,14 @@
 
 use ferropress_core::{Block, BlockKind, InlineRun};
 
-use crate::{Html, RenderMode};
+use crate::{CustomBlockRenderer, Html, RenderMode};
 
-/// Render one block (recursing into children) to HTML.
+/// Render one block (recursing into children) to HTML. Custom (plugin) blocks are
+/// resolved through `custom` (see [`CustomBlockRenderer`]); all other blocks are
+/// pure.
 ///
 /// FERROPRESS-RENDER-DISPATCH — the one and only `BlockKind -> HTML` match.
-pub fn render_block(block: &Block, mode: RenderMode) -> Html {
+pub fn render_block(block: &Block, mode: RenderMode, custom: &dyn CustomBlockRenderer) -> Html {
     let html = match &block.kind {
         BlockKind::Paragraph { runs } => format!("<p>{}</p>", render_runs(runs)),
 
@@ -32,7 +34,7 @@ pub fn render_block(block: &Block, mode: RenderMode) -> Html {
             let mut items = String::new();
             for child in &block.children {
                 items.push_str("<li>");
-                items.push_str(render_block(child, mode).as_str());
+                items.push_str(render_block(child, mode, custom).as_str());
                 items.push_str("</li>");
             }
             format!("<{tag}>{items}</{tag}>")
@@ -72,15 +74,21 @@ pub fn render_block(block: &Block, mode: RenderMode) -> Html {
             )
         }
 
-        BlockKind::Custom { plugin, name, .. } => {
-            // Plugin-defined block. The real HTML comes from the plugin's render
-            // hook (ferropress-plugin-host); the pure renderer emits a typed
-            // placeholder so the tree still renders with the plugin absent.
-            let plugin = html_escape::encode_double_quoted_attribute(plugin);
-            let name = html_escape::encode_double_quoted_attribute(name);
-            format!(
-                "<div class=\"fp-custom\" data-plugin=\"{plugin}\" data-block=\"{name}\"></div>"
-            )
+        BlockKind::Custom { plugin, name, data } => {
+            // Ask the plugin host to render it. A returned `Html` is the plugin's
+            // FINAL, trusted output — emitted raw (see `CustomBlockRenderer`). With
+            // no host (or an unresolved block) we fall back to a typed placeholder
+            // so the tree still renders with the plugin absent.
+            match custom.render(plugin, name, data) {
+                Some(rendered) => rendered.into_string(),
+                None => {
+                    let plugin = html_escape::encode_double_quoted_attribute(plugin);
+                    let name = html_escape::encode_double_quoted_attribute(name);
+                    format!(
+                        "<div class=\"fp-custom\" data-plugin=\"{plugin}\" data-block=\"{name}\"></div>"
+                    )
+                }
+            }
         }
     };
     Html(html)

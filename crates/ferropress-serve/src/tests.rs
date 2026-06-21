@@ -19,6 +19,8 @@ use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_store_embedded::EmbeddedStore;
 use ferropress_theme::ThemeEngine;
 
+use ferropress_render::NoCustomBlocks;
+
 use crate::{OutputPage, ServeEngine, cache_key, content, serve_path};
 
 const PARAGRAPH_TEXT: &str = "Hello from the Ferropress cache test.";
@@ -107,7 +109,7 @@ async fn serve_path_read_through_populates_cache() {
     );
 
     // MISS -> render-on-demand -> populate.
-    let served = match serve_path(&store, &blobs, &theme, &path).await {
+    let served = match serve_path(&store, &blobs, &theme, &NoCustomBlocks, &path).await {
         crate::Resolved::Found(html) => html,
         other => panic!("expected Found on a published post, got {other:?}"),
     };
@@ -150,7 +152,7 @@ async fn serve_path_cache_hit_serves_stored_bytes() {
         .expect("seeding the cache entry");
 
     // serve_path must return the sentinel, not a fresh render.
-    match serve_path(&store, &blobs, &theme, &path).await {
+    match serve_path(&store, &blobs, &theme, &NoCustomBlocks, &path).await {
         crate::Resolved::Found(html) => {
             assert_eq!(html, SENTINEL, "must serve the cached bytes verbatim");
             assert!(
@@ -171,7 +173,12 @@ async fn regen_write_through_then_eviction() {
     let (store, blobs, theme) = boot(tmp.path());
     let id = seed_post(&store, SLUG, Status::Published).await;
 
-    let engine = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), Arc::clone(&theme));
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::clone(&theme),
+        Arc::new(NoCustomBlocks),
+    );
     let path = format!("/{SLUG}");
     let key = cache_key(&path);
 
@@ -246,6 +253,7 @@ async fn live_regen_loop_regenerates_on_change() {
         Arc::clone(&store),
         Arc::clone(&blobs),
         theme,
+        Arc::new(NoCustomBlocks),
     ));
     let regen = Arc::clone(&engine);
     let handle = tokio::spawn(async move {

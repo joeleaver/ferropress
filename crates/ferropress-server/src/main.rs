@@ -73,18 +73,37 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // (`ServeEngine`) so a prerendered page is byte-for-byte what an on-demand
     // render would produce.
     let theme = Arc::new(default_theme().context("building the page-chrome theme")?);
-    let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), Arc::clone(&theme));
-    let plugins = PluginHost::new();
+
+    // The embedded plugin host: load installed plugins from the plugins dir, then
+    // share it as the custom-block renderer for BOTH the read path (`AppState`) and
+    // the regen loop (`ServeEngine`) — so a plugin-rendered block is byte-for-byte
+    // identical whichever path produced the page. (`Arc<PluginHost>` coerces to
+    // `Arc<dyn CustomBlockRenderer>` at each call site.)
+    let mut plugins = PluginHost::new();
+    plugins
+        .load_dir(&cfg.plugins_dir)
+        .context("loading plugins")?;
+    let plugins = Arc::new(plugins);
+
+    // `plugins.clone()` yields `Arc<PluginHost>`, which coerces to
+    // `Arc<dyn CustomBlockRenderer>` at each call site (the `PluginHost` is the
+    // renderer for both the regen loop and the read path).
+    let serve = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::clone(&theme),
+        plugins.clone(),
+    );
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
     let app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
-        .with_islands_dir(cfg.islands_dir.clone());
+        .with_islands_dir(cfg.islands_dir.clone())
+        .with_custom_renderer(plugins.clone());
 
-    // Wired but not yet driven in v1: the scheduler, secret store, cert source,
-    // and the plugin host all come online in later increments. Named so the
-    // composition seam is real and they stay constructed. (The regen loop IS now
-    // driven — spawned below — so `serve` is no longer in this discard tuple.)
-    let _ = (&secrets, &scheduler, &certs, &plugins);
+    // Wired but not yet driven in v1: the scheduler, secret store, and cert source
+    // come online in later increments. Named so the composition seam is real and
+    // they stay constructed. (`serve` is spawned below; `plugins` is now injected.)
+    let _ = (&secrets, &scheduler, &certs);
 
     // 3. Spawn the static-first regeneration loop as a background task BEFORE the
     //    HTTP server boots. It subscribes to the change feed and write-throughs /

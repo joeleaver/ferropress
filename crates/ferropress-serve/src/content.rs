@@ -29,7 +29,7 @@ use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{TypeName, Value};
 use ferropress_core::{BlockTree, Compare, FilterSpec, Object, PAGE_TYPE, POST_TYPE, Status};
-use ferropress_render::{RenderMode, render};
+use ferropress_render::{CustomBlockRenderer, RenderMode, render_with};
 use ferropress_theme::{PageContext, SandboxLimits, ThemeEngine, ThemeError};
 
 use crate::cache_key;
@@ -115,9 +115,10 @@ pub fn slug_from_path(path: &str) -> &str {
 pub async fn resolve_path(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
     path: &str,
 ) -> Resolved {
-    match render_path(store, theme, path).await {
+    match render_path(store, theme, custom, path).await {
         Ok(Some(html)) => Resolved::Found(html),
         Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
@@ -146,6 +147,7 @@ pub async fn serve_path(
     store: &Arc<dyn RhypeStore>,
     blobs: &Arc<dyn BlobStore>,
     theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
     path: &str,
 ) -> Resolved {
     let key = cache_key(path);
@@ -172,7 +174,7 @@ pub async fn serve_path(
     }
 
     // 2. Miss: render on demand, then populate the cache (write-through).
-    match render_path(store, theme, path).await {
+    match render_path(store, theme, custom, path).await {
         Ok(Some(html)) => {
             if let Err(e) = blobs.put(&key, html.clone().into_bytes()).await {
                 // Populate-on-miss is best-effort: a write failure must not fail
@@ -193,6 +195,7 @@ pub async fn serve_path(
 pub(crate) async fn render_path(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
     path: &str,
 ) -> Result<Option<String>, CoreError> {
     let slug = slug_from_path(path);
@@ -205,7 +208,7 @@ pub(crate) async fn render_path(
         None => return Ok(None),
     };
 
-    let html = render_object(theme, &object)?;
+    let html = render_object(theme, custom, &object)?;
     Ok(Some(html))
 }
 
@@ -280,13 +283,18 @@ pub(crate) fn is_published(obj: &Object) -> bool {
 /// string, render the body, and wrap it in the page-chrome template.
 ///
 /// No `BlockKind` is inspected here — block markup is produced solely by
-/// `ferropress_render::render` (the one-shared-renderer invariant). The `title`
-/// is read off the object's `title` field (empty if absent).
+/// `ferropress_render::render_with` (the one-shared-renderer invariant), with
+/// `custom` resolving plugin (`BlockKind::Custom`) blocks. The `title` is read off
+/// the object's `title` field (empty if absent).
 ///
 /// `pub(crate)` so the regen loop's `render_page` can render an object it has
 /// already `get`-fetched (by id, off a change) without going back through the
 /// slug-based [`render_path`] lookup.
-pub(crate) fn render_object(theme: &ThemeEngine, obj: &Object) -> Result<String, CoreError> {
+pub(crate) fn render_object(
+    theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
+    obj: &Object,
+) -> Result<String, CoreError> {
     // `block_tree` is persisted as a JSON *String* (not Bytes / Json scalar).
     let tree = match obj.get("block_tree") {
         Some(Value::String(s)) => BlockTree::from_json_str(s)?,
@@ -299,7 +307,7 @@ pub(crate) fn render_object(theme: &ThemeEngine, obj: &Object) -> Result<String,
         }
     };
 
-    let body = render(&tree, RenderMode::Publish);
+    let body = render_with(&tree, RenderMode::Publish, custom);
 
     let title = match obj.get("title") {
         Some(Value::String(s)) => s.clone(),

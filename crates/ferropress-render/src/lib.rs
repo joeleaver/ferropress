@@ -54,15 +54,54 @@ pub enum RenderMode {
     Preview,
 }
 
-/// Render a whole block tree to HTML. The single public entry point.
+/// Resolves a custom (plugin) block to HTML. The renderer itself is pure and has
+/// no plugin runtime, so it delegates `BlockKind::Custom` through this seam:
+/// `ferropress-plugin-host` implements it (running the plugin's `render_block`
+/// export); the render crate gains no wasmtime/extism dependency.
+///
+/// Returning `None` falls back to the built-in typed placeholder (so a tree still
+/// renders with the plugin absent). A returned [`Html`] is the plugin's FINAL
+/// output and is emitted **raw** — plugins are operator-installed, trusted code
+/// (output sanitization / trust tiers are a separate concern), exactly as a
+/// WordPress shortcode emits arbitrary HTML.
+///
+/// `Send + Sync` so it can be shared as `Arc<dyn CustomBlockRenderer>` across the
+/// async serve path + the regen loop (axum state must be `Send + Sync`).
+pub trait CustomBlockRenderer: Send + Sync {
+    /// Render the custom block identified by `(plugin, name)` with its opaque JSON
+    /// `data`, or `None` to use the placeholder.
+    fn render(&self, plugin: &str, name: &str, data: &serde_json::Value) -> Option<Html>;
+}
+
+/// A [`CustomBlockRenderer`] that resolves nothing — every custom block falls back
+/// to the placeholder. Used by [`render`] when no plugin host is wired (tests,
+/// the editor before a host exists).
+pub struct NoCustomBlocks;
+
+impl CustomBlockRenderer for NoCustomBlocks {
+    fn render(&self, _plugin: &str, _name: &str, _data: &serde_json::Value) -> Option<Html> {
+        None
+    }
+}
+
+/// Render a whole block tree to HTML with no custom-block resolution (custom
+/// blocks render as placeholders). Equivalent to [`render_with`] using
+/// [`NoCustomBlocks`]. The single public entry point for the pure path.
+pub fn render(tree: &BlockTree, mode: RenderMode) -> Html {
+    render_with(tree, mode, &NoCustomBlocks)
+}
+
+/// Render a whole block tree to HTML, resolving custom (plugin) blocks through
+/// `custom`. The serve/publish path passes the plugin host here so
+/// `BlockKind::Custom` blocks get their real HTML.
 ///
 /// Walks `tree.blocks` in order, dispatches each top-level block through the
 /// single [`blocks::render_block`] match (which recurses into children), and
 /// concatenates the fragments. Returns ready-to-embed [`Html`].
-pub fn render(tree: &BlockTree, mode: RenderMode) -> Html {
+pub fn render_with(tree: &BlockTree, mode: RenderMode, custom: &dyn CustomBlockRenderer) -> Html {
     let mut out = String::new();
     for block in &tree.blocks {
-        out.push_str(blocks::render_block(block, mode).as_str());
+        out.push_str(blocks::render_block(block, mode, custom).as_str());
     }
     Html(out)
 }

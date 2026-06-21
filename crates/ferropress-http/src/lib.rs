@@ -28,6 +28,7 @@ use tower_http::services::ServeDir;
 use ferropress_core::error::CoreError;
 use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
+use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
 use ferropress_serve::Resolved;
 use ferropress_theme::ThemeEngine;
 
@@ -52,11 +53,16 @@ pub struct AppState {
     /// of `ferropress-islands`). When set, it is served at `/_fp/islands`; `None`
     /// (e.g. in tests) simply omits that route.
     pub islands_dir: Option<PathBuf>,
+    /// Resolves `BlockKind::Custom` (plugin) blocks during page render. Defaults to
+    /// [`NoCustomBlocks`] (custom blocks render as placeholders); the composition
+    /// root injects the plugin host via [`with_custom_renderer`](Self::with_custom_renderer).
+    pub custom: Arc<dyn CustomBlockRenderer>,
 }
 
 impl AppState {
-    /// Assemble the shared state from the injected ports + theme host. Island
-    /// asset serving is off until set via [`with_islands_dir`](Self::with_islands_dir).
+    /// Assemble the shared state from the injected ports + theme host. Island asset
+    /// serving is off until [`with_islands_dir`](Self::with_islands_dir); custom
+    /// blocks render as placeholders until [`with_custom_renderer`](Self::with_custom_renderer).
     pub fn new(
         store: Arc<dyn RhypeStore>,
         blobs: Arc<dyn BlobStore>,
@@ -67,6 +73,7 @@ impl AppState {
             blobs,
             theme,
             islands_dir: None,
+            custom: Arc::new(NoCustomBlocks),
         }
     }
 
@@ -74,6 +81,13 @@ impl AppState {
     /// `cargo xtask build-islands`) at `/_fp/islands`.
     pub fn with_islands_dir(mut self, dir: PathBuf) -> Self {
         self.islands_dir = Some(dir);
+        self
+    }
+
+    /// Resolve plugin (`BlockKind::Custom`) blocks during render via `custom`
+    /// (the `ferropress-plugin-host`).
+    pub fn with_custom_renderer(mut self, custom: Arc<dyn CustomBlockRenderer>) -> Self {
+        self.custom = custom;
         self
     }
 }
@@ -171,7 +185,15 @@ async fn healthz() -> impl IntoResponse {
 async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_owned();
 
-    match ferropress_serve::serve_path(&state.store, &state.blobs, &state.theme, &path).await {
+    match ferropress_serve::serve_path(
+        &state.store,
+        &state.blobs,
+        &state.theme,
+        state.custom.as_ref(),
+        &path,
+    )
+    .await
+    {
         Resolved::Found(html) => (StatusCode::OK, Html(html)).into_response(),
         Resolved::NotFound => (StatusCode::NOT_FOUND, "Not Found").into_response(),
         Resolved::Error(err) => {

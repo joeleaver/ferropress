@@ -163,3 +163,83 @@ async fn draft_post_is_not_served() {
     );
     assert_eq!(body, "Not Found");
 }
+
+/// The built callout plugin wasm, or `None` if it has not been built yet
+/// (`cargo xtask build-plugins`).
+fn callout_wasm() -> Option<Vec<u8>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crate is two levels under the repo root")
+        .join("plugins/dist/callout/ferropress_plugin_callout.wasm");
+    std::fs::read(path).ok()
+}
+
+/// Seed a published post whose body is a single custom `callout` block.
+async fn seed_callout_post(store: &Arc<dyn RhypeStore>, slug: &str) {
+    let tree = BlockTree::from_blocks(vec![Block {
+        uid: "01J0000000000000000000CALL".to_owned(),
+        kind: BlockKind::Custom {
+            plugin: "callout".to_owned(),
+            name: "callout".to_owned(),
+            data: serde_json::json!({ "variant": "warning", "text": "Heads up <b>!</b>" }),
+        },
+        children: Vec::new(),
+    }]);
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(Status::Published.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String("Callout".to_owned()));
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert(
+        "block_tree".to_owned(),
+        Value::String(tree.to_json_string().expect("serialize block tree")),
+    );
+    store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .expect("seed callout post");
+}
+
+/// Full stack: a custom block is rendered by a REAL plugin through the REAL router.
+/// router -> serve_page -> serve_path -> render_object -> render_with ->
+/// PluginHost (extism) -> callout wasm -> `<div class="fp-callout …">` in the page.
+/// Gated on the wasm being built (skips otherwise, like the ONNX tests).
+#[tokio::test]
+async fn serves_custom_block_via_plugin() {
+    let Some(wasm) = callout_wasm() else {
+        eprintln!(
+            "skipping serves_custom_block_via_plugin: callout wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+
+    // A real plugin host, loaded with the built callout plugin, as the renderer.
+    let mut host = ferropress_plugin_host::PluginHost::new();
+    host.load_plugin("callout", &wasm, Default::default(), Default::default())
+        .expect("load callout plugin");
+    let state = state.with_custom_renderer(Arc::new(host));
+
+    seed_callout_post(&store, "with-callout").await;
+
+    let (status, body) = get(&state, "/with-callout").await;
+    assert_eq!(status, StatusCode::OK, "body=\n{body}");
+    assert!(
+        body.contains("<div class=\"fp-callout fp-callout-warning\">"),
+        "the plugin's HTML must appear (not the placeholder); body=\n{body}"
+    );
+    assert!(
+        body.contains("Heads up &lt;b&gt;!&lt;/b&gt;"),
+        "the plugin escaped the block text; body=\n{body}"
+    );
+    assert!(
+        !body.contains("data-plugin=\"callout\""),
+        "the built-in placeholder must NOT be used when the plugin renders; body=\n{body}"
+    );
+}

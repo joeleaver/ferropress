@@ -11,3 +11,7 @@ workspace = true
 [dependencies]
 ferropress-core = { workspace = true }
 html-escape = { workspace = true }
+# Custom (plugin) block payloads are opaque JSON; the `CustomBlockRenderer` seam
+# names `serde_json::Value`. (No wasmtime/extism dep — the plugin host implements
+# the trait; render only defines it.)
+serde_json = { workspace = true }

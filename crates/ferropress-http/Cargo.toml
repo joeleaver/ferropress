@@ -35,6 +35,10 @@ tracing = { workspace = true }
 # `rhypedb-*` deps, which stay on store-embedded/schema-sdl).
 ferropress-store-embedded = { workspace = true }
 ferropress-blob-localfs = { workspace = true }
+# The custom-block e2e test drives a real plugin host (loading the built callout
+# wasm) as the AppState renderer, proving router -> serve -> render -> plugin.
+# (serde_json is already a normal dep, used by the test to build the block data.)
+ferropress-plugin-host = { workspace = true }
 # `tower::ServiceExt::oneshot` feeds a synthetic request through the router with
 # no socket; tempfile gives each test run an isolated store/blob dir.
 tower = { workspace = true }
