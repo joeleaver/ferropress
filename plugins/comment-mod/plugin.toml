@@ -1,0 +1,15 @@
+# Declarative manifest for the comment-mod plugin. `cargo xtask build-plugins`
+# copies this (alongside the built wasm) into plugins/dist/comment-mod/, which the
+# server loads via --plugins-dir. The host registers the [[hooks]] entry below and,
+# on a new comment, dispatches the `comment.create` filter to this plugin's
+# `comment_create` export.
+id = "comment-mod"
+wasm = "ferropress_plugin_comment_mod.wasm"
+# No `blocks` (this plugin renders nothing) and no [capabilities] table →
+# capability-zero (pure compute, no host access: it reads only the comment payload).
+
+[[hooks]]
+event = "comment.create"
+kind = "filter"
+export = "comment_create"
+priority = 10
