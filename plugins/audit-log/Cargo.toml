@@ -1,0 +1,31 @@
+# ferropress-plugin-audit-log — a reference Ferropress plugin: an ACTION hook that
+# logs every change it is wired to. Built with the Extism Rust PDK to a wasm32
+# `cdylib`, loaded by `ferropress-plugin-host` (extism). It is a PURE-COMPUTE,
+# capability-zero plugin: it observes the change payload and logs it.
+#
+# It demonstrates the action-hook authoring shape (the post-persist counterpart to
+# the comment-mod FILTER). A capability-zero action can only OBSERVE (log); doing
+# real work in reaction to a change (store writes, webhooks) needs capability
+# host-functions, a later increment.
+#
+# Outside the host workspace (the whole `plugins/` dir is excluded in the root
+# Cargo.toml): wasm32-only, pins its own deps. Build with `cargo xtask build-plugins`.
+[package]
+name = "ferropress-plugin-audit-log"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Reference Ferropress plugin: an action hook that logs changes (Extism PDK)."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+# Reads the change payload (type / kind / object_id) as JSON.
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+strip = true

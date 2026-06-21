@@ -115,8 +115,10 @@ jobs:
             .
             plugins/callout
             plugins/comment-mod
+            plugins/audit-log
       - run: cargo clippy --manifest-path plugins/callout/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: cargo clippy --manifest-path plugins/comment-mod/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --manifest-path plugins/audit-log/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: cargo run --manifest-path xtask/Cargo.toml -- build-plugins
       - run: cargo test -p ferropress-plugin-host
       - run: cargo test -p ferropress-http

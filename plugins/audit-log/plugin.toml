@@ -1,0 +1,13 @@
+# Declarative manifest for the audit-log plugin. `cargo xtask build-plugins` copies
+# this (alongside the built wasm) into plugins/dist/audit-log/, which the server
+# loads via --plugins-dir. The change-feed -> action bridge dispatches the
+# `comment.created` action (post-persist) to this plugin's `on_change` export.
+id = "audit-log"
+wasm = "ferropress_plugin_audit_log.wasm"
+# No `blocks` and no [capabilities] table → capability-zero (observe/log only).
+
+[[hooks]]
+event = "comment.created"
+kind = "action"
+export = "on_change"
+priority = 10
