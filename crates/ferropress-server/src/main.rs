@@ -26,7 +26,7 @@ use uuid::Uuid;
 use ferropress_core::ports::{BlobStore, CertSource, Scheduler, SecretStore};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
-use ferropress_core::{Block, BlockKind, BlockTree, InlineRun, POST_TYPE, Status};
+use ferropress_core::{Block, BlockKind, BlockTree, ContentReader, InlineRun, POST_TYPE, Status};
 
 use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_cert_acme::{AcmeCertSource, AcmeConfig};
@@ -65,7 +65,13 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let blobs = select_blob_store(&cfg);
     let scheduler = select_scheduler();
     let certs = select_cert_source(&cfg);
+    // The concrete store backs TWO ports. Coerce it to the synchronous
+    // `content:read` capability while it is still concrete, then re-bind `store`
+    // to the async data port the rest of the wiring uses. (`store.clone()` coerces
+    // on the result; `Arc::clone(&store)` would force `T = dyn …` and not unsize.)
     let store = select_store(&cfg)?;
+    let content_reader: Arc<dyn ContentReader> = store.clone();
+    let store: Arc<dyn RhypeStore> = store;
 
     // 2. Build the owned subsystems over the ports.
     // Build the page-chrome theme once (its template registered) and share it
@@ -79,7 +85,10 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // the regen loop (`ServeEngine`) — so a plugin-rendered block is byte-for-byte
     // identical whichever path produced the page. (`Arc<PluginHost>` coerces to
     // `Arc<dyn CustomBlockRenderer>` at each call site.)
-    let mut plugins = PluginHost::new();
+    // The same concrete store (as `content_reader`) backs the synchronous
+    // `content:read` capability a plugin granted `read_store` reaches via
+    // `fp_lookup_slug`.
+    let mut plugins = PluginHost::new().with_content_reader(content_reader);
     plugins
         .load_dir(&cfg.plugins_dir)
         .context("loading plugins")?;
@@ -228,9 +237,12 @@ fn select_cert_source(cfg: &ServerConfig) -> Arc<dyn CertSource> {
     Arc::new(source)
 }
 
-/// Select the `RhypeStore` adapter (the embedded rhypedb engine — the only one
-/// today). Opening runs the additive schema reconcile.
-fn select_store(cfg: &ServerConfig) -> Result<Arc<dyn RhypeStore>> {
+/// Select the embedded rhypedb store (the only adapter today). Returns the
+/// CONCRETE `Arc<EmbeddedStore>` — not a trait object — because it backs two ports:
+/// it coerces to `Arc<dyn RhypeStore>` for the async data path AND to
+/// `Arc<dyn ContentReader>` for the plugin host's synchronous `content:read`
+/// capability. Opening runs the additive schema reconcile.
+fn select_store(cfg: &ServerConfig) -> Result<Arc<EmbeddedStore>> {
     let store = EmbeddedStore::open(&cfg.data_dir)
         .with_context(|| format!("opening embedded store at {}", cfg.data_dir.display()))?;
     Ok(Arc::new(store))

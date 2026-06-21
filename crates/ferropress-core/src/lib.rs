@@ -25,6 +25,7 @@ pub mod entity;
 pub mod error;
 pub mod hook;
 pub mod ids;
+pub mod plugin_caps;
 pub mod ports;
 pub mod query;
 pub mod role;
@@ -38,6 +39,7 @@ pub use entity::*;
 pub use error::{CoreError, Result};
 pub use hook::{HookDispatcher, HookEvent, HookKind, NoHooks};
 pub use ids::{SchemaVersion, Slug};
+pub use plugin_caps::{ContentReader, PublishedRef};
 pub use ports::{
     BlobKey, BlobStore, BoxFuture, CertSource, Certificate, ScheduleId, ScheduledJob, Scheduler,
     SecretRef, SecretStore,

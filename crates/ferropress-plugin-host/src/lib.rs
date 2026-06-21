@@ -27,14 +27,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use extism::{Manifest, Plugin, PluginBuilder, Wasm};
+use extism::{Manifest, Plugin, PluginBuilder, UserData, ValType, Wasm, host_fn};
 use serde::Deserialize;
 
 use ferropress_core::error::{CoreError, Result as CoreResult};
 use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
+use ferropress_core::plugin_caps::ContentReader;
 use ferropress_render::{CustomBlockRenderer, Html};
 
 /// The guest export a plugin must provide to render a custom block: it receives
@@ -222,16 +223,32 @@ struct HookManifest {
 pub struct PluginHost {
     plugins: HashMap<String, Mutex<Plugin>>,
     bus: HookBus,
+    /// The `content:read` capability backend. `None` until injected via
+    /// [`with_content_reader`](Self::with_content_reader); when absent, a plugin's
+    /// `read_store` grant has no effect (the `fp_lookup_slug` host function is not
+    /// wired, so deny-by-default holds).
+    content: Option<Arc<dyn ContentReader>>,
 }
 
 impl PluginHost {
-    /// An empty host (no plugins). Plugins are added via [`load_plugin`] /
-    /// [`load_dir`].
+    /// An empty host (no plugins, no capability backends). Plugins are added via
+    /// [`load_plugin`] / [`load_dir`]; capability backends via the `with_*` setters.
     pub fn new() -> Self {
         Self {
             plugins: HashMap::new(),
             bus: HookBus::new(),
+            content: None,
         }
+    }
+
+    /// Inject the `content:read` capability backend (the embedded store's
+    /// synchronous [`ContentReader`]). Plugins granted `read_store` then get the
+    /// `fp_lookup_slug` host function backed by it. MUST be set before
+    /// [`load_dir`](Self::load_dir) / [`load_plugin`](Self::load_plugin), since the
+    /// host function is wired at plugin-build time.
+    pub fn with_content_reader(mut self, content: Arc<dyn ContentReader>) -> Self {
+        self.content = Some(content);
+        self
     }
 
     /// Scan a plugins directory: each subdirectory with a `plugin.toml` is loaded
@@ -326,9 +343,34 @@ impl PluginHost {
         }
 
         // Deny-by-default: WASI off; host functions are added ONLY for granted
-        // capabilities. (v1 plugins are capability-zero; store/settings host
-        // functions are wired here when a plugin first needs them.)
-        let builder = PluginBuilder::new(manifest).with_wasi(false);
+        // capabilities. An ungranted capability has NO import in the guest, so a
+        // plugin can never call a host function it did not declare.
+        let mut builder = PluginBuilder::new(manifest).with_wasi(false);
+
+        // `content:read` (`read_store`): expose `fp_lookup_slug`, backed by the
+        // injected `ContentReader`. If a plugin declares `read_store` but no backend
+        // was wired, the host function is absent and the plugin fails to
+        // instantiate — surfaced clearly rather than silently granting nothing.
+        if capabilities.read_store {
+            match &self.content {
+                Some(content) => {
+                    builder = builder.with_function(
+                        "fp_lookup_slug",
+                        [ValType::I64],
+                        [ValType::I64],
+                        UserData::new(Arc::clone(content)),
+                        fp_lookup_slug,
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        plugin = id,
+                        "plugin requests `read_store` but no ContentReader is wired; \
+                         `fp_lookup_slug` will be unresolved and the plugin will fail to load"
+                    );
+                }
+            }
+        }
 
         let plugin = builder
             .build()
@@ -473,6 +515,30 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PluginHost>();
 };
+
+// The `fp_lookup_slug` host function (the `content:read` capability). The guest
+// passes a slug; it returns the JSON of a [`PublishedRef`](ferropress_core::PublishedRef)
+// (`{id, type, title, slug}`) when a PUBLISHED entity answers that slug, else the
+// literal `null`. Backed by the [`ContentReader`] captured in `UserData`. A lookup
+// error / poisoned lock degrades to `null` (the target simply reads as
+// non-existent) — a capability call never aborts the guest. Wired into a plugin's
+// linker only when it is granted `read_store`.
+host_fn!(fp_lookup_slug(user_data: Arc<dyn ContentReader>; slug: String) -> String {
+    let cell = user_data.get()?;
+    let guard = match cell.lock() {
+        Ok(g) => g,
+        Err(_) => return Ok("null".to_owned()),
+    };
+    let json = match guard.lookup_published_slug(&slug) {
+        Ok(Some(found)) => serde_json::to_string(&found).unwrap_or_else(|_| "null".to_owned()),
+        Ok(None) => "null".to_owned(),
+        Err(e) => {
+            tracing::error!(error = %e, "fp_lookup_slug failed");
+            "null".to_owned()
+        }
+    };
+    Ok(json)
+});
 
 /// Map a manifest hook-kind string to [`HookKind`].
 fn parse_hook_kind(s: &str) -> CoreResult<HookKind> {
