@@ -19,6 +19,12 @@
 /crates/ferropress-islands/target/
 /crates/ferropress-islands/dist/
 
+# plugins/ are wasm cdylibs OUTSIDE the workspace (Extism PDK). Each has its own
+# target dir; `cargo xtask build-plugins` assembles the loadable bundles into
+# plugins/dist/. (Each plugin's Cargo.lock IS committed.)
+/plugins/*/target/
+/plugins/dist/
+
 # Env / secrets (Ferropress uses a dotenv-style SecretStore adapter)
 .env
 .env.*

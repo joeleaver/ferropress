@@ -95,6 +95,27 @@ jobs:
       - run: cargo install wasm-bindgen-cli --version 0.2.125 --locked
       - run: cargo run --manifest-path xtask/Cargo.toml -- build-islands
 
+  # Reference WASM plugins (Extism PDK) are EXCLUDED from the workspace, so the
+  # --workspace jobs don't cover them. Lint + build them for wasm32, then run the
+  # plugin-host integration test (which loads the built wasm — the extism ABI
+  # conformance proof; it skips in the plain `test` job where plugins aren't built).
+  plugins-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            plugins/callout
+      - run: cargo clippy --manifest-path plugins/callout/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo run --manifest-path xtask/Cargo.toml -- build-plugins
+      - run: cargo test -p ferropress-plugin-host
+
   # Portability boundary: ferropress-core must build entirely on its own, naming
   # ZERO external upstream (no rhypedb, no rinch, no jkbase). Building just this
   # package — and nothing else in the workspace — proves the boundary holds.

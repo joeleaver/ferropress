@@ -1,0 +1,10 @@
+# Declarative manifest for the callout plugin. `cargo xtask build-plugins` copies
+# this (alongside the built wasm) into plugins/dist/callout/, which the server
+# loads via --plugins-dir. `id` matches the block tree's `Custom.plugin` field;
+# the host renders `Custom` blocks by calling this plugin's `render_block` export.
+id = "callout"
+wasm = "ferropress_plugin_callout.wasm"
+# Block names this plugin provides (editor/discovery metadata).
+blocks = ["callout"]
+# No [capabilities] table → capability-zero (pure compute, no host access).
+# No [[hooks]] → renders blocks only.

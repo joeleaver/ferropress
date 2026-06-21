@@ -1,0 +1,28 @@
+# ferropress-plugin-callout — a reference Ferropress plugin: a custom "callout"
+# block renderer. Built with the Extism Rust PDK to a wasm32 `cdylib`, loaded by
+# `ferropress-plugin-host` (extism). It is a PURE-COMPUTE, capability-zero plugin:
+# attrs JSON in, HTML out, no host access.
+#
+# This crate is OUTSIDE the host workspace (the whole `plugins/` dir is excluded in
+# the root Cargo.toml): it is wasm32-only and pins its own deps. Build it with
+# `cargo xtask build-plugins`, which compiles it and assembles `plugins/dist/callout/`.
+[package]
+name = "ferropress-plugin-callout"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Reference Ferropress plugin: a 'callout' custom-block renderer (Extism PDK)."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+serde = { version = "1", features = ["derive"] }
+# The plugin produces FINAL HTML, so it escapes its own text/attributes.
+html-escape = "0.2"
+
+[profile.release]
+opt-level = "z"
+strip = true

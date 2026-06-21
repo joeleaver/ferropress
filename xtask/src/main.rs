@@ -57,8 +57,9 @@ fn main() -> Result<()> {
         // `dep-graph-lint` is the name CI invokes; `dep-graph` is the short form.
         Some("dep-graph") | Some("dep-graph-lint") | None => dep_graph_lint(),
         Some("build-islands") => build_islands(),
+        Some("build-plugins") => build_plugins(),
         Some(other) => bail!(
-            "unknown xtask subcommand {other:?} (expected `dep-graph` or `build-islands`)"
+            "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, or `build-plugins`)"
         ),
     }
 }
@@ -127,6 +128,97 @@ fn build_islands() -> Result<()> {
 
     println!("build-islands: OK -> {}", dist.display());
     Ok(())
+}
+
+/// Build every reference plugin under `plugins/` to `wasm32-unknown-unknown`
+/// (release) and assemble its loadable bundle — `plugin.toml` + the produced wasm
+/// — into `plugins/dist/<name>/`, which the server loads via `--plugins-dir`.
+///
+/// A plugin dir qualifies if it has BOTH a `Cargo.toml` and a `plugin.toml`
+/// (the `dist` dir itself is skipped). Extism loads raw wasm, so there is no
+/// wasm-bindgen step.
+fn build_plugins() -> Result<()> {
+    let root = repo_root()?;
+    let plugins_dir = root.join("plugins");
+    let dist = plugins_dir.join("dist");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+
+    if !plugins_dir.is_dir() {
+        println!("build-plugins: no plugins/ dir; nothing to build");
+        return Ok(());
+    }
+
+    let mut built = 0usize;
+    for entry in std::fs::read_dir(&plugins_dir).context("reading plugins/")? {
+        let dir = entry.context("reading a plugins/ entry")?.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name == "dist" {
+            continue;
+        }
+        let manifest = dir.join("Cargo.toml");
+        let plugin_toml = dir.join("plugin.toml");
+        if !manifest.exists() || !plugin_toml.exists() {
+            continue;
+        }
+
+        // 1. Compile to wasm32 (release).
+        let status = Command::new(&cargo)
+            .args([
+                "build",
+                "--manifest-path",
+                &manifest.to_string_lossy(),
+                "--target",
+                "wasm32-unknown-unknown",
+                "--release",
+            ])
+            .status()
+            .with_context(|| format!("running cargo build for plugin {name}"))?;
+        if !status.success() {
+            bail!("plugin {name} wasm build failed");
+        }
+
+        // 2. Locate the produced cdylib wasm (top of the release dir).
+        let release = dir.join("target/wasm32-unknown-unknown/release");
+        let wasm = find_wasm(&release)?;
+
+        // 3. Assemble plugins/dist/<name>/{plugin.toml, <wasm>}.
+        let out = dist.join(&name);
+        std::fs::create_dir_all(&out)
+            .with_context(|| format!("creating {}", out.display()))?;
+        std::fs::copy(&plugin_toml, out.join("plugin.toml"))
+            .with_context(|| format!("copying plugin.toml for {name}"))?;
+        let wasm_file = wasm
+            .file_name()
+            .context("wasm path has no file name")?;
+        std::fs::copy(&wasm, out.join(wasm_file))
+            .with_context(|| format!("copying wasm for {name}"))?;
+
+        built += 1;
+        println!("  built plugin {name} -> {}", out.display());
+    }
+
+    println!("build-plugins: OK ({built} plugin(s)) -> {}", dist.display());
+    Ok(())
+}
+
+/// Find the single cdylib `.wasm` at the top of a cargo release dir (deps live in
+/// `release/deps/`, which this does not descend into).
+fn find_wasm(release_dir: &Path) -> Result<PathBuf> {
+    let read = std::fs::read_dir(release_dir)
+        .with_context(|| format!("reading {}", release_dir.display()))?;
+    for entry in read {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "wasm") {
+            return Ok(path);
+        }
+    }
+    bail!("no .wasm produced in {}", release_dir.display())
 }
 
 /// Enforce the dependency-graph invariants. Returns `Ok(())` when clean, or an
