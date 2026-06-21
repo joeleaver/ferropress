@@ -18,6 +18,8 @@ ferropress-theme = { workspace = true }
 # The change stream is awaited via tokio-stream's StreamExt; tokio drives the loop.
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+# The hook bridge builds each change's action-hook JSON payload.
+serde_json = { workspace = true }
 # Best-effort cache + regen log their swallowed faults (never fail the request /
 # tear down the loop).
 tracing = { workspace = true }

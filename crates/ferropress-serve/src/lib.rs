@@ -31,11 +31,13 @@ use ferropress_render::CustomBlockRenderer;
 use ferropress_theme::ThemeEngine;
 
 pub mod content;
+pub mod hook_bridge;
 
 pub use content::{
     PAGE_TEMPLATE, PAGE_TEMPLATE_SRC, Resolved, default_theme, resolve_path,
     resolve_published_entity, serve_path, slug_from_path,
 };
+pub use hook_bridge::HookBridge;
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it

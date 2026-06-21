@@ -34,7 +34,7 @@ use ferropress_http::AppState;
 use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
-use ferropress_serve::{ServeEngine, default_theme};
+use ferropress_serve::{HookBridge, ServeEngine, default_theme};
 use ferropress_store_embedded::EmbeddedStore;
 
 use crate::config::{Cli, Command, PostArgs, ServerConfig, TlsMode};
@@ -119,6 +119,18 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = regen.regen_loop().await {
             tracing::error!(error = %e, "regen loop exited");
+        }
+    });
+
+    // 3b. Spawn the change-feed -> ACTION hook bridge: an INDEPENDENT subscription
+    //     (the engine hub fans out to every subscriber) that dispatches a
+    //     `<type>.<created|updated|deleted>` action per committed change, so plugins
+    //     react to writes after the fact — decoupled from regen above. Shares the
+    //     same `Arc<PluginHost>` dispatcher as the comment-create filter.
+    let bridge = Arc::new(HookBridge::new(Arc::clone(&store), plugins.clone()));
+    tokio::spawn(async move {
+        if let Err(e) = bridge.run().await {
+            tracing::error!(error = %e, "hook bridge exited");
         }
     });
 

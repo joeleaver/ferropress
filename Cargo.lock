@@ -1643,6 +1643,7 @@ dependencies = [
  "ferropress-render",
  "ferropress-store-embedded",
  "ferropress-theme",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",

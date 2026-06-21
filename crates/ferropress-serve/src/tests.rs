@@ -5,15 +5,18 @@
 //! cache read-through, the cache hit, and the regen write-through/eviction are
 //! proven against actual store + blob backends, not mocks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
 use ferropress_core::ports::BlobStore;
 use ferropress_core::query::{Change, ChangeKind};
 use ferropress_core::store::RhypeStore;
-use ferropress_core::value::{ObjectId, TypeName, Value};
-use ferropress_core::{Block, BlockKind, BlockTree, InlineRun, POST_TYPE, Status};
+use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
+use ferropress_core::{
+    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, PAGE_TYPE, POST_TYPE, Status,
+};
 
 use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_store_embedded::EmbeddedStore;
@@ -289,4 +292,188 @@ async fn live_regen_loop_regenerates_on_change() {
         cached.contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
         "regenerated cache entry must hold the rendered body; was:\n{cached}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Change-feed -> ACTION hook bridge
+// ---------------------------------------------------------------------------
+
+use crate::HookBridge;
+use crate::hook_bridge::{action_name, change_payload};
+
+/// A [`HookDispatcher`] double that records every dispatched event and answers
+/// [`has_hooks`] from a fixed allow-set — so a test can both prove the gate and
+/// inspect exactly what the bridge emitted.
+struct RecordingDispatcher {
+    allow: HashSet<String>,
+    seen: Mutex<Vec<(String, HookKind, serde_json::Value)>>,
+}
+
+impl RecordingDispatcher {
+    fn new<const N: usize>(allow: [&str; N]) -> Self {
+        Self {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+    fn events(&self) -> Vec<(String, HookKind, serde_json::Value)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl HookDispatcher for RecordingDispatcher {
+    fn dispatch(&self, event: HookEvent) -> ferropress_core::error::Result<HookEvent> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((event.name.clone(), event.kind, event.payload.clone()));
+        Ok(event)
+    }
+    fn has_hooks(&self, name: &str) -> bool {
+        self.allow.contains(name)
+    }
+}
+
+/// A synthetic change of an arbitrary type (the `change` helper above is Post-only).
+fn change_of(kind: ChangeKind, type_name: &str, id: u64, version: u64) -> Change {
+    Change {
+        version,
+        kind,
+        type_name: TypeName::from(type_name),
+        object_id: ObjectId(id),
+        fields: None,
+    }
+}
+
+#[test]
+fn action_name_maps_type_and_kind() {
+    assert_eq!(
+        action_name(&change_of(ChangeKind::Create, POST_TYPE, 1, 1)),
+        "post.created"
+    );
+    assert_eq!(
+        action_name(&change_of(ChangeKind::Update, PAGE_TYPE, 1, 1)),
+        "page.updated"
+    );
+    assert_eq!(
+        action_name(&change_of(ChangeKind::Delete, COMMENT_TYPE, 1, 1)),
+        "comment.deleted"
+    );
+}
+
+#[test]
+fn change_payload_carries_identity() {
+    let payload = change_payload(&change_of(ChangeKind::Update, COMMENT_TYPE, 42, 7));
+    assert_eq!(payload["version"], 7);
+    assert_eq!(payload["type"], "Comment");
+    assert_eq!(payload["kind"], "update");
+    assert_eq!(payload["object_id"], 42);
+    // The embedded feed carries no fields, so the key is omitted (not null).
+    assert!(payload.get("fields").is_none(), "no fields key: {payload}");
+}
+
+#[test]
+fn change_payload_serializes_present_fields_as_bare_scalars() {
+    // If an adapter DOES publish scalar fields on the feed, they must reach the
+    // plugin as ordinary JSON (`"title": "hi"`), never the tagged `{"String":"hi"}`
+    // form the `Value` serde derive would emit. Locks the payload contract before
+    // any adapter starts forwarding fields.
+    let mut fields: FieldMap = HashMap::new();
+    fields.insert("title".to_owned(), Value::String("hi".to_owned()));
+    fields.insert("n".to_owned(), Value::U64(42));
+    let change = Change {
+        version: 3,
+        kind: ChangeKind::Update,
+        type_name: TypeName::from(POST_TYPE),
+        object_id: ObjectId(9),
+        fields: Some(fields),
+    };
+
+    let payload = change_payload(&change);
+    assert_eq!(
+        payload["fields"]["title"], "hi",
+        "string field is a bare scalar: {payload}"
+    );
+    assert_eq!(
+        payload["fields"]["n"], 42,
+        "integer field is a bare scalar: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_change_is_gated_by_has_hooks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, _theme) = boot(tmp.path());
+    // Only `post.created` is registered.
+    let rec = Arc::new(RecordingDispatcher::new(["post.created"]));
+    let bridge = HookBridge::new(store, rec.clone());
+
+    // Registered action -> dispatched.
+    bridge
+        .dispatch_change(&change_of(ChangeKind::Create, POST_TYPE, 5, 1))
+        .await;
+    // Unregistered action (no `post.updated` hook) -> skipped (no payload built).
+    bridge
+        .dispatch_change(&change_of(ChangeKind::Update, POST_TYPE, 5, 2))
+        .await;
+
+    let events = rec.events();
+    assert_eq!(events.len(), 1, "only the registered action dispatches");
+    let (name, kind, payload) = &events[0];
+    assert_eq!(name, "post.created");
+    assert_eq!(*kind, HookKind::Action);
+    assert_eq!(payload["object_id"], 5);
+    assert_eq!(payload["type"], "Post");
+    assert_eq!(payload["kind"], "create");
+}
+
+/// The LIVE bridge: a real `subscribe` -> action dispatch, exactly as
+/// `ferropress-server` spawns it. Proves the subscription wiring + gating end to
+/// end against a real embedded store change feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_bridge_dispatches_action_on_change() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, _theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Published).await;
+
+    let rec = Arc::new(RecordingDispatcher::new(["post.created", "post.updated"]));
+    let bridge = Arc::new(HookBridge::new(Arc::clone(&store), rec.clone()));
+    let run = Arc::clone(&bridge);
+    let handle = tokio::spawn(async move {
+        let _ = run.run().await;
+    });
+
+    // Drive real updates (post-subscribe) until the bridge records a `post.updated`
+    // action — the same touch-loop shape the live regen test uses to dodge the
+    // first-event-races-subscription gap.
+    let mut got = None;
+    for i in 0..200u32 {
+        let mut patch: HashMap<String, Value> = HashMap::new();
+        patch.insert("title".to_owned(), Value::String(format!("touch {i}")));
+        store
+            .update(&TypeName::from(POST_TYPE), id, patch)
+            .await
+            .expect("touch update");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if let Some(ev) = rec
+            .events()
+            .into_iter()
+            .find(|(name, _, _)| name == "post.updated")
+        {
+            got = Some(ev);
+            break;
+        }
+    }
+    handle.abort();
+
+    let (name, kind, payload) = got.expect("the bridge must dispatch a post.updated action");
+    assert_eq!(name, "post.updated");
+    assert_eq!(kind, HookKind::Action);
+    assert_eq!(
+        payload["object_id"].as_u64(),
+        Some(id.0),
+        "action payload identifies the changed object: {payload}"
+    );
+    assert_eq!(payload["type"], "Post");
+    assert_eq!(payload["kind"], "update");
 }

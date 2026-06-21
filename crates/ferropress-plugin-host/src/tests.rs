@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use ferropress_core::hook::{HookEvent, HookKind};
 use ferropress_render::CustomBlockRenderer;
 
-use crate::{Capabilities, HostLimits, PluginHost};
+use crate::{Capabilities, HookRegistration, HostLimits, PluginHost};
 
 /// Repo root (the plugin-host crate is `crates/ferropress-plugin-host`).
 fn repo_root() -> PathBuf {
@@ -157,4 +157,66 @@ fn comment_mod_plugin_flags_spam() {
     // The filter is faithful: it returns the rest of the payload unchanged.
     assert_eq!(clean.payload["author_name"], "Jo");
     assert_eq!(clean.payload["slug"], "hello");
+}
+
+/// `load_dir` registers the audit-log plugin's ACTION hook (`comment.created`)
+/// from its `plugin.toml` — the action-side counterpart to the comment-mod filter.
+#[test]
+fn load_dir_registers_audit_log_action() {
+    let dist = repo_root().join("plugins/dist");
+    if !dist.join("audit-log").exists() {
+        eprintln!(
+            "skipping load_dir_registers_audit_log_action: audit-log not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    }
+    let mut host = PluginHost::new();
+    host.load_dir(&dist).expect("load plugins dir");
+    assert!(host.has_plugin("audit-log"));
+    assert!(
+        host.has_hooks("comment.created"),
+        "audit-log registered its comment.created action hook"
+    );
+}
+
+/// An ACTION hook must IGNORE the guest's returned payload (only filters
+/// transform). Proven with real wasm by registering comment-mod's
+/// spam-classifying export under an ACTION hook: as a filter the same export sets
+/// `status:"spam"`, but dispatched as an action the event payload comes back
+/// UNCHANGED.
+#[test]
+fn action_dispatch_ignores_guest_return() {
+    let dist = repo_root().join("plugins/dist");
+    if !dist.join("comment-mod").exists() {
+        eprintln!(
+            "skipping action_dispatch_ignores_guest_return: comment-mod not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    }
+    let mut host = PluginHost::new();
+    host.load_dir(&dist).expect("load plugins dir");
+    host.bus_mut().register(HookRegistration {
+        plugin_id: "comment-mod".to_owned(),
+        hook_name: "comment.created".to_owned(),
+        kind: HookKind::Action,
+        priority: 0,
+        export: "comment_create".to_owned(),
+    });
+
+    let out = host
+        .dispatch(HookEvent {
+            name: "comment.created".to_owned(),
+            kind: HookKind::Action,
+            payload: serde_json::json!({
+                "author_name": "x",
+                "body": "buy viagra now",
+                "status": "pending",
+            }),
+        })
+        .expect("dispatch action");
+    assert_eq!(
+        out.payload["status"], "pending",
+        "an action must not mutate the event payload: {}",
+        out.payload
+    );
 }
