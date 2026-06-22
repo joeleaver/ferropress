@@ -18,11 +18,11 @@
 //! cased entity type and `<verb>` is the past tense of the change kind:
 //! `post.created`, `page.updated`, `comment.deleted`, … The past-tense verb
 //! deliberately distinguishes these post-persist actions from a pre-persist
-//! *filter* like `comment.create`. The payload is the change identity:
-//! `{ version, type, kind, object_id, fields? }` (`fields` is present only when the
-//! adapter publishes scalar fields on the feed — the embedded adapter does not, so
-//! it is usually absent; a plugin that needs the object reads it via a store
-//! capability, a later increment).
+//! *filter* like `comment.create`. The payload is the change identity plus its
+//! changed fields: `{ version, type, kind, object_id, fields? }`. `fields` is the
+//! engine's JSON projection of the changed scalar fields, forwarded verbatim, so it
+//! is present whenever the change carried scalars — on create/update AND on delete
+//! (which carries the deleted object's pre-delete scalars).
 
 use std::sync::Arc;
 
@@ -100,12 +100,11 @@ pub(crate) fn action_name(change: &Change) -> String {
     format!("{}.{verb}", change.type_name.as_str().to_ascii_lowercase())
 }
 
-/// The action payload: the change's identity. `kind` is the present-tense verb
-/// (`create`/`update`/`delete`); `fields` is included only when the change carries
-/// scalar fields (usually absent on the embedded feed). The payload is built
-/// directly as JSON — each core [`Value`](ferropress_core::value::Value) becomes a
-/// BARE scalar via [`Value::to_json`](ferropress_core::value::Value::to_json), so a
-/// plugin sees `"n": 1`, never the tagged `"n": {"U64": 1}` the serde derive emits.
+/// The action payload: the change's identity plus its changed scalar `fields`.
+/// `kind` is the present-tense verb (`create`/`update`/`delete`); `fields` is the
+/// engine's JSON projection of the changed scalars, forwarded verbatim (so a plugin
+/// sees ordinary JSON — `"n": 1`, `Bytes` base64, `DateTime` RFC3339), and is
+/// present whenever the change carried fields (create/update and, now, delete).
 pub(crate) fn change_payload(change: &Change) -> serde_json::Value {
     let kind = match change.kind {
         ChangeKind::Create => "create",
@@ -121,12 +120,10 @@ pub(crate) fn change_payload(change: &Change) -> serde_json::Value {
     );
     obj.insert("kind".to_owned(), serde_json::Value::from(kind));
     obj.insert("object_id".to_owned(), change.object_id.0.into());
+    // `change.fields` is already the engine's JSON projection — forward it verbatim
+    // (the plugin receives the changed scalar fields as ordinary JSON).
     if let Some(fields) = &change.fields {
-        let mapped = fields
-            .iter()
-            .map(|(k, v)| (k.clone(), v.to_json()))
-            .collect();
-        obj.insert("fields".to_owned(), serde_json::Value::Object(mapped));
+        obj.insert("fields".to_owned(), fields.clone());
     }
     serde_json::Value::Object(obj)
 }

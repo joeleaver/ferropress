@@ -3,9 +3,11 @@
 //! the rest of the system: nothing here is re-exported.
 //!
 //! Mappings:
-//!   core::Value  <-> rhypedb_engine::object::Value   (1:1 on the 10 live variants)
+//!   core::Value  <-> rhypedb_engine::object::Value   (1:1 on the 10 shared variants;
+//!                                                      read-only folds DateTime/Json -> String)
 //!   core::Object <-  rhypedb_engine::object::Object
-//!   core::Change <-  rhypedb_subscribe::ChangeEvent  (one direction; read-only feed)
+//!   core::Change <-  rhypedb_subscribe::ChangeEvent  (one direction; read-only feed,
+//!                                                      fields forwarded as JSON)
 //!   core::Compare -> rhypedb_engine::CompareOp
 //!   core::VectorQuery.restrict -> HashSet<u64> for `Vectorizer::search_text`
 
@@ -39,7 +41,9 @@ pub fn to_db_value(v: CoreValue) -> DbValue {
     }
 }
 
-/// rhypedb Value -> core::Value. Total in the other direction too.
+/// rhypedb Value -> core::Value. Total: the 10 core-mirrored variants map 1:1; the
+/// two rhypedb-native variants core does NOT model (`DateTime`, `Json`) fold to
+/// `String` (see below).
 pub fn from_db_value(v: DbValue) -> CoreValue {
     match v {
         DbValue::Null => CoreValue::Null,
@@ -52,6 +56,15 @@ pub fn from_db_value(v: DbValue) -> CoreValue {
         DbValue::F64(n) => CoreValue::F64(n),
         DbValue::Bool(b) => CoreValue::Bool(b),
         DbValue::Bytes(b) => CoreValue::Bytes(b.to_vec()),
+        // rhypedb gained native DateTime/Json runtime values (formerly write-dead).
+        // Ferropress's core model deliberately carries NEITHER — timestamps and JSON
+        // travel as String (see `ferropress_core::value` module docs) — and
+        // Ferropress never WRITES them, so this is a defensive read path: render via
+        // the engine's canonical query-boundary projection (DateTime -> RFC3339 from
+        // epoch-millis, Json -> compact text) so a field written by some other tool
+        // still reads back as a String rather than panicking.
+        DbValue::DateTime(ms) => CoreValue::String(rhypedb_engine::object::rfc3339_from_millis(ms)),
+        DbValue::Json(j) => CoreValue::String(j.to_string()),
     }
 }
 
@@ -127,12 +140,13 @@ fn to_db_change_kind(kind: ChangeKind) -> DbChangeKind {
 
 /// rhypedb ChangeEvent -> core::Change. One-directional (the feed is read-only).
 ///
-/// `fields` is intentionally left `None`: rhypedb's `ChangeEvent.fields` is an
-/// `Option<HashMap<String, serde_json::Value>>` of scalar fields only, and the
-/// serve regen loop only needs `type_name` + `object_id` to know *which* object
-/// changed. The regen loop is therefore expected to re-`get` the object from the
-/// store to read its current fields rather than trust the (partial, scalar-only)
-/// change payload. Wiring the json->Value coercion here is a later refinement.
+/// The engine's `ChangeEvent.fields` is already the scalar fields as JSON
+/// (`Option<HashMap<String, serde_json::Value>>`, the same `value_to_query_json`
+/// projection the query boundary uses). We forward it VERBATIM as a JSON object —
+/// no lossy json->core::Value coercion (the engine's `Bytes`->base64 /
+/// `DateTime`->RFC3339 conventions don't round-trip through core `Value`). The
+/// serve regen loop reads the slug straight off this (no re-`get`), and on a
+/// **delete** it is the only way to learn which page to evict.
 pub fn from_change_event(ev: ChangeEvent) -> Change {
     let kind = match ev.kind {
         DbChangeKind::Create => ChangeKind::Create,
@@ -144,8 +158,49 @@ pub fn from_change_event(ev: ChangeEvent) -> Change {
         kind,
         type_name: TypeName(ev.type_name),
         object_id: ObjectId(ev.object_id),
-        // See doc comment: regen loop re-gets the object; partial scalar payload
-        // is not forwarded.
-        fields: None,
+        // Forward the scalar fields as a JSON object (or `None` if the event
+        // carried none — e.g. a delete with no captured fields).
+        fields: ev
+            .fields
+            .map(|m| serde_json::Value::Object(m.into_iter().collect())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_db_value_folds_native_datetime_and_json_to_string() {
+        // rhypedb-native DateTime (epoch millis) -> RFC3339 String.
+        match from_db_value(DbValue::DateTime(0)) {
+            CoreValue::String(s) => {
+                assert!(s.starts_with("1970-01-01"), "RFC3339 of epoch 0: {s}")
+            }
+            other => panic!("DateTime must fold to String, got {other:?}"),
+        }
+        // rhypedb-native Json -> compact JSON text.
+        match from_db_value(DbValue::Json(serde_json::json!({ "a": 1 }))) {
+            CoreValue::String(s) => assert_eq!(s, "{\"a\":1}"),
+            other => panic!("Json must fold to String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_change_event_forwards_fields_as_json_object() {
+        use std::collections::HashMap;
+        let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
+        fields.insert("slug".to_owned(), serde_json::json!("hello"));
+        let ev = ChangeEvent {
+            version: 1,
+            kind: DbChangeKind::Delete,
+            type_name: "Post".to_owned(),
+            object_id: 7,
+            fields: Some(fields),
+        };
+        let change = from_change_event(ev);
+        // Delete now carries the (pre-delete) scalar fields, forwarded as JSON.
+        let fields = change.fields.expect("fields forwarded");
+        assert_eq!(fields["slug"], "hello");
     }
 }

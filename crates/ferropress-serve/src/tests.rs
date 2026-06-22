@@ -13,7 +13,7 @@ use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
 use ferropress_core::ports::BlobStore;
 use ferropress_core::query::{Change, ChangeKind};
 use ferropress_core::store::RhypeStore;
-use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
+use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
     Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, PAGE_TYPE, POST_TYPE, Status,
 };
@@ -294,6 +294,145 @@ async fn live_regen_loop_regenerates_on_change() {
     );
 }
 
+/// A Delete change carrying the deleted object's slug (the engine now publishes it)
+/// EVICTS the cached page — the per-change-handler proof of delete-eviction.
+#[tokio::test]
+async fn regen_evicts_cache_on_delete() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Published).await;
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::clone(&theme),
+        Arc::new(NoCustomBlocks),
+    );
+    let key = cache_key(&format!("/{SLUG}"));
+
+    // Populate the cache (write-through), then confirm it's present.
+    engine
+        .apply_change(&change(ChangeKind::Update, id))
+        .await
+        .expect("write-through");
+    assert!(blobs.exists(&key).await.unwrap(), "cache populated");
+
+    // A delete carrying the slug evicts it.
+    let del = Change {
+        version: 2,
+        kind: ChangeKind::Delete,
+        type_name: TypeName::from(POST_TYPE),
+        object_id: id,
+        fields: Some(serde_json::json!({ "slug": SLUG })),
+    };
+    engine.apply_change(&del).await.expect("evict on delete");
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "the deleted page's cache entry must be evicted"
+    );
+}
+
+/// The PRIMARY Create/Update path reads the slug straight off the change feed (no
+/// re-`get`). Proven deterministically: the change references a NON-EXISTENT object
+/// id but carries the slug on its `fields`, and a published entity lives at that
+/// slug. Reading the slug off the feed renders + caches `/<slug>`; the fallback
+/// re-`get` of the missing id would instead error (`NotFound`) and cache nothing —
+/// so a written cache entry can ONLY mean the slug came from the feed.
+#[tokio::test]
+async fn regen_uses_slug_from_change_feed_without_reget() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    // The published entity lives at SLUG (resolved by slug, not by object id).
+    seed_post(&store, SLUG, Status::Published).await;
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        theme,
+        Arc::new(NoCustomBlocks),
+    );
+    let key = cache_key(&format!("/{SLUG}"));
+    assert!(!blobs.exists(&key).await.unwrap(), "cache starts empty");
+
+    // Object id 99_999 does not exist — a fallback re-`get` would error. The slug
+    // comes off the feed instead, so the page renders and is cached.
+    let change = Change {
+        version: 1,
+        kind: ChangeKind::Update,
+        type_name: TypeName::from(POST_TYPE),
+        object_id: ObjectId(99_999),
+        fields: Some(serde_json::json!({ "slug": SLUG })),
+    };
+    engine
+        .apply_change(&change)
+        .await
+        .expect("apply must succeed via the slug-from-feed path (no re-get)");
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "slug read off the feed -> /{SLUG} rendered + cached without a re-get"
+    );
+}
+
+/// The LIVE proof that consuming the upstream delete-fields fix works end to end:
+/// a real `store.delete` makes the engine publish a Delete `ChangeEvent` carrying
+/// the deleted object's slug, our adapter forwards it, and the regen loop evicts
+/// the cached page — the former persistent-stale gap, now closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_regen_evicts_on_delete() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Published).await;
+    let key = cache_key(&format!("/{SLUG}"));
+
+    let engine = Arc::new(ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        theme,
+        Arc::new(NoCustomBlocks),
+    ));
+    let regen = Arc::clone(&engine);
+    let handle = tokio::spawn(async move {
+        let _ = regen.regen_loop().await;
+    });
+
+    // 1. Get the page cached (touch-update loop, post-subscribe — same shape as
+    //    live_regen_loop_regenerates_on_change, to dodge the subscribe race).
+    let mut cached = false;
+    for i in 0..200u32 {
+        let mut patch: HashMap<String, Value> = HashMap::new();
+        patch.insert("title".to_owned(), Value::String(format!("touch {i}")));
+        store
+            .update(&TypeName::from(POST_TYPE), id, patch)
+            .await
+            .expect("touch update");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if blobs.exists(&key).await.unwrap() {
+            cached = true;
+            break;
+        }
+    }
+    assert!(cached, "page must be cached before the delete");
+
+    // 2. Delete it; the Delete change carries the slug, so the loop evicts.
+    store
+        .delete(&TypeName::from(POST_TYPE), id)
+        .await
+        .expect("delete");
+    let mut evicted = false;
+    for _ in 0..200u32 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if !blobs.exists(&key).await.unwrap() {
+            evicted = true;
+            break;
+        }
+    }
+    handle.abort();
+    assert!(
+        evicted,
+        "the live regen loop must evict the deleted page's cache entry"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Change-feed -> ACTION hook bridge
 // ---------------------------------------------------------------------------
@@ -373,31 +512,20 @@ fn change_payload_carries_identity() {
 }
 
 #[test]
-fn change_payload_serializes_present_fields_as_bare_scalars() {
-    // If an adapter DOES publish scalar fields on the feed, they must reach the
-    // plugin as ordinary JSON (`"title": "hi"`), never the tagged `{"String":"hi"}`
-    // form the `Value` serde derive would emit. Locks the payload contract before
-    // any adapter starts forwarding fields.
-    let mut fields: FieldMap = HashMap::new();
-    fields.insert("title".to_owned(), Value::String("hi".to_owned()));
-    fields.insert("n".to_owned(), Value::U64(42));
+fn change_payload_forwards_present_fields() {
+    // The change's scalar `fields` (the engine's JSON projection) reach the plugin
+    // as ordinary JSON, forwarded verbatim into the action payload.
     let change = Change {
         version: 3,
         kind: ChangeKind::Update,
         type_name: TypeName::from(POST_TYPE),
         object_id: ObjectId(9),
-        fields: Some(fields),
+        fields: Some(serde_json::json!({ "title": "hi", "n": 42 })),
     };
 
     let payload = change_payload(&change);
-    assert_eq!(
-        payload["fields"]["title"], "hi",
-        "string field is a bare scalar: {payload}"
-    );
-    assert_eq!(
-        payload["fields"]["n"], 42,
-        "integer field is a bare scalar: {payload}"
-    );
+    assert_eq!(payload["fields"]["title"], "hi", "{payload}");
+    assert_eq!(payload["fields"]["n"], 42, "{payload}");
 }
 
 #[tokio::test]

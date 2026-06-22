@@ -1683,6 +1683,7 @@ dependencies = [
  "rhypedb-engine",
  "rhypedb-schema",
  "rhypedb-subscribe",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2617,6 +2618,12 @@ checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
 dependencies = [
  "imgref",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
 name = "mach2"
@@ -3698,7 +3705,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 [[package]]
 name = "rhypedb-embed"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=e735be47bec1f6934be075d0dbb3fe22ccc3680f#e735be47bec1f6934be075d0dbb3fe22ccc3680f"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
 dependencies = [
  "fastembed",
  "hf-hub",
@@ -3708,7 +3715,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-engine"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=e735be47bec1f6934be075d0dbb3fe22ccc3680f#e735be47bec1f6934be075d0dbb3fe22ccc3680f"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -3722,12 +3729,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "time",
 ]
 
 [[package]]
 name = "rhypedb-schema"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=e735be47bec1f6934be075d0dbb3fe22ccc3680f#e735be47bec1f6934be075d0dbb3fe22ccc3680f"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3735,13 +3743,14 @@ dependencies = [
 [[package]]
 name = "rhypedb-storage"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=e735be47bec1f6934be075d0dbb3fe22ccc3680f#e735be47bec1f6934be075d0dbb3fe22ccc3680f"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
 dependencies = [
  "ahash",
  "bytes",
  "crc32fast",
  "crossbeam-skiplist",
  "libc",
+ "lz4_flex",
  "memmap2",
  "parking_lot",
  "rand 0.9.4",
@@ -3752,7 +3761,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-subscribe"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=e735be47bec1f6934be075d0dbb3fe22ccc3680f#e735be47bec1f6934be075d0dbb3fe22ccc3680f"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
 dependencies = [
  "parking_lot",
  "serde",
@@ -3762,7 +3771,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-vector"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=e735be47bec1f6934be075d0dbb3fe22ccc3680f#e735be47bec1f6934be075d0dbb3fe22ccc3680f"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
 dependencies = [
  "boxcar",
  "parking_lot",

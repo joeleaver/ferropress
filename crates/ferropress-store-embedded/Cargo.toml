@@ -26,6 +26,9 @@ tokio-stream = { workspace = true }
 futures-core = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+# The change feed forwards the engine's scalar fields as JSON (ChangeEvent.fields
+# is already serde_json::Value); the adapter wraps them into a JSON object.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

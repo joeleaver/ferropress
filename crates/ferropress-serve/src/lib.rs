@@ -88,6 +88,20 @@ fn page_blob_key(page: &OutputPage) -> BlobKey {
     cache_key(&page.path)
 }
 
+/// The slug carried on a change's JSON `fields` (the engine publishes the changed
+/// scalar fields, incl. on delete), if present and non-empty. Lets the regen loop
+/// derive a page path straight from the change — no extra store read, and the only
+/// way to know a *deleted* object's slug.
+fn slug_from_change(change: &Change) -> Option<String> {
+    change
+        .fields
+        .as_ref()
+        .and_then(|f| f.get("slug"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Drives prerender + incremental regeneration over the ports.
 ///
 /// Holds the same collaborators the read path uses: the store (to read the
@@ -124,19 +138,18 @@ impl ServeEngine {
     /// committed change, write-through (regenerate) or evict exactly the affected
     /// prerendered pages. Never a full rebuild.
     ///
-    /// Per change:
-    ///   * **Create / Update** of a `Post`/`Page`: re-`get` the object (the change
-    ///     payload's `fields` is always `None` from the embedded adapter, so the
-    ///     slug/status MUST be read back from the store), derive its `/<slug>`
-    ///     path, and [`render_page`](Self::render_page) it. `Some(html)` -> `put`
+    /// Per change (the slug comes off the change feed's `fields` — the engine
+    /// publishes the changed scalar fields, so no extra read is needed; a re-`get`
+    /// is only a fallback when the feed somehow carried no slug):
+    ///   * **Create / Update** of a `Post`/`Page`: derive its `/<slug>` path and
+    ///     [`render_page`](Self::render_page) it. `Some(html)` -> `put`
     ///     (regenerate); `None` (the entity is no longer published) -> `delete`
     ///     (evict). This makes an unpublish/trash a cache eviction, not a stale
     ///     page.
-    ///   * **Delete**: the object is gone, so it cannot be re-`get`'d to learn its
-    ///     slug, and `Change.fields` is `None` — the path is unknown. See the TODO
-    ///     in [`affected_pages`](Self::affected_pages): correct delete-eviction
-    ///     needs a reverse `object_id -> path` index (a later increment). For now
-    ///     a Delete is logged and skipped.
+    ///   * **Delete**: the object is gone, but the change carries its (pre-delete)
+    ///     scalar `fields`, so we read the slug from there and evict the cached
+    ///     page. This closes the previously-unfixable "deleted page stays cached"
+    ///     gap (which needed either this engine feature or a reverse index).
     ///
     /// The loop runs forever. A per-change error is logged and the loop continues
     /// — one bad change must never tear down regeneration for the whole site.
@@ -182,15 +195,18 @@ impl ServeEngine {
                     return Ok(());
                 }
 
-                // The change payload carries no fields (embedded adapter sets
-                // `fields: None`); re-`get` the object to read its current slug.
-                let obj = self.store.get(&change.type_name, change.object_id).await?;
-
-                let slug = match obj.get("slug") {
-                    Some(Value::String(s)) if !s.is_empty() => s.clone(),
-                    // No usable slug -> no permalink to (in)validate. Nothing we
-                    // can key the cache on; skip.
-                    _ => return Ok(()),
+                // Prefer the slug off the change feed (no extra read). Fall back to
+                // re-`get`ting the object only if the event carried no slug.
+                let slug = match slug_from_change(change) {
+                    Some(slug) => slug,
+                    None => {
+                        let obj = self.store.get(&change.type_name, change.object_id).await?;
+                        match obj.get("slug") {
+                            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                            // No usable slug -> no permalink to (in)validate; skip.
+                            _ => return Ok(()),
+                        }
+                    }
                 };
                 let page = OutputPage {
                     path: format!("/{slug}"),
@@ -218,26 +234,37 @@ impl ServeEngine {
                 Ok(())
             }
             ChangeKind::Delete => {
-                // TODO(reverse-index): a hard delete removes the object, so we can
-                // neither `get` it for its slug nor read fields off the change
-                // (`Change.fields` is always `None`). Without a reverse
-                // `object_id -> path` index we cannot know WHICH cache key to
-                // evict, so we log + skip. Wiring that index (maintained as pages
-                // are written) is a later increment.
-                //
-                // CAVEAT: skipping is safe ONLY when the delete makes the slug
-                // unresolvable — then the next request misses the (now absent)
-                // entity and `serve_path` returns an uncached 404. If a DIFFERENT
-                // published entity still answers that slug (e.g. a Page sharing a
-                // deleted Post's slug), the cache keeps serving the deleted page's
-                // HTML as a cache HIT, with no event to dislodge it, until the
-                // reverse index lands. A `/<slug>` collision across a hard delete
-                // is the one persistent-stale case in v1.
-                tracing::warn!(
-                    type_name = %change.type_name.as_str(),
-                    object_id = change.object_id.0,
-                    "delete change: cannot map object_id -> path without a reverse index; skipping eviction (see TODO)",
-                );
+                // Only content types map to a page in permalinks v1.
+                let ty = change.type_name.as_str();
+                if ty != POST_TYPE && ty != PAGE_TYPE {
+                    return Ok(());
+                }
+
+                // The engine publishes the deleted object's (pre-delete) scalar
+                // fields on the change, so we can map the deletion back to its page
+                // and evict the cached HTML — the fix for the former persistent-stale
+                // case (a deleted page, or a slug-collision sibling, served stale
+                // from cache with no event able to dislodge it). `delete` is
+                // idempotent (no-op if never cached).
+                match slug_from_change(change) {
+                    Some(slug) => {
+                        let page = OutputPage {
+                            path: format!("/{slug}"),
+                        };
+                        self.blobs.delete(&page_blob_key(&page)).await?;
+                        tracing::debug!(path = %page.path, "evicted prerender cache entry (deleted)");
+                    }
+                    None => {
+                        // No slug on the event (e.g. a type without a slug field) ->
+                        // nothing to key the cache on. Safe to skip: such an entity
+                        // has no permalink to go stale.
+                        tracing::debug!(
+                            type_name = %change.type_name.as_str(),
+                            object_id = change.object_id.0,
+                            "delete change carried no slug; nothing to evict",
+                        );
+                    }
+                }
                 Ok(())
             }
         }

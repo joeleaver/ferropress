@@ -3,7 +3,7 @@
 //! vocabulary; the embedded adapter maps these onto `filter_scan*`,
 //! `Vectorizer::search_*`, `link`/`get_links`, and the `ChangeEvent` stream.
 
-use crate::value::{FieldMap, ObjectId, TypeName, Value};
+use crate::value::{ObjectId, TypeName, Value};
 
 /// A single-field comparison, mirroring rhypedb's storage `CompareOp`
 /// (Eq/Ne/Lt/Le/Gt/Ge). The adapter forwards it to the matching `filter_scan*`
@@ -81,13 +81,20 @@ pub enum ChangeKind {
 
 /// A committed change, mirroring rhypedb's `ChangeEvent`. The regen loop in
 /// `ferropress-serve` consumes a stream of these to invalidate exactly the
-/// affected prerendered pages. `fields` carries only scalar fields (the engine
-/// does not publish relation/vector fields on the change feed).
+/// affected prerendered pages, and the hook bridge turns them into action hooks.
+///
+/// `fields` is the changed object's **scalar fields as JSON** — the engine's own
+/// query-boundary projection (`Bytes` → base64, `DateTime` → RFC3339, `Json`
+/// inline), so it is carried as `serde_json::Value` (a JSON object), NOT core
+/// [`Value`](crate::value::Value): the change feed is a JSON delta, and a plugin
+/// hook receives it as JSON directly. Relation/vector fields are not published.
+/// Present on create/update and (since the engine populates it) on **delete** too
+/// — which is what lets a deletion be mapped back to its page for cache eviction.
 #[derive(Debug, Clone)]
 pub struct Change {
     pub version: u64,
     pub kind: ChangeKind,
     pub type_name: TypeName,
     pub object_id: ObjectId,
-    pub fields: Option<FieldMap>,
+    pub fields: Option<serde_json::Value>,
 }
