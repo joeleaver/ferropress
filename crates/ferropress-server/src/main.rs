@@ -182,9 +182,7 @@ async fn create_post(
         },
         children: Vec::new(),
     }]);
-    let block_tree = tree
-        .to_json_string()
-        .context("serializing the block tree")?;
+    let block_tree = tree.to_json_value().context("serializing the block tree")?;
 
     let mut fields: FieldMap = HashMap::new();
     fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
@@ -194,7 +192,7 @@ async fn create_post(
     );
     fields.insert("title".to_owned(), Value::String(title.to_owned()));
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
-    fields.insert("block_tree".to_owned(), Value::String(block_tree));
+    fields.insert("block_tree".to_owned(), Value::Json(block_tree));
 
     store
         .create(&TypeName::from(POST_TYPE), fields)

@@ -29,10 +29,10 @@ const PARAGRAPH_TEXT: &str = "Hello from the Ferropress end-to-end test.";
 const PUBLISHED_SLUG: &str = "hello-world";
 const DRAFT_SLUG: &str = "still-a-draft";
 
-/// The block-tree JSON String for a post whose body is one paragraph. Built via
-/// the domain types + `to_json_string`, so it matches exactly what
-/// `BlockTree::from_json_str` expects on read.
-fn paragraph_block_tree_json() -> String {
+/// The block-tree JSON for a post whose body is one paragraph. Built via the
+/// domain types + `to_json_value`, so it matches exactly what
+/// `BlockTree::from_json_value` expects on read.
+fn paragraph_block_tree_json() -> serde_json::Value {
     let tree = BlockTree::from_blocks(vec![Block {
         uid: "01J0000000000000000000TEST".to_owned(),
         kind: BlockKind::Paragraph {
@@ -44,8 +44,7 @@ fn paragraph_block_tree_json() -> String {
         },
         children: Vec::new(),
     }]);
-    tree.to_json_string()
-        .expect("block tree serializes to JSON")
+    tree.to_json_value().expect("block tree serializes to JSON")
 }
 
 /// Insert one Post with the given slug + status + a single-paragraph body. Only
@@ -61,7 +60,7 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) {
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
     fields.insert(
         "block_tree".to_owned(),
-        Value::String(paragraph_block_tree_json()),
+        Value::Json(paragraph_block_tree_json()),
     );
 
     store
@@ -198,7 +197,7 @@ async fn seed_callout_post(store: &Arc<dyn RhypeStore>, slug: &str) {
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
     fields.insert(
         "block_tree".to_owned(),
-        Value::String(tree.to_json_string().expect("serialize block tree")),
+        Value::Json(tree.to_json_value().expect("serialize block tree")),
     );
     store
         .create(&TypeName::from(POST_TYPE), fields)
@@ -290,7 +289,7 @@ async fn seed_wiki_post(store: &Arc<dyn RhypeStore>, slug: &str, text: &str) {
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
     fields.insert(
         "block_tree".to_owned(),
-        Value::String(tree.to_json_string().expect("serialize block tree")),
+        Value::Json(tree.to_json_value().expect("serialize block tree")),
     );
     store
         .create(&TypeName::from(POST_TYPE), fields)
@@ -363,7 +362,7 @@ async fn seed_published_post(store: &Arc<dyn RhypeStore>, slug: &str) -> ObjectI
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
     fields.insert(
         "block_tree".to_owned(),
-        Value::String(paragraph_block_tree_json()),
+        Value::Json(paragraph_block_tree_json()),
     );
     store
         .create(&TypeName::from(POST_TYPE), fields)

@@ -29,9 +29,9 @@ use crate::{OutputPage, ServeEngine, cache_key, content, serve_path};
 const PARAGRAPH_TEXT: &str = "Hello from the Ferropress cache test.";
 const SLUG: &str = "hello-world";
 
-/// The block-tree JSON String for a one-paragraph body. Built via the domain
-/// types so it round-trips through `BlockTree::from_json_str` exactly.
-fn paragraph_block_tree_json() -> String {
+/// The block-tree JSON for a one-paragraph body. Built via the domain types so
+/// it round-trips through `BlockTree::from_json_value` exactly.
+fn paragraph_block_tree_json() -> serde_json::Value {
     let tree = BlockTree::from_blocks(vec![Block {
         uid: "01J0000000000000000000TEST".to_owned(),
         kind: BlockKind::Paragraph {
@@ -43,8 +43,7 @@ fn paragraph_block_tree_json() -> String {
         },
         children: Vec::new(),
     }]);
-    tree.to_json_string()
-        .expect("block tree serializes to JSON")
+    tree.to_json_value().expect("block tree serializes to JSON")
 }
 
 /// Boot a real embedded store + local-FS blobs + the shared default theme into a
@@ -71,7 +70,7 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> O
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
     fields.insert(
         "block_tree".to_owned(),
-        Value::String(paragraph_block_tree_json()),
+        Value::Json(paragraph_block_tree_json()),
     );
 
     store

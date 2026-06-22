@@ -141,6 +141,13 @@ pub(crate) fn string_field(obj: &Object, field: &str) -> Option<String> {
     }
 }
 
+/// Read a `DateTime` field (epoch-millis) off an object, or `None` if it is
+/// absent or not a `DateTime`. Timestamps are stored as `Value::DateTime`; the
+/// API formats them to RFC3339 only at the DTO boundary.
+pub(crate) fn datetime_field(obj: &Object, field: &str) -> Option<i64> {
+    obj.get(field).and_then(Value::as_datetime)
+}
+
 /// Whether an object's `status` field equals `expected` (statuses are stored as
 /// plain strings — e.g. `Status::Published.as_str()` /
 /// `CommentStatus::Approved.as_str()`). A missing/non-string status is never a

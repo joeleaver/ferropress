@@ -30,17 +30,17 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use ferropress_core::error::CoreError;
 use ferropress_core::hook::{HookEvent, HookKind};
 use ferropress_core::query::Edge;
-use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
+use ferropress_core::value::{
+    FieldMap, ObjectId, TypeName, Value, datetime_to_rfc3339, now_millis,
+};
 use ferropress_core::{COMMENT_TYPE, CommentStatus, PAGE_TYPE, POST_TYPE};
 
 use crate::AppState;
-use crate::island::{ApiError, ApiJson, ApiQuery, status_is, string_field};
+use crate::island::{ApiError, ApiJson, ApiQuery, datetime_field, status_is, string_field};
 
 /// Defensive field-length caps — the POST endpoint is public and unauthenticated.
 const MAX_BODY_LEN: usize = 10_000;
@@ -169,13 +169,13 @@ pub async fn list(
     //    comments (drop the oldest overflow — never approved content behind
     //    non-approved rows; real pagination is a later increment). Decorate with
     //    the `created_at` sort key so the comparator reads each field once.
-    //    `created_at` is RFC3339, which sorts lexicographically == chronologically;
-    //    id is a stable tiebreak.
-    let mut keyed: Vec<(String, u64, _)> = approved
+    //    `created_at` is a `DateTime` (epoch-millis), so the i64 sort is exactly
+    //    chronological; id is a stable tiebreak. A missing timestamp sorts oldest.
+    let mut keyed: Vec<(i64, u64, _)> = approved
         .into_iter()
         .map(|obj| {
             (
-                string_field(&obj, "created_at").unwrap_or_default(),
+                datetime_field(&obj, "created_at").unwrap_or(0),
                 obj.id.0,
                 obj,
             )
@@ -221,7 +221,10 @@ pub async fn list(
                     .filter(|s| !s.is_empty())
                     .or_else(|| string_field(&obj, "plaintext"))
                     .unwrap_or_default(),
-                created_at: string_field(&obj, "created_at").unwrap_or_default(),
+                // Stored as epoch-millis; the public contract is RFC3339 UTC.
+                created_at: datetime_field(&obj, "created_at")
+                    .and_then(datetime_to_rfc3339)
+                    .unwrap_or_default(),
                 parent_id,
             }
         })
@@ -357,10 +360,9 @@ pub async fn create(
     }
 
     // --- build the comment (PENDING moderation) ---
-    let created_at = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
-        // A formatting failure is an internal fault, not a client error.
-        ApiError::Internal(CoreError::Store(format!("timestamp format failed: {e}")))
-    })?;
+    // Timestamp is stored as epoch-millis (`Value::DateTime`); the API formats it
+    // back to RFC3339 on read.
+    let created_at_ms = now_millis();
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -434,7 +436,7 @@ pub async fn create(
     if let Some(ua) = user_agent {
         fields.insert("user_agent".to_owned(), Value::String(ua));
     }
-    fields.insert("created_at".to_owned(), Value::String(created_at));
+    fields.insert("created_at".to_owned(), Value::DateTime(created_at_ms));
 
     // Inline relation: the comment attaches to EXACTLY ONE of post/page (the
     // resolved type), enforcing the schema's app-level mutual exclusion. Relation

@@ -295,14 +295,14 @@ pub(crate) fn render_object(
     custom: &dyn CustomBlockRenderer,
     obj: &Object,
 ) -> Result<String, CoreError> {
-    // `block_tree` is persisted as a JSON *String* (not Bytes / Json scalar).
+    // `block_tree` is persisted as a native `Value::Json` (rhypedb Json scalar).
     let tree = match obj.get("block_tree") {
-        Some(Value::String(s)) => BlockTree::from_json_str(s)?,
+        Some(Value::Json(j)) => BlockTree::from_json_value(j.clone())?,
         other => {
             return Err(CoreError::TypeMismatch {
                 type_name: obj.type_name.as_str().to_owned(),
                 field: "block_tree".to_owned(),
-                detail: format!("expected JSON String, got {other:?}"),
+                detail: format!("expected JSON, got {other:?}"),
             });
         }
     };

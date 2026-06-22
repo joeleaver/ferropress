@@ -19,7 +19,7 @@ use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt; // for `oneshot`
 
 use ferropress_core::store::RhypeStore;
-use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
+use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, rfc3339_to_millis};
 use ferropress_core::{
     Block, BlockKind, BlockTree, COMMENT_TYPE, CommentStatus, InlineRun, PAGE_TYPE, POST_TYPE,
     Status,
@@ -44,9 +44,9 @@ fn boot_state(dir: &Path) -> (Arc<dyn RhypeStore>, AppState) {
     (store, state)
 }
 
-/// A one-paragraph block-tree JSON string (the serve path needs a parseable
+/// A one-paragraph block-tree JSON value (the serve path needs a parseable
 /// `block_tree`, though the comment API itself does not read it).
-fn paragraph_block_tree_json() -> String {
+fn paragraph_block_tree_json() -> serde_json::Value {
     BlockTree::from_blocks(vec![Block {
         uid: "01J0000000000000000000TEST".to_owned(),
         kind: BlockKind::Paragraph {
@@ -58,7 +58,7 @@ fn paragraph_block_tree_json() -> String {
         },
         children: Vec::new(),
     }])
-    .to_json_string()
+    .to_json_value()
     .expect("block tree serializes")
 }
 
@@ -74,7 +74,7 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> O
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
     fields.insert(
         "block_tree".to_owned(),
-        Value::String(paragraph_block_tree_json()),
+        Value::Json(paragraph_block_tree_json()),
     );
     store
         .create(&TypeName::from(POST_TYPE), fields)
@@ -93,7 +93,7 @@ async fn seed_page(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> O
     fields.insert("title".to_owned(), Value::String("A Page".to_owned()));
     fields.insert(
         "block_tree".to_owned(),
-        Value::String(paragraph_block_tree_json()),
+        Value::Json(paragraph_block_tree_json()),
     );
     store
         .create(&TypeName::from(PAGE_TYPE), fields)
@@ -151,7 +151,7 @@ async fn seed_comment_on(
     );
     fields.insert(
         "created_at".to_owned(),
-        Value::String(created_at.to_owned()),
+        Value::DateTime(rfc3339_to_millis(created_at).expect("test seed created_at is RFC3339")),
     );
     fields.insert(relation.to_owned(), Value::U64(entity_id.0));
     if let Some(ObjectId(pid)) = parent {

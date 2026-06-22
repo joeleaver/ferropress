@@ -283,6 +283,24 @@ impl RhypeStore for EmbeddedStore {
                 })
                 .await,
             )?,
+            // DateTime predicates ride the engine's integer `filter_scan`: on a
+            // DateTime-typed field it compares the i64 epoch-millis through the
+            // ordered secondary index (range pushdown), so `created_at`/archive
+            // range queries are index-served, not full scans.
+            Value::DateTime(ms) => join(
+                tokio::task::spawn_blocking(move || {
+                    db.filter_scan(&type_name, &field, op, ms, limit)
+                })
+                .await,
+            )?,
+            Value::Json(_) => {
+                return Err(AdapterError::Conversion(
+                    "filter predicate value cannot be Json: JSON has no total order, so there is \
+                     no filter_scan path (and a Json field cannot be @indexed)"
+                        .to_owned(),
+                )
+                .into());
+            }
             Value::Null => {
                 return Err(AdapterError::Conversion(
                     "filter predicate value cannot be Null: no filter_scan path exists for a \

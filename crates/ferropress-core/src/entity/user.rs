@@ -31,8 +31,8 @@ pub struct User {
     /// Single-use password-reset token (None when no reset is pending). Stored
     /// `@indexed` in the SDL so the reset flow can look a user up by it.
     pub password_reset_token: Option<String>,
-    /// Expiry instant for `password_reset_token`, as an RFC-3339 String at rest.
-    pub password_reset_expires: Option<String>,
+    /// Expiry instant for `password_reset_token` (stored as a native `DateTime`).
+    pub password_reset_expires: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub meta: serde_json::Value,
 

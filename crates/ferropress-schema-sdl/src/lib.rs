@@ -5,11 +5,17 @@
 //! there is no builder/macro). `parsed_schema()` both parses and validates.
 //!
 //! VERIFIED rhypedb constraints baked into this SDL (checked against source at
-//! the pinned rev `e735be47`):
-//!   * Working scalar types are String/u32/u64/i32/i64/f32/f64/Bool/Bytes.
-//!     `DateTime` and `Json` are PARSE-ONLY / write-dead (no runtime Value
-//!     variant) — so every timestamp and every JSON blob is a `String`. We do
-//!     NOT use `DateTime`/`Json` anywhere.
+//! the pinned rev `2a9bf28`):
+//!   * Working scalar types are String/u32/u64/i32/i64/f32/f64/Bool/Bytes plus
+//!     `Json` and `DateTime`, both write-capable since rev `2a9bf28` (formerly
+//!     parse-only). We use `Json` for JSON blobs (block_tree, meta, seo) and
+//!     `DateTime` (i64 epoch-millis, UTC) for timestamps.
+//!   * `DateTime` carries an ordered secondary index, so `@indexed` on it gives
+//!     range pushdown (archive ranges, scheduled-publish scans). `Json` has NO
+//!     total order — the parser REJECTS `@indexed`/`@unique` on a `Json` field —
+//!     so every `Json` field here is unindexed.
+//!   * `@vectorize`'s source must be a `String`; the per-entity `plaintext`
+//!     field stays `String` for exactly that reason (never `Json`).
 //!   * `@indexed` is the scalar secondary-index directive (NOT `@index`).
 //!     `@index(hnsw, ...)` is the VECTOR-index directive and is rejected on a
 //!     scalar. Each entity's `search` Vector field carries `@index(hnsw, ...)`;
@@ -54,13 +60,13 @@ type User {
     role: String @indexed
     password_hash: String
     password_reset_token: String @indexed
-    password_reset_expires: String
+    password_reset_expires: DateTime
     url: String
     bio: String
     plaintext: String
     activation_key: String
-    created_at: String @indexed
-    meta: String
+    created_at: DateTime @indexed
+    meta: Json
 
     search: Vector<384>
         @vectorize(source: "plaintext", model: "all-MiniLM-L6-v2")
@@ -84,8 +90,8 @@ type Media {
     plaintext: String
     focal_x: f32
     focal_y: f32
-    created_at: String @indexed
-    meta: String
+    created_at: DateTime @indexed
+    meta: Json
 
     search: Vector<384>
         @vectorize(source: "plaintext", model: "all-MiniLM-L6-v2")
@@ -99,7 +105,7 @@ type Taxonomy {
     label: String
     hierarchical: Bool
     multiple: Bool
-    meta: String
+    meta: Json
 }
 
 type Term {
@@ -108,7 +114,7 @@ type Term {
     description: String
     plaintext: String
     count: u32
-    meta: String
+    meta: Json
 
     search: Vector<384>
         @vectorize(source: "plaintext", model: "all-MiniLM-L6-v2")
@@ -124,15 +130,15 @@ type Post {
     title: String
     status: String @indexed
     post_type: String @indexed
-    block_tree: String
+    block_tree: Json
     plaintext: String
     excerpt: String
-    seo: String
-    meta: String
-    created_at: String @indexed
-    updated_at: String
-    published_at: String @indexed
-    deleted_at: String @indexed
+    seo: Json
+    meta: Json
+    created_at: DateTime @indexed
+    updated_at: DateTime
+    published_at: DateTime @indexed
+    deleted_at: DateTime @indexed
     content_hash: String @indexed
 
     search: Vector<384>
@@ -151,17 +157,17 @@ type Page {
     slug: String @indexed
     title: String
     status: String @indexed
-    block_tree: String
+    block_tree: Json
     plaintext: String
     excerpt: String
-    seo: String
-    meta: String
+    seo: Json
+    meta: Json
     menu_order: i32 @indexed
     template: String
-    created_at: String @indexed
-    updated_at: String
-    published_at: String @indexed
-    deleted_at: String @indexed
+    created_at: DateTime @indexed
+    updated_at: DateTime
+    published_at: DateTime @indexed
+    deleted_at: DateTime @indexed
     content_hash: String @indexed
 
     search: Vector<384>
@@ -177,7 +183,7 @@ type Page {
 
 type Comment {
     status: String @indexed
-    block_tree: String
+    block_tree: Json
     body: String
     plaintext: String
     author_name: String
@@ -185,8 +191,8 @@ type Comment {
     author_url: String
     author_ip: String
     user_agent: String
-    created_at: String @indexed
-    meta: String
+    created_at: DateTime @indexed
+    meta: Json
 
     post: Post @on_delete(cascade)
     page: Page @on_delete(cascade)
@@ -198,14 +204,14 @@ type Menu {
     slug: String @unique
     name: String
     location: String @indexed
-    meta: String
+    meta: Json
 }
 
 type MenuItem {
     label: String
     item_order: i32 @indexed
     target: String
-    meta: String
+    meta: Json
 
     menu: Menu @on_delete(cascade)
     parent: MenuItem @on_delete(cascade)
@@ -220,9 +226,9 @@ type Setting {
 type Revision {
     kind: String @indexed
     title: String
-    block_tree: String
+    block_tree: Json
     plaintext: String
-    created_at: String @indexed
+    created_at: DateTime @indexed
 
     parent_post: Post @on_delete(cascade)
     parent_page: Page @on_delete(cascade)

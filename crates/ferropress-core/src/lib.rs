@@ -11,7 +11,7 @@
 //! - **Domain entities** (`entity::*`): `Post`, `Page`, `Media`, `Taxonomy`,
 //!   `Term`, `User`, `Comment`, `Menu`, `MenuItem`, `Setting`, `Revision`,
 //!   `Redirect` — the typed WordPress content model.
-//! - **Value objects**: `BlockTree` (typed JSON block tree as a String),
+//! - **Value objects**: `BlockTree` (typed JSON block tree, a native `Value::Json`),
 //!   `Status` / `CommentStatus` state machines, `Role` / `Capability`,
 //!   `Slug`, `SchemaVersion`, `Seo`.
 //! - **The `RhypeStore` port** (`store`): an async trait mirroring rhypedb's

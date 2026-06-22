@@ -3,8 +3,8 @@
 //! the rest of the system: nothing here is re-exported.
 //!
 //! Mappings:
-//!   core::Value  <-> rhypedb_engine::object::Value   (1:1 on the 10 shared variants;
-//!                                                      read-only folds DateTime/Json -> String)
+//!   core::Value  <-> rhypedb_engine::object::Value   (1:1 on every shared variant,
+//!                                                      including native DateTime/Json)
 //!   core::Object <-  rhypedb_engine::object::Object
 //!   core::Change <-  rhypedb_subscribe::ChangeEvent  (one direction; read-only feed,
 //!                                                      fields forwarded as JSON)
@@ -25,7 +25,7 @@ use rhypedb_engine::object::{FieldMap as DbFieldMap, Object as DbObject, Value a
 use rhypedb_subscribe::{ChangeEvent, ChangeKind as DbChangeKind, SubscriptionFilter};
 
 /// core::Value -> rhypedb Value. Total: every core variant has a 1:1 rhypedb
-/// counterpart (core deliberately mirrors only the live rhypedb variants).
+/// counterpart (core mirrors exactly rhypedb's live runtime variants).
 pub fn to_db_value(v: CoreValue) -> DbValue {
     match v {
         CoreValue::Null => DbValue::Null,
@@ -38,12 +38,14 @@ pub fn to_db_value(v: CoreValue) -> DbValue {
         CoreValue::F64(n) => DbValue::F64(n),
         CoreValue::Bool(b) => DbValue::Bool(b),
         CoreValue::Bytes(b) => DbValue::Bytes(Bytes::from(b)),
+        CoreValue::Json(j) => DbValue::Json(j),
+        CoreValue::DateTime(ms) => DbValue::DateTime(ms),
     }
 }
 
-/// rhypedb Value -> core::Value. Total: the 10 core-mirrored variants map 1:1; the
-/// two rhypedb-native variants core does NOT model (`DateTime`, `Json`) fold to
-/// `String` (see below).
+/// rhypedb Value -> core::Value. Total + 1:1: core mirrors every rhypedb runtime
+/// variant, including the native `DateTime`/`Json` rhypedb gained at rev `2a9bf28`
+/// (no longer folded to `String`).
 pub fn from_db_value(v: DbValue) -> CoreValue {
     match v {
         DbValue::Null => CoreValue::Null,
@@ -56,15 +58,8 @@ pub fn from_db_value(v: DbValue) -> CoreValue {
         DbValue::F64(n) => CoreValue::F64(n),
         DbValue::Bool(b) => CoreValue::Bool(b),
         DbValue::Bytes(b) => CoreValue::Bytes(b.to_vec()),
-        // rhypedb gained native DateTime/Json runtime values (formerly write-dead).
-        // Ferropress's core model deliberately carries NEITHER — timestamps and JSON
-        // travel as String (see `ferropress_core::value` module docs) — and
-        // Ferropress never WRITES them, so this is a defensive read path: render via
-        // the engine's canonical query-boundary projection (DateTime -> RFC3339 from
-        // epoch-millis, Json -> compact text) so a field written by some other tool
-        // still reads back as a String rather than panicking.
-        DbValue::DateTime(ms) => CoreValue::String(rhypedb_engine::object::rfc3339_from_millis(ms)),
-        DbValue::Json(j) => CoreValue::String(j.to_string()),
+        DbValue::DateTime(ms) => CoreValue::DateTime(ms),
+        DbValue::Json(j) => CoreValue::Json(j),
     }
 }
 
@@ -171,19 +166,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_db_value_folds_native_datetime_and_json_to_string() {
-        // rhypedb-native DateTime (epoch millis) -> RFC3339 String.
-        match from_db_value(DbValue::DateTime(0)) {
-            CoreValue::String(s) => {
-                assert!(s.starts_with("1970-01-01"), "RFC3339 of epoch 0: {s}")
-            }
-            other => panic!("DateTime must fold to String, got {other:?}"),
-        }
-        // rhypedb-native Json -> compact JSON text.
-        match from_db_value(DbValue::Json(serde_json::json!({ "a": 1 }))) {
-            CoreValue::String(s) => assert_eq!(s, "{\"a\":1}"),
-            other => panic!("Json must fold to String, got {other:?}"),
-        }
+    fn datetime_and_json_round_trip_1_to_1() {
+        // DateTime <-> DateTime, preserving the i64 epoch-millis payload.
+        let ms = 1_781_181_296_789_i64;
+        assert!(matches!(to_db_value(CoreValue::DateTime(ms)), DbValue::DateTime(m) if m == ms));
+        assert_eq!(
+            from_db_value(DbValue::DateTime(ms)),
+            CoreValue::DateTime(ms)
+        );
+
+        // Json <-> Json, preserving structure (no String folding).
+        let j = serde_json::json!({ "a": 1, "b": ["x", true] });
+        assert!(matches!(to_db_value(CoreValue::Json(j.clone())), DbValue::Json(v) if v == j));
+        assert_eq!(from_db_value(DbValue::Json(j.clone())), CoreValue::Json(j));
     }
 
     #[test]

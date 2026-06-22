@@ -9,13 +9,15 @@
 //!
 //! Cross-cutting fields present on every content entity (Post/Page/Media/Term/
 //! Comment/Revision):
-//!   - `block_tree: BlockTree` — canonical body (JSON String at rest).
+//!   - `block_tree: BlockTree` — canonical body (native `Value::Json` at rest).
 //!   - `plaintext: String` — server-derived, the SINGLE `@vectorize` source
-//!     feeding that entity's `search` Vector field.
-//!   - `slug`, `status`, `created_at`/`updated_at`/`published_at`.
-//!   - `meta: serde_json::Value` — Tier-1 plugin meta (namespaced JSON String
-//!     at rest).
-//!   - `seo: Seo` — first-class SEO (JSON String at rest).
+//!     feeding that entity's `search` Vector field (stays `String` — the
+//!     vectorizer requires a `String` source).
+//!   - `slug`, `status`; `created_at`/`updated_at`/`published_at` (native
+//!     `DateTime`, epoch-millis at rest).
+//!   - `meta: serde_json::Value` — Tier-1 plugin meta (namespaced native
+//!     `Value::Json` at rest).
+//!   - `seo: Seo` — first-class SEO (native `Value::Json` at rest).
 
 pub mod comment;
 pub mod media;

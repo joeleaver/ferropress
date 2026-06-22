@@ -1,8 +1,13 @@
 //! The typed JSON block tree — Ferropress's content body representation.
 //!
-//! ARCHITECTURE INVARIANT: the canonical block tree is stored as a JSON
-//! **String** in the database (not `Bytes`, not the decorative `Json` scalar —
-//! both verified write-dead in rhypedb). Every block carries a stable UID so
+//! ARCHITECTURE INVARIANT: the canonical block tree is stored as a native
+//! **`Value::Json`** field in the database (rhypedb gained write-capable `Json`
+//! values at rev `2a9bf28`; it was previously a JSON `String` only because
+//! rhypedb's `Json` scalar was write-dead at the time — `String` was the only
+//! way to round-trip JSON through the store). Storing it as JSON means it flows
+//! through the JSON API
+//! boundary without double-encoding — the editor reads `"block_tree": {…}`, not
+//! an escaped `"{\"blocks\":…}"` string. Every block carries a stable UID so
 //! edits/diffs/revisions can address individual blocks across versions, and the
 //! tree carries a `schema_version` from commit #1 so the format can evolve with
 //! an explicit migration rather than ambiguous best-effort parsing.
@@ -16,9 +21,9 @@
 /// in every `BlockTree` so a reader can refuse / migrate older trees explicitly.
 pub const BLOCK_SCHEMA_VERSION: u32 = 1;
 
-/// The opaque, validated wrapper around the canonical block-tree JSON string as
-/// persisted. Construct via `from_blocks` (serializes + stamps the version) or
-/// `from_json_str` (validates it parses + version-checks). The renderer
+/// The opaque, validated wrapper around the canonical block tree as persisted
+/// (a native `Value::Json`). Construct via `from_blocks` (stamps the version) or
+/// `from_json_value` (validates it parses + version-checks). The renderer
 /// (`ferropress-render`) is the only consumer that walks the parsed form.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BlockTree {
@@ -35,17 +40,17 @@ impl BlockTree {
         }
     }
 
-    /// Parse + validate the persisted JSON string form.
-    pub fn from_json_str(s: &str) -> crate::error::Result<Self> {
-        let tree: BlockTree = serde_json::from_str(s)?;
+    /// Parse + validate the persisted `Value::Json` form.
+    pub fn from_json_value(value: serde_json::Value) -> crate::error::Result<Self> {
+        let tree: BlockTree = serde_json::from_value(value)?;
         // TODO: if tree.schema_version > BLOCK_SCHEMA_VERSION -> Validation error;
         // if older, route through a registered block-tree migration.
         Ok(tree)
     }
 
-    /// Serialize to the canonical JSON string for storage in a `Value::String`.
-    pub fn to_json_string(&self) -> crate::error::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    /// Serialize to a `serde_json::Value` for storage in a `Value::Json` field.
+    pub fn to_json_value(&self) -> crate::error::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
     }
 }
 
