@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 # Ports + the owned subsystems.
 ferropress-core = { workspace = true }
+ferropress-auth = { workspace = true }
 ferropress-store-embedded = { workspace = true }
 ferropress-serve = { workspace = true }
 ferropress-http = { workspace = true }

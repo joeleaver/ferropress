@@ -13,6 +13,9 @@ ferropress-core = { workspace = true }
 ferropress-serve = { workspace = true }
 ferropress-theme = { workspace = true }
 ferropress-render = { workspace = true }
+# Admin auth: Argon2 password verify + HMAC signed session tokens (the admin API
+# guards /admin/api/* with a signed-cookie session).
+ferropress-auth = { workspace = true }
 # Owned HTTP stack (invariant #6: serving is owned, never delegated).
 axum = { workspace = true }
 tower-http = { workspace = true }

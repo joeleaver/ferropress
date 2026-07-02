@@ -23,23 +23,29 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use uuid::Uuid;
 
-use ferropress_core::ports::{BlobStore, CertSource, Scheduler, SecretStore};
+use ferropress_auth::{SigningKey, hash_password};
+use ferropress_core::ports::{BlobStore, CertSource, Scheduler, SecretRef, SecretStore};
 use ferropress_core::store::RhypeStore;
-use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
+use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, now_millis};
 use ferropress_core::{
     Block, BlockKind, BlockTree, ContentReader, ContentWriter, InlineRun, POST_TYPE, Status,
+    USER_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_cert_acme::{AcmeCertSource, AcmeConfig};
-use ferropress_http::AppState;
+use ferropress_http::{AdminConfig, AppState};
 use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{HookBridge, ServeEngine, default_theme};
 use ferropress_store_embedded::EmbeddedStore;
 
-use crate::config::{Cli, Command, PostArgs, ServerConfig, TlsMode};
+use crate::config::{Cli, Command, CreateUserArgs, PostArgs, ServerConfig, TlsMode};
+
+/// The `SecretStore` key holding the admin session signing secret. When unset, the
+/// admin API is disabled (a public-only deployment).
+const ADMIN_SECRET_KEY: &str = "FERROPRESS_ADMIN_SECRET";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,6 +56,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Serve(cfg) => run_server(cfg).await,
         Command::Post(args) => create_post_cmd(args).await,
+        Command::CreateUser(args) => create_user_cmd(args).await,
     }
 }
 
@@ -120,15 +127,29 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // The same plugin host is the custom-block renderer AND the hook dispatcher
     // (the `comment.create` moderation filter runs through it); `plugins.clone()`
     // coerces `Arc<PluginHost>` to each trait object at the call site.
-    let app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
+    let mut app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
         .with_islands_dir(cfg.islands_dir.clone())
         .with_custom_renderer(plugins.clone())
         .with_hook_dispatcher(plugins.clone());
 
-    // Wired but not yet driven in v1: the scheduler, secret store, and cert source
-    // come online in later increments. Named so the composition seam is real and
-    // they stay constructed. (`serve` is spawned below; `plugins` is now injected.)
-    let _ = (&secrets, &scheduler, &certs);
+    // Admin API + SPA: enabled ONLY when a signing secret is configured (from the
+    // SecretStore). No secret -> the admin surface is not mounted (public-only),
+    // which is the safe default (never a weak/guessable key). The SPA bundle is
+    // served only if its build dir exists, so the API is usable before the wasm is
+    // built.
+    if let Some(admin) = select_admin_config(&cfg, secrets.as_ref()).await? {
+        app_state = app_state.with_admin(admin);
+    } else {
+        tracing::warn!(
+            "{ADMIN_SECRET_KEY} is not set — the admin API is DISABLED (public-only). \
+             Set it (e.g. in the env file) to enable /admin."
+        );
+    }
+
+    // Wired but not yet driven in v1: the scheduler and cert source come online in
+    // later increments. Named so the composition seam is real and they stay
+    // constructed. (`serve` is spawned below; `plugins` is now injected.)
+    let _ = (&scheduler, &certs);
 
     // 3. Spawn the static-first regeneration loop as a background task BEFORE the
     //    HTTP server boots. It subscribes to the change feed and write-throughs /
@@ -160,6 +181,93 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     ferropress_http::serve(app_state, cfg.bind)
         .await
         .context("running the HTTP server")?;
+    Ok(())
+}
+
+/// Build the admin config from the server config + secret store, or `None` when no
+/// signing secret is set (admin disabled). Fetching the secret is the ONLY reason
+/// this is async.
+async fn select_admin_config(
+    cfg: &ServerConfig,
+    secrets: &dyn SecretStore,
+) -> Result<Option<AdminConfig>> {
+    let secret = secrets
+        .try_get(&SecretRef(ADMIN_SECRET_KEY.to_owned()))
+        .await
+        .with_context(|| format!("reading {ADMIN_SECRET_KEY}"))?;
+    let Some(secret) = secret.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(AdminConfig {
+        signing_key: Arc::new(SigningKey::derive_from_secret(&secret)),
+        // Serve the SPA bundle only if it has been built; the API works regardless.
+        bundle_dir: cfg.admin_dir.exists().then(|| cfg.admin_dir.clone()),
+        cookie_secure: cfg.admin_cookie_secure,
+        session_ttl_ms: i64::from(cfg.admin_session_hours) * 60 * 60 * 1000,
+    }))
+}
+
+/// The `create-user` subcommand: seed a user (username + Argon2-hashed password +
+/// role) into the embedded store, then exit — so someone can sign in to the admin.
+async fn create_user_cmd(args: CreateUserArgs) -> Result<()> {
+    // Validate the role up front (a clear message beats a store-side failure). The
+    // snake_case strings mirror `Role`'s serde representation.
+    let role = args.role.to_ascii_lowercase();
+    if !matches!(
+        role.as_str(),
+        "subscriber" | "contributor" | "author" | "editor" | "administrator"
+    ) {
+        anyhow::bail!(
+            "invalid role {:?} (expected subscriber|contributor|author|editor|administrator)",
+            args.role
+        );
+    }
+
+    let store: Arc<dyn RhypeStore> = Arc::new(
+        EmbeddedStore::open(&args.data_dir)
+            .with_context(|| format!("opening embedded store at {}", args.data_dir.display()))?,
+    );
+
+    // Friendly duplicate check (slug is @unique, so the engine would reject it too).
+    let taken = !store
+        .filter(ferropress_core::query::FilterSpec {
+            type_name: TypeName::from(USER_TYPE),
+            field: "slug".to_owned(),
+            op: ferropress_core::query::Compare::Eq,
+            value: Value::String(args.username.clone()),
+            limit: Some(1),
+        })
+        .await
+        .context("checking for an existing username")?
+        .is_empty();
+    if taken {
+        anyhow::bail!("username {:?} already exists", args.username);
+    }
+
+    let hash =
+        hash_password(&args.password).map_err(|e| anyhow::anyhow!("hashing password: {e}"))?;
+    let display_name = args.display_name.unwrap_or_else(|| args.username.clone());
+    let email = args
+        .email
+        .unwrap_or_else(|| format!("{}@localhost", args.username));
+
+    let mut fields: FieldMap = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(args.username.clone()));
+    fields.insert("uuid".to_owned(), Value::String(Uuid::now_v7().to_string()));
+    fields.insert("email".to_owned(), Value::String(email));
+    fields.insert("display_name".to_owned(), Value::String(display_name));
+    fields.insert("role".to_owned(), Value::String(role.clone()));
+    fields.insert("password_hash".to_owned(), Value::String(hash));
+    fields.insert("created_at".to_owned(), Value::DateTime(now_millis()));
+
+    let id = store
+        .create(&TypeName::from(USER_TYPE), fields)
+        .await
+        .context("creating the user")?;
+    println!(
+        "created user id={} username={} role={role}",
+        id.0, args.username
+    );
     Ok(())
 }
 

@@ -33,7 +33,10 @@ use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
 use ferropress_serve::Resolved;
 use ferropress_theme::ThemeEngine;
 
+pub mod admin;
 pub mod island;
+
+pub use admin::AdminConfig;
 
 /// Shared HTTP application state, cloned into every axum handler. Holds the
 /// injected data ports plus the render-side collaborators the SSR fallback needs
@@ -62,6 +65,10 @@ pub struct AppState {
     /// to [`NoHooks`] (every event passes through unchanged); the composition root
     /// injects the plugin host via [`with_hook_dispatcher`](Self::with_hook_dispatcher).
     pub hooks: Arc<dyn HookDispatcher>,
+    /// Admin API + SPA configuration (signing key, bundle dir, cookie policy). When
+    /// `None`, NO `/admin*` route is mounted — a public-only deployment. Injected by
+    /// the composition root via [`with_admin`](Self::with_admin).
+    pub admin: Option<AdminConfig>,
 }
 
 impl AppState {
@@ -80,6 +87,7 @@ impl AppState {
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
             hooks: Arc::new(NoHooks),
+            admin: None,
         }
     }
 
@@ -101,6 +109,13 @@ impl AppState {
     /// (the `ferropress-plugin-host`).
     pub fn with_hook_dispatcher(mut self, hooks: Arc<dyn HookDispatcher>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Enable the admin API + SPA with `admin` (signing key + bundle dir + cookie
+    /// policy). Without this, `/admin*` is not routed at all.
+    pub fn with_admin(mut self, admin: AdminConfig) -> Self {
+        self.admin = Some(admin);
         self
     }
 }
@@ -177,6 +192,19 @@ pub fn router(state: AppState) -> Router {
     // `text/javascript` + `application/wasm` content types for ESM + wasm loading.
     if let Some(dir) = &state.islands_dir {
         app = app.nest_service("/_fp/islands", ServeDir::new(dir));
+    }
+
+    // Admin API + SPA, only when configured. The API (login/session-guarded posts)
+    // is always available once an `AdminConfig` is present; the SPA shell + wasm
+    // bundle are additionally gated on a built bundle dir, so the API is testable
+    // without a wasm build.
+    if let Some(admin_cfg) = &state.admin {
+        app = app.merge(admin::api_routes());
+        if let Some(dir) = &admin_cfg.bundle_dir {
+            app = app
+                .route("/admin", get(admin::shell))
+                .nest_service("/_fp/admin", ServeDir::new(dir));
+        }
     }
 
     app.with_state(state)

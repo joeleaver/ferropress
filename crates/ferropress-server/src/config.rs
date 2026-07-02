@@ -34,6 +34,37 @@ pub enum Command {
     Serve(ServerConfig),
     /// Create a published post, then exit (admin / seeding).
     Post(PostArgs),
+    /// Create an admin user (username + password + role), then exit. Seeds the
+    /// first account so someone can sign in to the admin.
+    CreateUser(CreateUserArgs),
+}
+
+/// Arguments for `create-user`: seed a user with a password + role.
+#[derive(Debug, Args)]
+pub struct CreateUserArgs {
+    /// Directory holding the embedded rhypedb database (must match the server's).
+    #[arg(long, env = "FERROPRESS_DATA_DIR", default_value = "./data/db")]
+    pub data_dir: PathBuf,
+
+    /// Login username (the unique `slug`).
+    #[arg(long)]
+    pub username: String,
+
+    /// Password (hashed with Argon2 before storage; never persisted in plaintext).
+    #[arg(long)]
+    pub password: String,
+
+    /// Role: subscriber | contributor | author | editor | administrator.
+    #[arg(long, default_value = "administrator")]
+    pub role: String,
+
+    /// Display name (defaults to the username).
+    #[arg(long)]
+    pub display_name: Option<String>,
+
+    /// Email (defaults to `<username>@localhost`).
+    #[arg(long)]
+    pub email: Option<String>,
 }
 
 /// Arguments for `post`: create a published post from the command line.
@@ -106,4 +137,29 @@ pub struct ServerConfig {
     /// A missing directory just means no plugins are loaded.
     #[arg(long, env = "FERROPRESS_PLUGINS_DIR", default_value = "./plugins/dist")]
     pub plugins_dir: PathBuf,
+
+    /// Directory holding the built wasm admin bundle (the `dist/` output of
+    /// `cargo xtask build-admin`). Served at `/_fp/admin`; the SPA shell is at
+    /// `/admin`. The admin API is enabled only when a signing secret is set (see
+    /// `FERROPRESS_ADMIN_SECRET`), independent of whether this bundle exists.
+    #[arg(
+        long,
+        env = "FERROPRESS_ADMIN_DIR",
+        default_value = "./crates/ferropress-admin/dist"
+    )]
+    pub admin_dir: PathBuf,
+
+    /// Mark the admin session cookie `Secure` (HTTPS-only). Default true; set false
+    /// for local plain-HTTP development so the browser will store the cookie.
+    #[arg(
+        long,
+        env = "FERROPRESS_ADMIN_COOKIE_SECURE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub admin_cookie_secure: bool,
+
+    /// Admin session lifetime, in hours (cookie Max-Age + token expiry).
+    #[arg(long, env = "FERROPRESS_ADMIN_SESSION_HOURS", default_value_t = 168)]
+    pub admin_session_hours: u32,
 }

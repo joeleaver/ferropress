@@ -52,6 +52,53 @@ impl BlockTree {
     pub fn to_json_value(&self) -> crate::error::Result<serde_json::Value> {
         Ok(serde_json::to_value(self)?)
     }
+
+    /// Flatten the tree to its plain reading text — the projection the persisted
+    /// `plaintext` field carries for `@vectorize` semantic search. Every editor
+    /// save re-derives this so the search index tracks the edited body. Prose runs
+    /// (paragraph / heading / quote / list items) and code/image-alt contribute;
+    /// structural-only kinds (`List` wrapper, `Embed`, `Custom`) do not (their
+    /// prose, if any, rides on child blocks). Blocks are separated by newlines.
+    pub fn plaintext(&self) -> String {
+        let mut out = String::new();
+        for block in &self.blocks {
+            block.push_plaintext(&mut out);
+        }
+        out.trim().to_owned()
+    }
+}
+
+impl Block {
+    /// Append this block's reading text (then recurse into children) to `out`.
+    fn push_plaintext(&self, out: &mut String) {
+        match &self.kind {
+            BlockKind::Paragraph { runs }
+            | BlockKind::Heading { runs, .. }
+            | BlockKind::Quote { runs } => {
+                for run in runs {
+                    out.push_str(&run.text);
+                }
+                out.push('\n');
+            }
+            BlockKind::Code { source, .. } => {
+                out.push_str(source);
+                out.push('\n');
+            }
+            BlockKind::Image { alt, .. } if !alt.is_empty() => {
+                out.push_str(alt);
+                out.push('\n');
+            }
+            // `List` holds its items as children; `Embed`/`Custom` carry no prose
+            // to index (a URL / opaque plugin payload). `Image` with empty alt: nil.
+            BlockKind::Image { .. }
+            | BlockKind::List { .. }
+            | BlockKind::Embed { .. }
+            | BlockKind::Custom { .. } => {}
+        }
+        for child in &self.children {
+            child.push_plaintext(out);
+        }
+    }
 }
 
 /// A single block in the tree. `uid` is stable across edits.
@@ -116,4 +163,108 @@ pub struct InlineRun {
     /// Present when the run is a link.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(text: &str) -> InlineRun {
+        InlineRun {
+            text: text.to_owned(),
+            marks: Vec::new(),
+            href: None,
+        }
+    }
+    fn block(kind: BlockKind, children: Vec<Block>) -> Block {
+        Block {
+            uid: "u".to_owned(),
+            kind,
+            children,
+        }
+    }
+
+    #[test]
+    fn plaintext_flattens_prose_and_recurses_children() {
+        let tree = BlockTree::from_blocks(vec![
+            block(
+                BlockKind::Heading {
+                    level: 1,
+                    runs: vec![run("Title")],
+                },
+                vec![],
+            ),
+            block(
+                BlockKind::Paragraph {
+                    runs: vec![run("Hello "), run("world")],
+                },
+                vec![],
+            ),
+            block(
+                BlockKind::Quote {
+                    runs: vec![run("A quote")],
+                },
+                vec![],
+            ),
+            // A list's items ride on children; the wrapper itself has no prose.
+            block(
+                BlockKind::List { ordered: false },
+                vec![
+                    block(
+                        BlockKind::Paragraph {
+                            runs: vec![run("first")],
+                        },
+                        vec![],
+                    ),
+                    block(
+                        BlockKind::Paragraph {
+                            runs: vec![run("second")],
+                        },
+                        vec![],
+                    ),
+                ],
+            ),
+            block(
+                BlockKind::Code {
+                    language: None,
+                    source: "let x = 1;".to_owned(),
+                },
+                vec![],
+            ),
+            block(
+                BlockKind::Image {
+                    media_id: 3,
+                    alt: "a cat".to_owned(),
+                },
+                vec![],
+            ),
+            // No prose to index.
+            block(
+                BlockKind::Embed {
+                    provider: "y".to_owned(),
+                    url: "http://x".to_owned(),
+                },
+                vec![],
+            ),
+            block(
+                BlockKind::Custom {
+                    plugin: "p".to_owned(),
+                    name: "n".to_owned(),
+                    data: serde_json::json!({}),
+                },
+                vec![],
+            ),
+        ]);
+
+        let text = tree.plaintext();
+        assert_eq!(
+            text,
+            "Title\nHello world\nA quote\nfirst\nsecond\nlet x = 1;\na cat"
+        );
+    }
+
+    #[test]
+    fn plaintext_of_empty_tree_is_empty() {
+        assert_eq!(BlockTree::from_blocks(vec![]).plaintext(), "");
+    }
 }
