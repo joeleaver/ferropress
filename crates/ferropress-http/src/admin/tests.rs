@@ -112,6 +112,25 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> O
         .expect("seed post")
 }
 
+/// POST /admin/api/posts (create) with the given cookie + JSON body; return
+/// (status, body json).
+async fn do_create(
+    state: &AppState,
+    cookie: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/posts")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
 /// POST /admin/api/login and return (status, set-cookie value, body json).
 async fn do_login(
     state: &AppState,
@@ -443,6 +462,221 @@ async fn save_rejects_a_slug_taken_by_another_post() {
     assert_eq!(
         router(state).oneshot(req).await.unwrap().status(),
         StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn create_stamps_a_full_post_and_attributes_the_author() {
+    use ferropress_core::query::Edge;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let jane = seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // Create a blank draft (no status → defaults to Draft).
+    let (status, body) = do_create(
+        &state,
+        &cookie,
+        serde_json::json!({
+            "title": "A new dispatch",
+            "slug": "a-new-dispatch",
+            "block_tree": one_paragraph("first words on the sheet"),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create body: {body}");
+    let new_id = body["id"].as_u64().expect("create returns an id");
+    assert!(body["created_at"].as_i64().unwrap() > 0);
+
+    // The post is readable, is a Draft, and carries the derived + stamped fields.
+    let obj = store
+        .get(&TypeName::from(POST_TYPE), ObjectId(new_id))
+        .await
+        .expect("get created");
+    assert!(matches!(obj.get("title"), Some(Value::String(s)) if s == "A new dispatch"));
+    assert!(matches!(obj.get("slug"), Some(Value::String(s)) if s == "a-new-dispatch"));
+    assert!(matches!(obj.get("status"), Some(Value::String(s)) if s == Status::Draft.as_str()));
+    assert!(matches!(obj.get("post_type"), Some(Value::String(s)) if s == "post"));
+    assert!(
+        matches!(obj.get("uuid"), Some(Value::String(s)) if !s.is_empty()),
+        "a fresh uuid must be stamped: {:?}",
+        obj.get("uuid")
+    );
+    assert!(
+        matches!(obj.get("plaintext"), Some(Value::String(s)) if s.contains("first words")),
+        "plaintext must be derived on create: {:?}",
+        obj.get("plaintext")
+    );
+    assert!(matches!(obj.get("created_at"), Some(Value::DateTime(_))));
+    assert!(matches!(obj.get("updated_at"), Some(Value::DateTime(_))));
+
+    // The post is attributed to its creator via the `author` relation.
+    let links = store
+        .get_links(&Edge {
+            type_name: TypeName::from(POST_TYPE),
+            id: ObjectId(new_id),
+            field: "author".to_owned(),
+        })
+        .await
+        .expect("get author links");
+    assert!(
+        links.iter().any(|(id, _)| *id == jane),
+        "the new post must be linked to its author {jane:?}: {links:?}"
+    );
+
+    // It shows up in the galley list.
+    let req = Request::builder()
+        .uri("/admin/api/posts")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let listed = to_json(router(state).oneshot(req).await.unwrap()).await;
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == new_id && p["slug"] == "a-new-dispatch"),
+        "list must contain the created post: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn create_accepts_an_explicit_publishable_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let (status, body) = do_create(
+        &state,
+        &cookie,
+        serde_json::json!({
+            "title": "Straight to press",
+            "slug": "straight-to-press",
+            "status": "published",
+            "block_tree": one_paragraph("body"),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create body: {body}");
+    let obj = store
+        .get(
+            &TypeName::from(POST_TYPE),
+            ObjectId(body["id"].as_u64().unwrap()),
+        )
+        .await
+        .expect("get");
+    assert!(matches!(obj.get("status"), Some(Value::String(s)) if s == Status::Published.as_str()));
+}
+
+#[tokio::test]
+async fn create_rejects_bad_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    seed_post(&store, "taken-slug", Status::Published).await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+    let good_tree = one_paragraph("x");
+
+    // Empty slug.
+    assert_eq!(
+        do_create(
+            &state,
+            &cookie,
+            serde_json::json!({"title":"t","slug":"  ","block_tree":good_tree})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    // A slug another post already holds is a conflict.
+    assert_eq!(
+        do_create(
+            &state,
+            &cookie,
+            serde_json::json!({"title":"t","slug":"taken-slug","block_tree":good_tree})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    // Unknown status.
+    assert_eq!(
+        do_create(
+            &state,
+            &cookie,
+            serde_json::json!({"title":"t","slug":"ok","status":"nonsense","block_tree":good_tree})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    // A status that isn't a legal birth state (private/trashed are not reachable
+    // directly from a fresh draft).
+    for bad in ["private", "trashed"] {
+        assert_eq!(
+            do_create(
+                &state,
+                &cookie,
+                serde_json::json!({"title":"t","slug":"ok","status":bad,"block_tree":good_tree})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST,
+            "status {bad:?} must be rejected at create"
+        );
+    }
+    // Malformed block tree.
+    assert_eq!(
+        do_create(
+            &state,
+            &cookie,
+            serde_json::json!({"title":"t","slug":"ok","block_tree":{"nope":1}})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn create_requires_a_session_and_the_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "sam", "passwordpassword", "subscriber").await;
+    let tree = one_paragraph("x");
+
+    // No session → 401.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/posts")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"title":"t","slug":"nope","block_tree":tree}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router(state.clone()).oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Authenticated but under-privileged → 403.
+    let (_, cookie, _) = do_login(&state, "sam", "passwordpassword").await;
+    let cookie = session_pair(&cookie.unwrap());
+    assert_eq!(
+        do_create(
+            &state,
+            &cookie,
+            serde_json::json!({"title":"t","slug":"nope","block_tree":one_paragraph("x")})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
     );
 }
 

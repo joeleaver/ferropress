@@ -285,6 +285,11 @@ async fn create_post_cmd(args: PostArgs) -> Result<()> {
 }
 
 /// Build a one-paragraph published post and insert it through the store port.
+/// Stamps the same full field set the admin `create` handler does — `uuid`,
+/// derived `plaintext` (the `@vectorize` source), `created_at`/`updated_at` — so a
+/// CLI-seeded post is indistinguishable from an editor-authored one. A CLI post has
+/// no `author` (there is no authenticated user on this path); that relation is set
+/// only through the admin API.
 async fn create_post(
     store: &Arc<dyn RhypeStore>,
     slug: &str,
@@ -304,7 +309,9 @@ async fn create_post(
     }]);
     let block_tree = tree.to_json_value().context("serializing the block tree")?;
 
+    let now = now_millis();
     let mut fields: FieldMap = HashMap::new();
+    fields.insert("uuid".to_owned(), Value::String(Uuid::now_v7().to_string()));
     fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
     fields.insert(
         "status".to_owned(),
@@ -313,6 +320,9 @@ async fn create_post(
     fields.insert("title".to_owned(), Value::String(title.to_owned()));
     fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
     fields.insert("block_tree".to_owned(), Value::Json(block_tree));
+    fields.insert("plaintext".to_owned(), Value::String(tree.plaintext()));
+    fields.insert("created_at".to_owned(), Value::DateTime(now));
+    fields.insert("updated_at".to_owned(), Value::DateTime(now));
 
     store
         .create(&TypeName::from(POST_TYPE), fields)

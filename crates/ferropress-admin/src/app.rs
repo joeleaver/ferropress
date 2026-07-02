@@ -75,6 +75,12 @@ pub fn app() -> NodeHandle {
     // closure freely; `.get()` returns a clone of the underlying `Rc` editor.
     let editor = Signal::new(create_editor());
     let current_id = Signal::new(Option::<u64>::None);
+    // A monotonic "editing session" generation, bumped whenever a different document
+    // is loaded into the shared editor (open a post / start a new one). A save
+    // captures it and, on completion, ignores its own writeback if the generation
+    // has moved on — so a slow save that finishes after the user navigated away can
+    // never clobber the now-current post's id (see `save_post`).
+    let editor_session = Signal::new(0u64);
     let title = Signal::new(String::new());
     let slug = Signal::new(String::new());
     let status = Signal::new(String::new());
@@ -187,6 +193,14 @@ pub fn app() -> NodeHandle {
                             span { class: "masthead__sep", "\u{00B7}" }
                             span { class: "masthead__here", "Posts" }
                             span { class: "masthead__spacer" }
+                            button {
+                                class: "btn btn--primary",
+                                style: "width:auto",
+                                onclick: move || new_post(
+                                    editor, title, slug, status, current_id, editor_session, notice, auth,
+                                ),
+                                "\u{002B} New post"
+                            }
                             span { class: "masthead__user",
                                 span { class: "masthead__avatar", {move || avatar_initial(&me_user.get())} }
                                 {move || display_name(&me_user.get())}
@@ -239,7 +253,7 @@ pub fn app() -> NodeHandle {
                                 class: "row",
                                 onclick: {
                                     let id = row.id;
-                                    move || open_post(id, editor, title, slug, status, current_id, notice, auth)
+                                    move || open_post(id, editor, title, slug, status, current_id, editor_session, notice, auth)
                                 },
                                 span { class: "row__mark", "\u{2295}" }
                                 span {
@@ -272,13 +286,13 @@ pub fn app() -> NodeHandle {
                                 "\u{2190} Posts"
                             }
                             span { class: "masthead__sep", "\u{00B7}" }
-                            span { class: "masthead__here", {move || title.get()} }
+                            span { class: "masthead__here", {move || masthead_title(&title.get())} }
                             span { class: "masthead__spacer" }
                             button {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || save_post(
-                                    editor, current_id.get(), title, slug, status, saving, notice, toast, auth,
+                                    editor, current_id, editor_session, title, slug, status, saving, notice, toast, auth,
                                 ),
                                 {move || if saving.get() { "Saving\u{2026}" } else { "Save" }}
                             }
@@ -335,6 +349,19 @@ pub fn app() -> NodeHandle {
                         }
                         div { class: "sheet",
                             div { class: "sheet__inner",
+                                // The title is the headline set on the sheet (per the
+                                // mockup). Uncontrolled like the slug field: `value` is
+                                // read once at arm-build — after `open_post`/`new_post`
+                                // set the signal — and `oninput` feeds edits back (a
+                                // reactive `value` would fight the caret). Typing here
+                                // live-updates the masthead, which reads the same signal.
+                                input {
+                                    class: "sheet__title",
+                                    value: title.get(),
+                                    placeholder: "Untitled",
+                                    spellcheck: "false",
+                                    oninput: move |v: String| title.set(v),
+                                }
                                 Editor { editor: editor.get(), content: "" }
                             }
                         }
@@ -404,6 +431,7 @@ fn open_post(
     slug: Signal<String>,
     status: Signal<String>,
     current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
     notice: Signal<String>,
     auth: AuthCtx,
 ) {
@@ -411,6 +439,9 @@ fn open_post(
     spawn_local(async move {
         match api::get_post(id).await {
             Ok(detail) => {
+                // A new document is taking over the shared editor: bump the session
+                // so any still-in-flight save can no longer write back its id here.
+                editor_session.update(|g| *g += 1);
                 title.set(detail.title);
                 slug.set(detail.slug);
                 status.set(detail.status);
@@ -438,11 +469,14 @@ fn open_post(
 }
 
 /// Persist the current editor document: read it back, bridge to `BlockTree`, and
-/// `PUT` it. Surfaces the server's 400/409 message; stamps a "Saved" toast on 200.
+/// send it. A post with no id yet (a fresh "New post") is CREATED (`POST`) and its
+/// assigned id captured into `current_id` so the next save UPDATES (`PUT`) it in
+/// place. Surfaces the server's 400/409 message; stamps a "Saved" toast on success.
 #[allow(clippy::too_many_arguments)]
 fn save_post(
     editor: Signal<EditorHandle>,
-    id: Option<u64>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
     title: Signal<String>,
     slug: Signal<String>,
     status: Signal<String>,
@@ -454,9 +488,6 @@ fn save_post(
     if saving.get() {
         return;
     }
-    let Some(id) = id else {
-        return;
-    };
 
     let node = editor.get().doc();
     let block_tree = match bridge::node_to_block_tree_json(&node) {
@@ -474,30 +505,107 @@ fn save_post(
 
     notice.set(String::new());
     saving.set(true);
-    let body = api::SaveRequest {
-        title: title.get(),
-        slug: slug_val,
-        status: status.get(),
-        block_tree,
-    };
+    let title_val = title.get();
+    let status_val = status.get();
+    // The document this save belongs to. If the editor loads a different document
+    // before the request returns, the result is stale and must NOT write back its
+    // id / toast / error into what is now a different editing context.
+    let save_gen = editor_session.get();
     spawn_local(async move {
-        match api::save_post(id, &body).await {
-            Ok(()) => {
+        // Create when there's no id yet, else update in place. Both map to
+        // `Result<Option<u64>, _>` where `Some(id)` is a freshly assigned id.
+        let result = match current_id.get() {
+            Some(id) => api::save_post(
+                id,
+                &api::SaveRequest {
+                    title: title_val,
+                    slug: slug_val,
+                    status: status_val,
+                    block_tree,
+                },
+            )
+            .await
+            .map(|()| None),
+            None => api::create_post(&api::CreateRequest {
+                title: title_val,
+                slug: slug_val,
+                status: status_val,
+                block_tree,
+            })
+            .await
+            .map(Some),
+        };
+        // The editor moved to another document while we were in flight: the save
+        // still landed server-side, but adopting its id here would hijack the new
+        // document. Free the save lock and drop the writeback. (A 401 is auth-wide,
+        // so it still routes to login regardless.)
+        let stale = editor_session.get() != save_gen;
+        saving.set(false);
+        match result {
+            Ok(new_id) => {
+                if stale {
+                    return;
+                }
+                // A create hands back the new id; record it so the next save updates.
+                if new_id.is_some() {
+                    current_id.set(new_id);
+                }
                 toast.set(true);
-                saving.set(false);
                 TimeoutFuture::new(1600).await;
                 toast.set(false);
             }
-            Err(api::ApiError::Unauthorized) => {
-                saving.set(false);
-                auth.session_expired();
-            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
             Err(api::ApiError::Message(e)) => {
-                notice.set(e);
-                saving.set(false);
+                if !stale {
+                    notice.set(e);
+                }
             }
         }
     });
+}
+
+/// Start a brand-new post: reset the editor meta to a blank Draft, clear the shared
+/// editor to an empty document, and switch to the editor view. `current_id` is set
+/// to `None` so the first Save creates the post (see [`save_post`]). The signals are
+/// set BEFORE the view switch so the uncontrolled title/slug inputs read the blank
+/// values at arm-build.
+#[allow(clippy::too_many_arguments)]
+fn new_post(
+    editor: Signal<EditorHandle>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    // A fresh document takes over the shared editor: bump the session so any
+    // still-in-flight save can no longer write its id back into this blank post.
+    editor_session.update(|g| *g += 1);
+    notice.set(String::new());
+    title.set(String::new());
+    slug.set(String::new());
+    status.set("draft".to_owned());
+    current_id.set(None);
+
+    // Clear whatever the shared editor held from a previously opened post.
+    let schema = Schema::starter_kit();
+    let handle = editor.get();
+    if let Ok(node) = bridge::block_tree_json_to_node(&schema, &empty_tree()) {
+        handle.load_doc(node);
+    }
+    auth.view.set(View::Editor);
+}
+
+/// The editor masthead's "you are here" label — the post title, or a neutral
+/// placeholder while it's still empty (a fresh post, or one whose title was cleared).
+fn masthead_title(title: &str) -> String {
+    if title.trim().is_empty() {
+        "Untitled".to_owned()
+    } else {
+        title.to_owned()
+    }
 }
 
 fn empty_tree() -> serde_json::Value {

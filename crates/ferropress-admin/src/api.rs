@@ -80,6 +80,22 @@ pub struct SaveRequest {
     pub block_tree: serde_json::Value,
 }
 
+/// `POST /admin/api/posts` body — create a new post. Same shape as [`SaveRequest`]
+/// (the server derives the rest: `uuid`, `plaintext`, timestamps, `author`).
+#[derive(Serialize)]
+pub struct CreateRequest {
+    pub title: String,
+    pub slug: String,
+    pub status: String,
+    pub block_tree: serde_json::Value,
+}
+
+/// `{ id }` from a successful create (the rest of the response is ignored).
+#[derive(Deserialize)]
+struct CreateResponse {
+    id: u64,
+}
+
 #[derive(Deserialize)]
 struct ErrorBody {
     #[serde(default)]
@@ -216,6 +232,27 @@ pub async fn save_post(id: u64, body: &SaveRequest) -> Result<(), ApiError> {
         return Err(classify(resp).await);
     }
     Ok(())
+}
+
+/// `POST /admin/api/posts` — create a new post; returns its new id. On failure the
+/// server's `{ error }` message (a 409 slug clash, a 400 bad slug/status) is
+/// surfaced verbatim; a 401 routes back to login.
+pub async fn create_post(body: &CreateRequest) -> Result<u64, ApiError> {
+    let built = Request::post("/admin/api/posts")
+        .credentials(RequestCredentials::SameOrigin)
+        .json(body);
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<CreateResponse>()
+        .await
+        .map(|r| r.id)
+        .map_err(|e| ApiError::Message(e.to_string()))
 }
 
 /// Read a failed response's `{ error }` body, falling back to the status code.

@@ -2,11 +2,12 @@
 //! design, ported from the validated HTML-first mockup
 //! (`crates/ferropress-admin/design/mockup.html`, CLAUDE.md §2).
 //!
-//! Two things differ from the mockup, by construction:
-//!   * View switching is rinch's reactive `match` (one view in the DOM at a time),
-//!     so there is no `.view { display: none }` toggle to get wrong.
-//!   * Status is a segmented button control, not a `<select>` — rinch-web only
-//!     delivers `input` events for `<input>`/`<textarea>`, never `<select>` change.
+//! One thing differs from the mockup, by construction: view switching is rinch's
+//! reactive `match` (one view in the DOM at a time), so there is no
+//! `.view { display: none }` toggle to get wrong.
+//!
+//! Status is the mockup's native `<select>` (rinch#95 delivers its change via
+//! `oninput`), and the title is an in-sheet headline input (`.sheet__title`).
 //!
 //! The editor content (`[data-pm-editor]`, projected by rinch-editor-view) is styled
 //! under `.sheet` so those rules out-specify the editor's own injected defaults.
@@ -255,6 +256,16 @@ const ADMIN_CSS: &str = r#"
 .sheet__inner { max-width: var(--measure); margin: 0 auto; }
 .editor__error { max-width: calc(var(--measure) + 6rem); margin: 0 auto 1rem; color: var(--minium-deep); font-size: .88rem; text-align: center; }
 
+/* The title is the headline on the sheet — a borderless input set in the display
+   serif, matching the editor's own h1 so it reads as one continuous proof. */
+.sheet__title {
+  width: 100%; border: 0; background: transparent; padding: 0; margin: 0 0 1.25rem;
+  font-family: var(--ff-display); font-weight: 700; font-size: 2.1rem; line-height: 1.12;
+  letter-spacing: .005em; color: var(--ink);
+}
+.sheet__title::placeholder { color: var(--steel-2); font-weight: 700; }
+.sheet__title:focus { outline: none; }
+
 /* editor content — set in the reading serif, like a proof on paper. Scoped under
    .sheet so these out-specify rinch-editor-view's own injected defaults. */
 .sheet [data-pm-editor] { font-family: var(--ff-display); color: var(--ink); outline: none; min-height: 12rem; }
@@ -288,6 +299,7 @@ const ADMIN_CSS: &str = r#"
   .row { grid-template-columns: 18px 1fr auto; }
   .row__time, .row__edit { display: none; }
   .sheet { padding: 1.5rem; }
+  .sheet__title { font-size: 1.7rem; }
   .sheet [data-pm-editor] h1 { font-size: 1.7rem; }
 }
 @media (prefers-reduced-motion: reduce) {

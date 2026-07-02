@@ -215,7 +215,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/admin/api/login", post(auth::login))
         .route("/admin/api/logout", post(auth::logout))
         .route("/admin/api/me", get(auth::me))
-        .route("/admin/api/posts", get(posts::list))
+        .route("/admin/api/posts", get(posts::list).post(posts::create))
         .route(
             "/admin/api/posts/{id}",
             get(posts::get_one).put(posts::save),

@@ -11,9 +11,11 @@ use axum::Json;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
 
+use uuid::Uuid;
+
 use ferropress_core::POST_TYPE;
 use ferropress_core::block::BlockTree;
-use ferropress_core::query::{Compare, FilterSpec};
+use ferropress_core::query::{Compare, Edge, FilterSpec};
 use ferropress_core::role::Capability;
 use ferropress_core::status::Status;
 use ferropress_core::value::{FieldMap, Object, ObjectId, TypeName, Value, now_millis};
@@ -134,23 +136,8 @@ pub async fn save(
     let tree = BlockTree::from_json_value(body.block_tree.clone())
         .map_err(|e| AdminError::BadRequest(format!("invalid block tree: {e}")))?;
 
-    // Enforce slug uniqueness. `Post.slug` is `@indexed`, NOT `@unique`, so the DB
-    // won't reject a duplicate — but the public router resolves a slug to exactly
-    // ONE post (`filter(slug ==, limit 1)`), so a collision would make one post
-    // permanently unreachable. Reject a slug already held by a DIFFERENT post.
-    let clash = state
-        .store
-        .filter(FilterSpec {
-            type_name: TypeName::from(POST_TYPE),
-            field: "slug".to_owned(),
-            op: Compare::Eq,
-            value: Value::String(slug.to_owned()),
-            limit: Some(2),
-        })
-        .await?
-        .iter()
-        .any(|o| o.id != ObjectId(id));
-    if clash {
+    // Reject a slug already held by a DIFFERENT post (see [`slug_taken`]).
+    if slug_taken(&state, slug, Some(ObjectId(id))).await? {
         return Err(AdminError::Conflict(format!(
             "the slug {slug:?} is already used by another post"
         )));
@@ -193,6 +180,149 @@ pub async fn save(
         id,
         updated_at: now,
     }))
+}
+
+/// The editor's "New post" payload. `status` is optional (a new post is born a
+/// `Draft`); `block_tree` may be an empty tree for a blank draft.
+#[derive(Deserialize)]
+pub struct CreateRequest {
+    pub title: String,
+    pub slug: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The initial block tree as JSON (Ferropress's shape). Usually the empty tree.
+    pub block_tree: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct CreateResponse {
+    pub id: u64,
+    pub created_at: i64,
+}
+
+/// `POST /admin/api/posts` — create a new post (the editor's "New post" flow).
+/// Validates the slug (non-empty + globally unique) and the initial status, and
+/// checks the block tree is well-formed; derives `plaintext` (for search) and
+/// stamps `uuid`/`post_type`/`created_at`/`updated_at`. The post is attributed to
+/// its creator via the `author` relation. Returns the new id so the editor can
+/// switch from create to update on the next save; the regen loop then prerenders
+/// it (a `Draft` stays out of the public index).
+pub async fn create(
+    State(state): State<AppState>,
+    who: AuthedUser,
+    AdminJson(body): AdminJson<CreateRequest>,
+) -> Result<Json<CreateResponse>, AdminError> {
+    who.require(Capability::EditOthersContent)?;
+
+    let slug = body.slug.trim();
+    if slug.is_empty() {
+        return Err(AdminError::BadRequest("slug must not be empty".to_owned()));
+    }
+    let status = initial_status(body.status.as_deref())?;
+    let tree = BlockTree::from_json_value(body.block_tree.clone())
+        .map_err(|e| AdminError::BadRequest(format!("invalid block tree: {e}")))?;
+
+    // No self to exclude on create: ANY post already at this slug is a clash.
+    if slug_taken(&state, slug, None).await? {
+        return Err(AdminError::Conflict(format!(
+            "the slug {slug:?} is already used by another post"
+        )));
+    }
+
+    let now = now_millis();
+    let mut fields: FieldMap = HashMap::new();
+    fields.insert("uuid".to_owned(), Value::String(Uuid::now_v7().to_string()));
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert("title".to_owned(), Value::String(body.title));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(status.as_str().to_owned()),
+    );
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert("block_tree".to_owned(), Value::Json(body.block_tree));
+    // Derive the @vectorize source so a new post is immediately searchable.
+    fields.insert("plaintext".to_owned(), Value::String(tree.plaintext()));
+    fields.insert("created_at".to_owned(), Value::DateTime(now));
+    fields.insert("updated_at".to_owned(), Value::DateTime(now));
+
+    let id = state
+        .store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await?;
+
+    // Attribute the post to its creator. `author` is a to-one RELATION, set via
+    // the link API (not a scalar field). If the link fails — e.g. the signed-in
+    // user was deleted mid-session, so the link target no longer exists — roll the
+    // just-created post back rather than leave an unattributed orphan, then report
+    // the cause. (A later slice reads `author` for per-author `EditOwnContent`
+    // scoping, so every created post must carry it.)
+    let author = Edge {
+        type_name: TypeName::from(POST_TYPE),
+        id,
+        field: "author".to_owned(),
+    };
+    if let Err(e) = state.store.link(&author, who.id, FieldMap::new()).await {
+        if let Err(rollback) = state.store.delete(&TypeName::from(POST_TYPE), id).await {
+            tracing::error!(
+                error = %rollback,
+                "failed to roll back orphan post after author-link failure"
+            );
+        }
+        return Err(e.into());
+    }
+
+    Ok(Json(CreateResponse {
+        id: id.0,
+        created_at: now,
+    }))
+}
+
+/// Validate the initial status of a NEW post. A post is born a `Draft`; an
+/// explicit status must be a legal departure from `Draft` (so `Published`,
+/// `Pending`, `Scheduled` are allowed) and never `Trashed`. Absent/empty → `Draft`.
+fn initial_status(raw: Option<&str>) -> Result<Status, AdminError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(Status::Draft),
+        Some(s) => {
+            let status = parse_status(s)
+                .ok_or_else(|| AdminError::BadRequest(format!("unknown status {s:?}")))?;
+            if status == Status::Draft {
+                return Ok(status);
+            }
+            if status == Status::Trashed || !Status::Draft.can_transition_to(status) {
+                return Err(AdminError::BadRequest(format!(
+                    "a new post can't start as {}",
+                    status.as_str()
+                )));
+            }
+            Ok(status)
+        }
+    }
+}
+
+/// Whether `slug` is already held by a post OTHER than `exclude` (or by ANY post
+/// when `exclude` is `None`). `Post.slug` is `@indexed`, NOT `@unique`, so the DB
+/// won't reject a duplicate — but the public router resolves a slug to exactly ONE
+/// post (`filter(slug ==, limit 1)`), so a collision would make one permanently
+/// unreachable. `save` excludes the post being edited; `create` has no self.
+async fn slug_taken(
+    state: &AppState,
+    slug: &str,
+    exclude: Option<ObjectId>,
+) -> Result<bool, AdminError> {
+    // limit 2 so that `self` plus one other are both visible to the exclusion.
+    Ok(state
+        .store
+        .filter(FilterSpec {
+            type_name: TypeName::from(POST_TYPE),
+            field: "slug".to_owned(),
+            op: Compare::Eq,
+            value: Value::String(slug.to_owned()),
+            limit: Some(2),
+        })
+        .await?
+        .iter()
+        .any(|o| Some(o.id) != exclude))
 }
 
 /// Build a list-row summary from a post object.

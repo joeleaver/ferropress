@@ -27,6 +27,9 @@ serde_json = { workspace = true }
 # Comment timestamps (RFC3339 — lexicographically chronological, so list sort is
 # a plain string compare).
 time = { workspace = true }
+# New-post creation stamps an immutable `uuid` (v7) on the post; matches the
+# CLI/composition-root use of `Uuid::now_v7`.
+uuid = { workspace = true }
 # Request/response + error logging (causes logged, never leaked to the client).
 tracing = { workspace = true }
 
