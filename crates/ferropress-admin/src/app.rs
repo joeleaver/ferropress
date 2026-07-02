@@ -299,14 +299,16 @@ pub fn app() -> NodeHandle {
                             }
                             div { class: "metaitem",
                                 label { "Status" }
-                                div { class: "statusbar",
-                                    for entry in api::STATUSES {
-                                        button {
-                                            key: entry.0,
-                                            class: {move || if status.get() == entry.0 { "statusbtn is-on" } else { "statusbtn" }},
-                                            onclick: move || status.set(entry.0.to_owned()),
-                                            {entry.1}
-                                        }
+                                // Native <select> (rinch#95 now delivers its change via
+                                // `oninput`). Uncontrolled: the current status is rendered
+                                // first so the browser shows it as the default — rinch emits
+                                // a boolean `selected` attr even when false, so a per-option
+                                // `selected` can't mark just one.
+                                select {
+                                    class: "select",
+                                    oninput: move |v: String| status.set(v),
+                                    for entry in status_options(&status.get()) {
+                                        option { key: entry.0.clone(), value: entry.0, {entry.1} }
                                     }
                                 }
                             }
@@ -513,6 +515,21 @@ fn avatar_initial(user: &Option<UserDto>) -> String {
         })
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_default()
+}
+
+/// The status options with the current one FIRST — an uncontrolled `<select>` shows
+/// its first option, so this makes the dropdown default to the post's current status
+/// (a per-option `selected` attr can't work: rinch emits it even when false). Owned
+/// `String`s so a status outside [`api::STATUSES`] is still shown + preserved.
+fn status_options(current: &str) -> Vec<(String, String)> {
+    let mut opts = Vec::with_capacity(api::STATUSES.len() + 1);
+    opts.push((current.to_owned(), api::status_label(current)));
+    for (value, label) in api::STATUSES {
+        if *value != current {
+            opts.push(((*value).to_owned(), (*label).to_owned()));
+        }
+    }
+    opts
 }
 
 /// The signed-in user's display name (falls back to the username).

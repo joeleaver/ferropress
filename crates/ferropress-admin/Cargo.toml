@@ -28,10 +28,10 @@ crate-type = ["cdylib"]
 # rinch — UPSTREAM, pinned git rev (MUST match ferropress-editor-bridge).
 # default-features=false drops the desktop/wgpu stack; the web DOM backend is
 # rinch-web, which re-exports the editor (Editor / EditorHandle / create_editor).
-rinch = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96", default-features = false, features = ["components", "theme"] }
-rinch-core = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96", features = ["theme"] }
-rinch-web = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96" }
-rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96", features = ["serde"] }
+rinch = { git = "https://github.com/joeleaver/rinch.git", rev = "9e142ae3e485ce05ab1e84a88f1533712efb98d6", default-features = false, features = ["components", "theme"] }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", rev = "9e142ae3e485ce05ab1e84a88f1533712efb98d6", features = ["theme"] }
+rinch-web = { git = "https://github.com/joeleaver/rinch.git", rev = "9e142ae3e485ce05ab1e84a88f1533712efb98d6" }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", rev = "9e142ae3e485ce05ab1e84a88f1533712efb98d6", features = ["serde"] }
 
 # The BlockTree ⇄ DocNode bridge (our own crate; path is fine — the no-path rule is
 # only for the rinch/rhypedb/jkbase upstreams).

@@ -219,13 +219,16 @@ const ADMIN_CSS: &str = r#"
 .slugbox input { border: 0; background: transparent; font: inherit; color: var(--ink); width: 16ch; padding: 0; }
 .slugbox input:focus { outline: none; }
 
-.statusbar { display: inline-flex; gap: .2rem; background: var(--paper-sink); border: 1px solid var(--rule); border-radius: var(--radius); padding: .2rem; }
-.statusbtn {
-  font-family: var(--ff-mono); font-size: .74rem; letter-spacing: .04em; text-transform: uppercase;
-  padding: .28rem .55rem; border: 1px solid transparent; border-radius: 2px; background: transparent; color: var(--steel);
+.select {
+  font-family: var(--ff-mono); font-size: .82rem;
+  padding: .35rem 1.6rem .35rem .6rem;
+  border: 1px solid var(--rule); border-radius: var(--radius); color: var(--ink);
+  background: var(--paper-sink)
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'><path d='M1 1l4 4 4-4' stroke='%236B6F76' stroke-width='1.5' fill='none'/></svg>")
+    no-repeat right .55rem center;
+  appearance: none; -webkit-appearance: none;
 }
-.statusbtn:hover { color: var(--ink); }
-.statusbtn.is-on { background: var(--ink); color: var(--paper); }
+.select:focus { outline: none; border-color: var(--minium); }
 
 .toolbar {
   display: flex; align-items: center; gap: .15rem; flex-wrap: wrap;
