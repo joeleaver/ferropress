@@ -3705,7 +3705,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 [[package]]
 name = "rhypedb-embed"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=6729de818f9819d2ab204b5963065fe235c26ec7#6729de818f9819d2ab204b5963065fe235c26ec7"
 dependencies = [
  "fastembed",
  "hf-hub",
@@ -3715,7 +3715,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-engine"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=6729de818f9819d2ab204b5963065fe235c26ec7#6729de818f9819d2ab204b5963065fe235c26ec7"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -3726,16 +3726,16 @@ dependencies = [
  "rhypedb-storage",
  "rhypedb-subscribe",
  "rhypedb-vector",
+ "rhypedb-wire",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
- "time",
 ]
 
 [[package]]
 name = "rhypedb-schema"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=6729de818f9819d2ab204b5963065fe235c26ec7#6729de818f9819d2ab204b5963065fe235c26ec7"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -3743,7 +3743,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-storage"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=6729de818f9819d2ab204b5963065fe235c26ec7#6729de818f9819d2ab204b5963065fe235c26ec7"
 dependencies = [
  "ahash",
  "bytes",
@@ -3761,7 +3761,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-subscribe"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=6729de818f9819d2ab204b5963065fe235c26ec7#6729de818f9819d2ab204b5963065fe235c26ec7"
 dependencies = [
  "parking_lot",
  "serde",
@@ -3771,12 +3771,25 @@ dependencies = [
 [[package]]
 name = "rhypedb-vector"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?rev=2a9bf28686c6602ccabbb9efb0e06922efd9fc1a#2a9bf28686c6602ccabbb9efb0e06922efd9fc1a"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=6729de818f9819d2ab204b5963065fe235c26ec7#6729de818f9819d2ab204b5963065fe235c26ec7"
 dependencies = [
  "boxcar",
  "parking_lot",
  "rand 0.9.4",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rhypedb-wire"
+version = "0.1.0"
+source = "git+https://github.com/joeleaver/rhypedb.git?rev=6729de818f9819d2ab204b5963065fe235c26ec7#6729de818f9819d2ab204b5963065fe235c26ec7"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "rhypedb-subscribe",
+ "serde",
+ "serde_json",
+ "time",
 ]
 
 [[package]]

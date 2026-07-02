@@ -76,9 +76,9 @@ ferropress-admin           = { path = "crates/ferropress-admin" }
 # network and ONNX is dlopen'd at runtime (ORT_DYLIB_PATH) — the offline build
 # posture. Only ferropress-store-embedded enables engine/subscribe;
 # ferropress-schema-sdl uses rhypedb-schema (no ONNX feature surface at all).
-rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", rev = "2a9bf28686c6602ccabbb9efb0e06922efd9fc1a" }
-rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", rev = "2a9bf28686c6602ccabbb9efb0e06922efd9fc1a", default-features = false, features = ["onnx-dynamic"] }
-rhypedb-subscribe = { git = "https://github.com/joeleaver/rhypedb.git", rev = "2a9bf28686c6602ccabbb9efb0e06922efd9fc1a" }
+rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", rev = "6729de818f9819d2ab204b5963065fe235c26ec7" }
+rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", rev = "6729de818f9819d2ab204b5963065fe235c26ec7", default-features = false, features = ["onnx-dynamic"] }
+rhypedb-subscribe = { git = "https://github.com/joeleaver/rhypedb.git", rev = "6729de818f9819d2ab204b5963065fe235c26ec7" }
 
 # --- Async runtime -----------------------------------------------------------
 tokio = { version = "1", features = ["full"] }
