@@ -13,7 +13,7 @@
 //! clash) that message is surfaced verbatim so the editor can show it.
 
 use serde::{Deserialize, Serialize};
-use web_sys::RequestCredentials;
+use web_sys::{FormData, RequestCredentials};
 
 use gloo_net::http::{Request, Response};
 
@@ -252,6 +252,37 @@ pub async fn create_post(body: &CreateRequest) -> Result<u64, ApiError> {
     resp.json::<CreateResponse>()
         .await
         .map(|r| r.id)
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `POST /admin/api/media` response. Only `url` (`/media/{id}`) is read — it's what
+/// the editor inserts as the image `src`; the bridge reverses it to the `media_id` on
+/// save and the public page renders the same URL. (The server also returns `id` +
+/// dimensions; serde ignores the fields we don't render.)
+#[derive(Deserialize)]
+pub struct UploadResponse {
+    #[serde(default)]
+    pub url: String,
+}
+
+/// `POST /admin/api/media` — upload an image as multipart (`file` + `alt`). The
+/// browser sets the `multipart/form-data` boundary from the `FormData` body, so we
+/// must NOT set a content-type header. Returns the new media's id + served URL; a 401
+/// routes back to login.
+pub async fn upload_media(form: FormData) -> Result<UploadResponse, ApiError> {
+    let req = Request::post("/admin/api/media")
+        .credentials(RequestCredentials::SameOrigin)
+        .body(form)
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<UploadResponse>()
+        .await
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 

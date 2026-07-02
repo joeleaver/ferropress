@@ -129,6 +129,13 @@ extism = "1"
 minijinja = { version = "2", features = ["loader"] }
 html-escape = "0.2"
 
+# --- Media -------------------------------------------------------------------
+# Header-only image sniffing: validates an upload really is a known image and
+# reads its intrinsic dimensions WITHOUT a full decode (no pixel buffer). Used by
+# the admin media-upload handler so `mime_type`/`width`/`height` come from the
+# bytes themselves, never the client's (untrusted) content-type.
+imagesize = "0.13"
+
 # --- Scheduler / certs / secrets adapters ------------------------------------
 cron = "0.12"
 rustls-acme = "0.13"

@@ -8,6 +8,33 @@ use time::OffsetDateTime;
 
 use crate::value::ObjectId;
 
+/// The public URL path prefix under which a `Media` original is served
+/// (`GET /media/{id}`). This is the SINGLE source of truth for the media-addressing
+/// convention, shared by the media-serving route (`ferropress-http`), the serve-layer
+/// `data-media-id` → `src` rewrite (`ferropress-serve`), the editor bridge
+/// (`ferropress-editor-bridge`), and the admin client — so the in-editor preview and
+/// the published page always agree on an image's URL. Change it here and every seam
+/// follows.
+pub const MEDIA_URL_PREFIX: &str = "/media/";
+
+/// The HTML attribute the pure renderer emits carrying a media id (the image ships
+/// `src`-less, since the renderer has no DB to resolve a URL). The serve layer
+/// rewrites it into a real `src`; naming it here keeps the emitter
+/// (`ferropress-render`) and the rewriter (`ferropress-serve`) in lockstep.
+pub const MEDIA_ID_ATTR: &str = "data-media-id";
+
+/// The public URL for a media original by id: `"/media/{id}"`. The inverse is
+/// [`media_id_from_url`].
+pub fn media_url(id: u64) -> String {
+    format!("{MEDIA_URL_PREFIX}{id}")
+}
+
+/// Recover the media id from a [`media_url`], or `None` if `src` is not one (e.g. an
+/// external image URL or a malformed id). The inverse of [`media_url`].
+pub fn media_id_from_url(src: &str) -> Option<u64> {
+    src.strip_prefix(MEDIA_URL_PREFIX)?.parse().ok()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Media {
     pub id: Option<ObjectId>,
@@ -33,4 +60,27 @@ pub struct Media {
     pub meta: serde_json::Value,
 
     pub uploaded_by: Option<ObjectId>, // -> User
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MEDIA_URL_PREFIX, media_id_from_url, media_url};
+
+    #[test]
+    fn media_url_round_trips_through_id() {
+        for id in [0u64, 1, 42, u64::MAX] {
+            let url = media_url(id);
+            assert!(url.starts_with(MEDIA_URL_PREFIX));
+            assert_eq!(media_id_from_url(&url), Some(id));
+        }
+    }
+
+    #[test]
+    fn non_media_srcs_yield_none() {
+        assert_eq!(media_id_from_url("fp-media:42"), None); // the retired scheme
+        assert_eq!(media_id_from_url("https://example.com/cat.png"), None);
+        assert_eq!(media_id_from_url("/media/"), None); // no id
+        assert_eq!(media_id_from_url("/media/not-a-number"), None);
+        assert_eq!(media_id_from_url("/mediaX/1"), None); // prefix must match exactly
+    }
 }

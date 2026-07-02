@@ -15,7 +15,9 @@ use tower::ServiceExt; // for `oneshot`
 use ferropress_auth::{SigningKey, hash_password};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, now_millis};
-use ferropress_core::{Block, BlockKind, BlockTree, InlineRun, POST_TYPE, Status, USER_TYPE};
+use ferropress_core::{
+    Block, BlockKind, BlockTree, InlineRun, MEDIA_TYPE, POST_TYPE, Status, USER_TYPE,
+};
 
 use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_store_embedded::EmbeddedStore;
@@ -59,6 +61,57 @@ fn one_paragraph(text: &str) -> serde_json::Value {
     }])
     .to_json_value()
     .expect("tree json")
+}
+
+/// A valid 1×1 PNG (the smallest real image `imagesize` can sniff a type + size
+/// from). Decoded from base64 so the fixture stays readable.
+fn tiny_png() -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==",
+        )
+        .expect("valid base64 PNG")
+}
+
+/// A minimal PNG *header* declaring `width`×`height`. `imagesize` reads dimensions
+/// from the IHDR at fixed offsets and needs no IDAT/IEND, so this is enough to test
+/// the dimension guard with a tiny file that CLAIMS a huge canvas.
+fn png_header(width: u32, height: u32) -> Vec<u8> {
+    let mut v = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG signature
+    v.extend_from_slice(&[0, 0, 0, 0x0D]); // IHDR chunk length = 13
+    v.extend_from_slice(b"IHDR");
+    v.extend_from_slice(&width.to_be_bytes());
+    v.extend_from_slice(&height.to_be_bytes());
+    v.extend_from_slice(&[8, 2, 0, 0, 0]); // bit depth, color type, compression, filter, interlace
+    v
+}
+
+/// Build a `multipart/form-data` body with a `file` part (bytes + filename + a
+/// declared content-type — which the server IGNORES in favor of sniffing) and an
+/// `alt` text part. Returns the `Content-Type` header value + the raw body bytes.
+fn multipart_image(
+    filename: &str,
+    declared_ct: &str,
+    bytes: &[u8],
+    alt: &str,
+) -> (String, Vec<u8>) {
+    let boundary = "FerropressTestBoundary8f3a";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {declared_ct}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"alt\"\r\n\r\n");
+    body.extend_from_slice(alt.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
 /// Seed a user with a known password + role. Returns the new id.
@@ -678,6 +731,220 @@ async fn create_requires_a_session_and_the_capability() {
         .0,
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn media_upload_then_serve_roundtrips() {
+    use ferropress_core::query::Edge;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let jane = seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let png = tiny_png();
+    let (ct, body) = multipart_image("Red Pixel.png", "image/png", &png, "a red pixel");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/media")
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "upload should succeed");
+    let up = to_json(resp).await;
+    let id = up["id"].as_u64().expect("upload returns an id");
+    assert_eq!(up["url"], format!("/media/{id}"), "url is the served path");
+    assert_eq!(up["mime_type"], "image/png");
+    assert_eq!(up["width"], 1);
+    assert_eq!(up["height"], 1);
+
+    // The Media row carries the sniffed metadata (not the client's claims).
+    let obj = store
+        .get(&TypeName::from(MEDIA_TYPE), ObjectId(id))
+        .await
+        .expect("get media");
+    assert!(matches!(obj.get("mime_type"), Some(Value::String(s)) if s == "image/png"));
+    assert!(matches!(obj.get("byte_size"), Some(Value::U64(n)) if *n == png.len() as u64));
+    assert!(matches!(obj.get("width"), Some(Value::U32(1))));
+    assert!(matches!(obj.get("alt_text"), Some(Value::String(s)) if s == "a red pixel"));
+    assert!(
+        matches!(obj.get("slug"), Some(Value::String(s)) if s == "red-pixel"),
+        "slug is derived from the filename stem: {:?}",
+        obj.get("slug")
+    );
+
+    // Attributed to its uploader via the `uploaded_by` relation.
+    let links = store
+        .get_links(&Edge {
+            type_name: TypeName::from(MEDIA_TYPE),
+            id: ObjectId(id),
+            field: "uploaded_by".to_owned(),
+        })
+        .await
+        .expect("get uploader links");
+    assert!(
+        links.iter().any(|(uid, _)| *uid == jane),
+        "media must be attributed to its uploader {jane:?}: {links:?}"
+    );
+
+    // GET /media/{id} is PUBLIC (no cookie) and returns the exact bytes + content-type.
+    let req = Request::builder()
+        .uri(format!("/media/{id}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "image/png"
+    );
+    let served = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        served.as_ref(),
+        png.as_slice(),
+        "served bytes must equal the uploaded bytes"
+    );
+}
+
+#[tokio::test]
+async fn media_upload_rejects_a_non_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // Bytes that are NOT an image, even though the part CLAIMS image/png — the server
+    // sniffs the bytes and rejects.
+    let (ct, body) = multipart_image(
+        "evil.png",
+        "image/png",
+        b"<script>definitely not an image</script>",
+        "",
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/media")
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router(state).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "content-type is not trusted; a non-image is rejected"
+    );
+}
+
+#[tokio::test]
+async fn media_upload_requires_a_session_and_the_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    // A subscriber authenticates fine but lacks UploadMedia (Author+).
+    seed_user(&store, "sam", "passwordpassword", "subscriber").await;
+    let png = tiny_png();
+
+    // No session → 401.
+    let (ct, body) = multipart_image("p.png", "image/png", &png, "");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/media")
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(body))
+        .unwrap();
+    assert_eq!(
+        router(state.clone()).oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Authenticated but under-privileged → 403.
+    let (_, cookie, _) = do_login(&state, "sam", "passwordpassword").await;
+    let cookie = session_pair(&cookie.unwrap());
+    let (ct, body) = multipart_image("p.png", "image/png", &png, "");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/media")
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(body))
+        .unwrap();
+    assert_eq!(
+        router(state).oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn media_upload_rejects_oversized_alt_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // A valid image, but an alt string far past the cap → rejected (would otherwise
+    // bloat the row + the @vectorize source).
+    let png = tiny_png();
+    let alt = "x".repeat(3000);
+    let (ct, body) = multipart_image("p.png", "image/png", &png, &alt);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/media")
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(body))
+        .unwrap();
+    assert_eq!(
+        router(state).oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn media_upload_rejects_a_dimension_bomb() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // A tiny file that DECLARES a 30000-wide canvas — rejected before it can be stored
+    // and served to public viewers (whose browsers would decode it to a huge bitmap).
+    let bomb = png_header(30_000, 1);
+    let (ct, body) = multipart_image("bomb.png", "image/png", &bomb, "");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/api/media")
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(body))
+        .unwrap();
+    assert_eq!(
+        router(state).oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn serving_a_missing_media_id_is_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    let req = Request::builder()
+        .uri("/media/999999")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

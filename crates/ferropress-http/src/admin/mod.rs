@@ -18,7 +18,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequestParts, Request};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Request};
 use axum::http::StatusCode;
 use axum::http::header::COOKIE;
 use axum::http::request::Parts;
@@ -34,6 +34,7 @@ use ferropress_core::value::{Object, ObjectId, Value, now_millis};
 use crate::AppState;
 
 pub mod auth;
+pub mod media;
 pub mod posts;
 
 #[cfg(test)]
@@ -219,6 +220,13 @@ pub fn api_routes() -> Router<AppState> {
         .route(
             "/admin/api/posts/{id}",
             get(posts::get_one).put(posts::save),
+        )
+        // Media upload (multipart). axum's default 2 MiB body limit would reject a
+        // real image, so this route carries its own limit sized to the handler's
+        // per-file cap plus multipart-framing headroom.
+        .route(
+            "/admin/api/media",
+            post(media::upload).layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + (1 << 20))),
         )
 }
 

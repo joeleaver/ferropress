@@ -49,6 +49,14 @@ web-sys = { version = "0.3", features = [
     "Node",
     "HtmlHeadElement",
     "RequestCredentials",
+    # Image upload: a native <input type=file> file picker, the chosen File/FileList,
+    # and a FormData multipart body posted to /admin/api/media.
+    "HtmlElement",
+    "HtmlInputElement",
+    "Blob",
+    "File",
+    "FileList",
+    "FormData",
 ] }
 
 # HTTP (fetch) + JSON + a small timer for the save toast.

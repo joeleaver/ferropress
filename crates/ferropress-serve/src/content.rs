@@ -22,14 +22,14 @@
 //! and only block dispatch lives in `ferropress-render` (the one-shared-renderer
 //! invariant). Here we only orchestrate store lookup -> `render` -> theme.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use ferropress_core::error::CoreError;
 use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{TypeName, Value};
 use ferropress_core::{BlockTree, Compare, FilterSpec, Object, PAGE_TYPE, POST_TYPE, Status};
-use ferropress_render::{CustomBlockRenderer, RenderMode, render_with};
+use ferropress_render::{CustomBlockRenderer, Html, RenderMode, render_with};
 use ferropress_theme::{PageContext, SandboxLimits, ThemeEngine, ThemeError};
 
 use crate::cache_key;
@@ -307,7 +307,12 @@ pub(crate) fn render_object(
         }
     };
 
-    let body = render_with(&tree, RenderMode::Publish, custom);
+    // Render the block body, then rewrite `data-media-id` placeholders into real
+    // media `src`s (see [`rewrite_media_srcs`]) — the serve layer's job, not the
+    // pure renderer's. This runs pre-cache in the one shared render path.
+    let body = Html(rewrite_media_srcs(
+        render_with(&tree, RenderMode::Publish, custom).as_str(),
+    ));
 
     let title = match obj.get("title") {
         Some(Value::String(s)) => s.clone(),
@@ -327,4 +332,126 @@ pub(crate) fn render_object(
         // ThemeError does not convert to CoreError; carry its message so the HTTP
         // layer can log it and return a generic 500.
         .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
+}
+
+/// Rewrite the renderer's `src`-less media placeholder into a real media URL.
+///
+/// `ferropress-render` is pure (no DB), so `BlockKind::Image` emits
+/// `<img data-media-id="N" …>` with no `src`. Here in the serve layer — which DOES
+/// front the store — we add `src="/media/N"` ([`ferropress_core::media_url`]) so the
+/// browser fetches the bytes from the media route. Deliberately kept OUT of the
+/// renderer to preserve the one-shared-renderer invariant AND to keep the editor
+/// preview (which reuses `render`) DB-free.
+///
+/// This is a **pure string transform**: the id is already in the HTML, so it needs no
+/// store lookup and stays off the page-render data path. It runs exactly once per
+/// (re)render, and — because [`render_object`] is the single point BOTH the on-demand
+/// write-through ([`serve_path`]) and the regen loop
+/// ([`ServeEngine::render_page`](crate::ServeEngine::render_page)) funnel through — it
+/// runs BEFORE the HTML is cached, so cached pages always carry final URLs. The
+/// leading fast-path check makes the common (image-less) page free.
+///
+/// Robustness: the needle anchors on the renderer's exact opener `<img data-media-id="`
+/// (the id is the FIRST attribute). This literal cannot appear inside an attribute
+/// VALUE — any `"` there is escaped to `&quot;` — so the match only ever lands on a
+/// real image tag. A malformed match (non-numeric id / no closing quote, which the
+/// renderer never emits) is copied through unchanged.
+fn rewrite_media_srcs(html: &str) -> String {
+    let needle = MEDIA_IMG_NEEDLE.as_str();
+    if !html.contains(needle) {
+        return html.to_owned();
+    }
+    let mut out = String::with_capacity(html.len() + 32);
+    let mut rest = html;
+    while let Some(pos) = rest.find(needle) {
+        let after = pos + needle.len();
+        let tail = &rest[after..];
+        // The id runs to the closing quote; the renderer only ever emits a u64 there.
+        match tail.find('"') {
+            Some(q) if tail[..q].parse::<u64>().is_ok() => {
+                // `id` is already the normalized u64 text sitting in the HTML, so we
+                // reuse it verbatim: `MEDIA_URL_PREFIX + id` == `media_url(id)` with no
+                // per-image allocation.
+                let id = &tail[..q];
+                out.push_str(&rest[..pos]);
+                out.push_str("<img src=\"");
+                out.push_str(ferropress_core::MEDIA_URL_PREFIX);
+                out.push_str(id);
+                out.push_str("\" ");
+                out.push_str(ferropress_core::MEDIA_ID_ATTR);
+                out.push_str("=\"");
+                out.push_str(id);
+                out.push('"');
+                rest = &tail[q + 1..];
+            }
+            _ => {
+                // Not the renderer's shape — copy through and advance past the needle
+                // so the loop always makes progress.
+                out.push_str(&rest[..after]);
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The renderer's exact `<img data-media-id="` opener, derived ONCE from the shared
+/// [`ferropress_core::MEDIA_ID_ATTR`] const (still single-source). A `LazyLock` so the
+/// invariant needle isn't re-allocated on every page render, image-free ones included.
+static MEDIA_IMG_NEEDLE: LazyLock<String> =
+    LazyLock::new(|| format!("<img {}=\"", ferropress_core::MEDIA_ID_ATTR));
+
+#[cfg(test)]
+mod media_rewrite_tests {
+    use super::rewrite_media_srcs;
+    use ferropress_core::{Block, BlockKind, BlockTree};
+    use ferropress_render::{NoCustomBlocks, RenderMode, render_with};
+
+    #[test]
+    fn adds_src_to_the_renderers_image_output() {
+        // Drive the REAL renderer so the rewrite is tested against its actual markup,
+        // not a hand-written string that could drift from the emitter.
+        let tree = BlockTree::from_blocks(vec![Block {
+            uid: "x".to_owned(),
+            kind: BlockKind::Image {
+                media_id: 7,
+                alt: "a proof".to_owned(),
+            },
+            children: vec![],
+        }]);
+        let html = render_with(&tree, RenderMode::Publish, &NoCustomBlocks).into_string();
+        assert!(!html.contains("src="), "sanity: renderer emits no src");
+
+        let out = rewrite_media_srcs(&html);
+        assert!(out.contains("src=\"/media/7\""), "got: {out}");
+        assert!(
+            out.contains("data-media-id=\"7\""),
+            "id attr is preserved: {out}"
+        );
+        assert!(out.contains("alt=\"a proof\""));
+    }
+
+    #[test]
+    fn rewrites_multiple_images() {
+        let img = |id: u64| Block {
+            uid: id.to_string(),
+            kind: BlockKind::Image {
+                media_id: id,
+                alt: String::new(),
+            },
+            children: vec![],
+        };
+        let tree = BlockTree::from_blocks(vec![img(1), img(22)]);
+        let html = render_with(&tree, RenderMode::Publish, &NoCustomBlocks).into_string();
+        let out = rewrite_media_srcs(&html);
+        assert!(out.contains("src=\"/media/1\""), "got: {out}");
+        assert!(out.contains("src=\"/media/22\""), "got: {out}");
+    }
+
+    #[test]
+    fn passes_image_free_html_through_untouched() {
+        let html = "<p>no images here — data-media-id is just text</p>";
+        assert_eq!(rewrite_media_srcs(html), html);
+    }
 }

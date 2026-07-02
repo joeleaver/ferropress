@@ -35,6 +35,7 @@ use ferropress_theme::ThemeEngine;
 
 pub mod admin;
 pub mod island;
+pub mod media;
 
 pub use admin::AdminConfig;
 
@@ -165,12 +166,15 @@ pub async fn serve(state: AppState, addr: SocketAddr) -> ferropress_core::error:
 /// graph the server serves, without binding a socket (via `tower::ServiceExt`
 /// `oneshot`).
 ///
-/// Static *media* (user content) is intentionally served from the [`BlobStore`]
-/// via a handler (not `ServeDir`) so the port stays the single source of content
-/// bytes — that handler is a later increment. The island bundle below is
-/// different: it is a *build artifact* (the `wasm-bindgen` output), not content,
-/// so it is served straight from the build dir via [`ServeDir`].
+/// Static *media* (user content) is served from the [`BlobStore`] via the
+/// [`media::serve`] handler (not `ServeDir`) so the port stays the single source of
+/// content bytes. The island bundle below is different: it is a *build artifact* (the
+/// `wasm-bindgen` output), not content, so it is served straight from the build dir
+/// via [`ServeDir`].
 pub fn router(state: AppState) -> Router {
+    // The media route is built from the shared URL prefix so it can never drift from
+    // `ferropress_core::media_url` (what the serve rewrite + editor emit).
+    let media_route = format!("{}{{id}}", ferropress_core::MEDIA_URL_PREFIX);
     let mut app = Router::new()
         .route("/healthz", get(healthz))
         // Island API: the rhypedb-backed JSON endpoints the public-site islands
@@ -181,6 +185,9 @@ pub fn router(state: AppState) -> Router {
             "/api/comments",
             get(island::comments::list).post(island::comments::create),
         )
+        // Public media originals (`GET /media/{id}`) — un-authenticated, served on
+        // every deployment (not gated on `admin`). See [`media`].
+        .route(&media_route, get(media::serve))
         // Static-first hot path is the fallback: it consults the prerender
         // BlobStore cache first (via `ferropress_serve::serve_path`) and only
         // falls through to an on-demand SSR render — populating the cache — on a

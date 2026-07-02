@@ -341,6 +341,8 @@ pub fn app() -> NodeHandle {
                             button { class: "tool", title: "Quote", onclick: move || { editor.get().command("wrapInBlockquote"); }, "\u{201C}" }
                             button { class: "tool", title: "Bulleted list", onclick: move || { editor.get().command("toggleBulletList"); }, "\u{2022}" }
                             button { class: "tool tool--label", title: "Code block", onclick: move || { editor.get().command("setCodeBlock"); }, "{ }" }
+                            span { class: "toolbar__sep" }
+                            button { class: "tool", title: "Insert image", onclick: move || insert_image_via_picker(editor, notice, auth), "\u{25A6}" }
                             span { class: "toolbar__spacer" }
                             span { class: "toolbar__measure",
                                 span { class: "regmark", style: "font-size:.75rem", "\u{2295}" }
@@ -596,6 +598,78 @@ fn new_post(
         handle.load_doc(node);
     }
     auth.view.set(View::Editor);
+}
+
+/// Open the OS image picker, upload the chosen file, and insert it at the caret.
+///
+/// The `<input type=file>` is created and `.click()`ed SYNCHRONOUSLY inside this
+/// (trusted) toolbar-button handler, so the browser opens the dialog — a file dialog
+/// must be initiated within a user gesture. The upload + insert then run async: we
+/// prompt for alt text, POST the bytes as multipart, and on success insert an `image`
+/// node whose `src` is the server-issued `/media/{id}` URL — the SAME URL the bridge
+/// reverses to a `media_id` on save and the public page renders, so the in-editor
+/// image matches the published page.
+fn insert_image_via_picker(editor: Signal<EditorHandle>, notice: Signal<String>, auth: AuthCtx) {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(input) = document
+        .create_element("input")
+        .ok()
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    input.set_type("file");
+    let _ = input.set_attribute("accept", "image/*");
+
+    // Fires when the user picks a file. `Closure::forget` intentionally leaks this
+    // one-shot handler (a few hundred bytes) so it outlives this function and is alive
+    // when the dialog resolves — the standard wasm-bindgen idiom for a detached DOM
+    // callback; image inserts are infrequent, so the leak is immaterial.
+    let picker = input.clone();
+    let on_change = Closure::<dyn FnMut()>::new(move || {
+        let Some(file) = picker.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        spawn_local(async move {
+            // Alt text for accessibility. Cancelling the prompt yields an empty alt
+            // (the server's default too) rather than aborting the upload.
+            let alt = web_sys::window()
+                .and_then(|w| {
+                    w.prompt_with_message("Describe this image (alt text):")
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default();
+
+            let Ok(form) = web_sys::FormData::new() else {
+                notice.set("Your browser blocked the upload form.".to_owned());
+                return;
+            };
+            let _ = form.append_with_blob_and_filename("file", &file, &file.name());
+            let _ = form.append_with_str("alt", &alt);
+
+            match api::upload_media(form).await {
+                Ok(resp) => {
+                    if !editor.get().insert_image(&resp.url, &alt) {
+                        notice.set(
+                            "Couldn't place the image \u{2014} click into the sheet, then insert again."
+                                .to_owned(),
+                        );
+                    }
+                }
+                Err(api::ApiError::Unauthorized) => auth.session_expired(),
+                Err(api::ApiError::Message(e)) => notice.set(format!("Image upload failed: {e}")),
+            }
+        });
+    });
+    input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
+    on_change.forget();
+    input.click();
 }
 
 /// The editor masthead's "you are here" label — the post title, or a neutral

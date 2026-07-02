@@ -41,10 +41,13 @@ pub fn render_block(block: &Block, mode: RenderMode, custom: &dyn CustomBlockRen
         }
 
         BlockKind::Image { media_id, alt } => {
-            // No DB access here: the serve layer rewrites `data-media-id` into a
-            // real `src`. Alt text is author-supplied → attribute-escaped.
+            // No DB access here (the renderer is pure): the image ships `src`-less,
+            // carrying only its id in `data-media-id`; the serve layer rewrites that
+            // into a real `src` (see `ferropress_core::MEDIA_ID_ATTR` + the
+            // `ferropress-serve` rewrite). Alt text is author-supplied → escaped.
+            let attr = ferropress_core::MEDIA_ID_ATTR;
             let alt = html_escape::encode_double_quoted_attribute(alt);
-            format!("<figure><img data-media-id=\"{media_id}\" alt=\"{alt}\"></figure>")
+            format!("<figure><img {attr}=\"{media_id}\" alt=\"{alt}\"></figure>")
         }
 
         BlockKind::Code { language, source } => {

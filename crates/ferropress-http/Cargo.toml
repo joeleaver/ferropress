@@ -16,10 +16,14 @@ ferropress-render = { workspace = true }
 # Admin auth: Argon2 password verify + HMAC signed session tokens (the admin API
 # guards /admin/api/* with a signed-cookie session).
 ferropress-auth = { workspace = true }
-# Owned HTTP stack (invariant #6: serving is owned, never delegated).
-axum = { workspace = true }
+# Owned HTTP stack (invariant #6: serving is owned, never delegated). The
+# `multipart` feature powers the media-upload extractor (`axum::extract::Multipart`).
+axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true }
 tokio = { workspace = true }
+# Media uploads: sniff the real image type + dimensions from the bytes (never trust
+# the client content-type). Header-only, no full decode.
+imagesize = { workspace = true }
 # Island API request/response bodies (search results, comment list/create) are
 # JSON; serde derives the DTOs, serde_json is the codec axum's `Json` uses.
 serde = { workspace = true }
@@ -49,6 +53,9 @@ ferropress-plugin-host = { workspace = true }
 # no socket; tempfile gives each test run an isolated store/blob dir.
 tower = { workspace = true }
 tempfile = { workspace = true }
+# The media-upload e2e test decodes a tiny inline PNG fixture (base64) to build a
+# real multipart body; base64 is already a workspace dep (ferropress-auth).
+base64 = { workspace = true }
 # The search test drives the handler with a `RhypeStore` DOUBLE (canned
 # vector_search + get_many) so the mapping / ranking / publish-gate logic is
 # tested WITHOUT the runtime ONNX model. async-trait writes the trait impl;

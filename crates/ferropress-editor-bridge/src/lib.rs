@@ -58,10 +58,13 @@ use uuid::Uuid;
 
 // ── The `src` convention for images + the Embed/Custom sentinels ─────────────────
 
-/// A synthetic `src` for an editor `image` node encoding a Ferropress media id.
-/// The real media pipeline (`data-media-id` → URL) is a later slice; until then the
-/// id round-trips through this scheme so no image is lost.
-const MEDIA_SRC_PREFIX: &str = "fp-media:";
+/// An editor `image` node's `src` is the media original's REAL served URL
+/// ([`ferropress_core::media_url`] → `/media/{id}`), so the live editor actually
+/// displays the image — and it is the SAME URL the public page renders (the serve
+/// layer rewrites `data-media-id` into it), so the in-editor preview never disagrees
+/// with the published page. On save the id is recovered from that URL
+/// ([`ferropress_core::media_id_from_url`]); the persisted `BlockKind::Image` keeps
+/// only the opaque `media_id`, never a URL.
 
 /// Reserved `code_block` `language` values that mark a parked non-prose block.
 const SENTINEL_EMBED: &str = "fp:embed";
@@ -297,7 +300,7 @@ fn simple_mark(name: &str) -> Option<&'static str> {
 }
 
 fn media_src(media_id: u64) -> String {
-    format!("{MEDIA_SRC_PREFIX}{media_id}")
+    ferropress_core::media_url(media_id)
 }
 
 /// Park a non-prose block's JSON in a `code_block` under a reserved `language`
@@ -506,10 +509,12 @@ fn revive_custom(source: &str) -> Option<Block> {
     ))
 }
 
+/// Recover a media id from an image node's `src`. A `src` that isn't a media URL
+/// (e.g. an externally-pasted image the model can't represent) yields `0` — the
+/// same "no media" sentinel the previous scheme used, so unmappable images collapse
+/// to id 0 rather than corrupting a neighbour.
 fn parse_media_id(src: &str) -> u64 {
-    src.strip_prefix(MEDIA_SRC_PREFIX)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+    ferropress_core::media_id_from_url(src).unwrap_or(0)
 }
 
 fn new_block(kind: BlockKind, children: Vec<Block>) -> Block {
