@@ -1,0 +1,44 @@
+# ferropress-editor-bridge — the BlockTree ⇄ rinch `DocNode` converter.
+#
+# The admin SPA edits content in rinch's rich-text editor, whose durable wire shape
+# is `rinch_editor_core::serialize::DocNode`. Ferropress persists content as its OWN
+# `BlockTree` JSON. This crate is the seam between the two, in both directions.
+#
+# It is EXCLUDED from the root workspace (see the root Cargo.toml) for one reason:
+# it git-deps `rinch-editor-core`, which the dep-graph lint forbids in any workspace
+# member. `rinch-editor-core` is wasm-clean AND host-buildable (no rinch-dom / winit
+# / web_sys / parley / automerge), so this crate compiles for BOTH the wasm admin
+# bundle AND the host — which is exactly what lets the round-trip fidelity tests run
+# on the host (`cargo test --manifest-path crates/ferropress-editor-bridge/Cargo.toml`).
+# It therefore carries its OWN Cargo.lock and declares its deps directly.
+#
+# rinch is an UPSTREAM (CLAUDE.local.md): pinned by exact git rev, never a path dep.
+# The rev MUST match `crates/ferropress-admin` so the `DocNode` type is one and the
+# same across the bridge and the SPA that hands its output to `Schema::node_from_doc`.
+[package]
+name = "ferropress-editor-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "BlockTree ⇄ rinch editor DocNode conversion for the Ferropress admin SPA (host-testable)."
+publish = false
+
+[dependencies]
+# First-party — our own crate (a path dep to a sibling is fine; the no-path rule is
+# only for the rinch/rhypedb/jkbase UPSTREAMS).
+ferropress-core = { path = "../ferropress-core" }
+
+# rinch-editor-core — UPSTREAM, pinned git rev. Feature `serde` gives the durable
+# `DocNode` wire type + `Schema::node_from_doc` / `Node::to_doc`.
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96", features = ["serde"] }
+
+serde_json = "1"
+
+# Block uids for content built on the save path (the editor's DocNode carries none).
+# On wasm the `js` feature routes getrandom to the browser crypto API; on the host
+# the OS backend is used and `js` is inert.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["v4", "js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uuid = { version = "1", features = ["v4"] }

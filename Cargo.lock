@@ -1520,15 +1520,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferropress-admin"
-version = "0.1.0"
-dependencies = [
- "ferropress-core",
- "ferropress-render",
- "ferropress-render-form",
-]
-
-[[package]]
 name = "ferropress-auth"
 version = "0.1.0"
 dependencies = [

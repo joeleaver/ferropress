@@ -19,6 +19,14 @@
 /crates/ferropress-islands/target/
 /crates/ferropress-islands/dist/
 
+# ferropress-admin is the admin-SPA wasm cdylib OUTSIDE the workspace (same posture
+# as islands): own target dir; `cargo xtask build-admin` emits the bundle into
+# dist/. Its host+wasm bridge, ferropress-editor-bridge, also lives outside the
+# workspace with its own target dir. (Both Cargo.locks ARE committed.)
+/crates/ferropress-admin/target/
+/crates/ferropress-admin/dist/
+/crates/ferropress-editor-bridge/target/
+
 # plugins/ are wasm cdylibs OUTSIDE the workspace (Extism PDK). Each has its own
 # target dir; `cargo xtask build-plugins` assembles the loadable bundles into
 # plugins/dist/. (Each plugin's Cargo.lock IS committed.)

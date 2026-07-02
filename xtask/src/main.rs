@@ -14,12 +14,15 @@
 //!   * `build-islands` — compile the excluded `ferropress-islands` wasm `cdylib`
 //!     and run `wasm-bindgen` into `crates/ferropress-islands/dist/` (the bundle
 //!     the server serves at `/_fp/islands`).
+//!   * `build-admin` — the same, for the excluded `ferropress-admin` admin-SPA
+//!     `cdylib` → `crates/ferropress-admin/dist/` (served at `/_fp/admin`).
 //!
 //! Run from anywhere:
 //!
 //! ```text
 //! cargo run --manifest-path xtask/Cargo.toml -- dep-graph
 //! cargo run --manifest-path xtask/Cargo.toml -- build-islands
+//! cargo run --manifest-path xtask/Cargo.toml -- build-admin
 //! ```
 //!
 //! The lint uses `cargo metadata --no-deps` so it is fast and offline — it reads
@@ -57,9 +60,10 @@ fn main() -> Result<()> {
         // `dep-graph-lint` is the name CI invokes; `dep-graph` is the short form.
         Some("dep-graph") | Some("dep-graph-lint") | None => dep_graph_lint(),
         Some("build-islands") => build_islands(),
+        Some("build-admin") => build_admin(),
         Some("build-plugins") => build_plugins(),
         Some(other) => bail!(
-            "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, or `build-plugins`)"
+            "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, `build-admin`, or `build-plugins`)"
         ),
     }
 }
@@ -127,6 +131,64 @@ fn build_islands() -> Result<()> {
     }
 
     println!("build-islands: OK -> {}", dist.display());
+    Ok(())
+}
+
+/// Build the admin SPA wasm bundle: compile the excluded `ferropress-admin`
+/// `cdylib` for `wasm32-unknown-unknown` (release), then run `wasm-bindgen
+/// --target web` to emit the JS + `_bg.wasm` into `crates/ferropress-admin/dist/`.
+///
+/// Same shape + `wasm-bindgen`-version caveat as [`build_islands`]: the CLI must
+/// match the crate's `wasm-bindgen` dependency exactly (install with
+/// `cargo install wasm-bindgen-cli --version <that>`). The server serves the
+/// output at `/_fp/admin` and the shell boots `ferropress_admin.js` /
+/// `ferropress_admin_bg.wasm`.
+fn build_admin() -> Result<()> {
+    let root = repo_root()?;
+    let manifest = root.join("crates/ferropress-admin/Cargo.toml");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+
+    // 1. Compile the wasm cdylib (release).
+    let status = Command::new(&cargo)
+        .args([
+            "build",
+            "--manifest-path",
+            &manifest.to_string_lossy(),
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+        ])
+        .status()
+        .context("failed to run `cargo build` for ferropress-admin")?;
+    if !status.success() {
+        bail!("ferropress-admin wasm build failed");
+    }
+
+    // 2. wasm-bindgen into dist/. The excluded crate has its OWN target dir.
+    let wasm = root
+        .join("crates/ferropress-admin/target/wasm32-unknown-unknown/release/ferropress_admin.wasm");
+    let dist = root.join("crates/ferropress-admin/dist");
+    let status = Command::new("wasm-bindgen")
+        .args([
+            "--target",
+            "web",
+            "--no-typescript",
+            "--out-name",
+            "ferropress_admin",
+            "--out-dir",
+            &dist.to_string_lossy(),
+            &wasm.to_string_lossy(),
+        ])
+        .status()
+        .context(
+            "failed to run `wasm-bindgen` — install the matching CLI with \
+             `cargo install wasm-bindgen-cli --version <ferropress-admin' wasm-bindgen version>`",
+        )?;
+    if !status.success() {
+        bail!("wasm-bindgen failed");
+    }
+
+    println!("build-admin: OK -> {}", dist.display());
     Ok(())
 }
 

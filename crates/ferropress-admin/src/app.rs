@@ -1,0 +1,529 @@
+//! The admin SPA: one whole-page rinch app with three views (login → post list →
+//! editor) driven by a `Signal<View>`. Ported from the letterpress "composing room"
+//! mockup (`design/mockup.html`).
+//!
+//! The rich-text editor is rinch's `Editor` (re-exported by `rinch-web`); content
+//! crosses the wire as Ferropress `BlockTree` JSON and is converted to/from the
+//! editor's `DocNode` by `ferropress-editor-bridge`. The `EditorHandle` lives in a
+//! `Signal` (which is `Copy`) so every nested reactive closure can obtain a clone
+//! with `.get()` — no ownership threading.
+
+use gloo_timers::future::TimeoutFuture;
+use rinch::prelude::*;
+use rinch_editor_core::Schema;
+use rinch_web::{Editor, EditorHandle, create_editor};
+use wasm_bindgen_futures::spawn_local;
+
+use ferropress_editor_bridge as bridge;
+
+use crate::api::{self, PostSummary, UserDto};
+
+/// Which of the three views is showing. `Boot` is the transient initial state while
+/// the session cookie is checked.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Boot,
+    Login,
+    List,
+    Editor,
+}
+
+/// Load state of the post list.
+#[derive(Clone, Copy, PartialEq)]
+enum Load {
+    Loading,
+    Ready,
+    Error,
+}
+
+/// The signals a guarded request needs to route back to login on a 401. `Signal` is
+/// `Copy`, so this bundle is `Copy` too and threads through the async closures freely.
+#[derive(Clone, Copy)]
+struct AuthCtx {
+    view: Signal<View>,
+    me_user: Signal<Option<UserDto>>,
+    login_error: Signal<String>,
+}
+
+impl AuthCtx {
+    /// A guarded endpoint returned 401 (expired / revoked session): forget the user,
+    /// explain on the login screen, and route there — never a false "outage".
+    fn session_expired(self) {
+        self.me_user.set(None);
+        self.login_error
+            .set("Your session ended \u{2014} please sign in again.".to_owned());
+        self.view.set(View::Login);
+    }
+}
+
+#[component]
+pub fn app() -> NodeHandle {
+    let view = Signal::new(View::Boot);
+    let me_user = Signal::new(Option::<UserDto>::None);
+
+    // Login view.
+    let username = Signal::new(String::new());
+    let password = Signal::new(String::new());
+    let login_error = Signal::new(String::new());
+    let signing_in = Signal::new(false);
+
+    // List view.
+    let posts = Signal::new(Vec::<PostSummary>::new());
+    let list_state = Signal::new(Load::Loading);
+
+    // Editor view. The handle lives in a Signal (Copy) so it flows into every
+    // closure freely; `.get()` returns a clone of the underlying `Rc` editor.
+    let editor = Signal::new(create_editor());
+    let current_id = Signal::new(Option::<u64>::None);
+    let title = Signal::new(String::new());
+    let slug = Signal::new(String::new());
+    let status = Signal::new(String::new());
+    let saving = Signal::new(false);
+    let notice = Signal::new(String::new());
+    let toast = Signal::new(false);
+
+    // The re-auth routing bundle, shared by every guarded request.
+    let auth = AuthCtx {
+        view,
+        me_user,
+        login_error,
+    };
+
+    // Boot: pick login vs list from the session cookie (`GET /admin/api/me`).
+    spawn_local(async move {
+        match api::me().await {
+            api::Auth::User(user) => {
+                me_user.set(Some(user));
+                load_posts(posts, list_state, auth);
+                view.set(View::List);
+            }
+            // 401 or any error → show the login view (login surfaces real errors).
+            _ => view.set(View::Login),
+        }
+    });
+
+    rsx! {
+        div { class: "fp-admin",
+            match view.get() {
+                View::Boot => div { class: "login",
+                    div { class: "ruler" }
+                    div { class: "login__stage", p { class: "brand__sub", "loading the composing room" } }
+                },
+
+                // ── LOGIN ──────────────────────────────────────────────────────
+                View::Login => div { class: "login",
+                    div { class: "ruler" }
+                    div { class: "login__stage",
+                        div { class: "login__plate",
+                            div { class: "brand",
+                                span { class: "regmark", style: "font-size:1.7rem", "\u{2295}" }
+                                h1 { class: "brand__word", "Ferropress" }
+                            }
+                            p { class: "brand__sub", "composing room" }
+                            div { class: "card",
+                                div { class: "field",
+                                    label { "Username" }
+                                    input {
+                                        class: "input input--mono",
+                                        placeholder: "jane",
+                                        oninput: move |v: String| username.set(v),
+                                    }
+                                }
+                                div { class: "field",
+                                    label { "Password" }
+                                    input {
+                                        class: "input",
+                                        r#type: "password",
+                                        placeholder: "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}",
+                                        oninput: move |v: String| password.set(v),
+                                    }
+                                }
+                                if !login_error.get().is_empty() {
+                                    p { class: "note", {move || login_error.get()} }
+                                }
+                                button {
+                                    class: "btn btn--primary",
+                                    onclick: move || {
+                                        if signing_in.get() { return; }
+                                        let u = username.get();
+                                        let p = password.get();
+                                        if u.trim().is_empty() || p.is_empty() {
+                                            login_error.set("Enter a username and password.".to_owned());
+                                            return;
+                                        }
+                                        login_error.set(String::new());
+                                        signing_in.set(true);
+                                        spawn_local(async move {
+                                            match api::login(&u, &p).await {
+                                                api::Auth::User(user) => {
+                                                    me_user.set(Some(user));
+                                                    load_posts(posts, list_state, auth);
+                                                    view.set(View::List);
+                                                }
+                                                api::Auth::Anonymous => login_error
+                                                    .set("That username and password don't match.".to_owned()),
+                                                api::Auth::Error(e) => login_error.set(format!("Sign-in failed: {e}")),
+                                            }
+                                            signing_in.set(false);
+                                        });
+                                    },
+                                    {move || if signing_in.get() { "Signing in\u{2026}" } else { "Sign in \u{2192}" }}
+                                }
+                            }
+                        }
+                    }
+                    p { class: "login__footer", "build proofs \u{00B7} press live" }
+                },
+
+                // ── POST LIST (THE GALLEY) ─────────────────────────────────────
+                View::List => div {
+                    header { class: "masthead",
+                        div { class: "ruler" }
+                        div { class: "masthead__bar",
+                            span { class: "masthead__brand",
+                                span { class: "regmark", style: "font-size:1.05rem", "\u{2295}" }
+                                "Ferropress"
+                            }
+                            span { class: "masthead__sep", "\u{00B7}" }
+                            span { class: "masthead__here", "Posts" }
+                            span { class: "masthead__spacer" }
+                            span { class: "masthead__user",
+                                span { class: "masthead__avatar", {move || avatar_initial(&me_user.get())} }
+                                {move || display_name(&me_user.get())}
+                            }
+                            button {
+                                class: "btn btn--quiet",
+                                onclick: move || {
+                                    spawn_local(async move {
+                                        // Only claim signed-out if the server actually
+                                        // cleared the (HttpOnly) cookie; JS can't clear
+                                        // it, so a failed logout must NOT fake it.
+                                        match api::logout().await {
+                                            Ok(()) => {
+                                                me_user.set(None);
+                                                view.set(View::Login);
+                                            }
+                                            Err(_) => notice.set(
+                                                "Couldn't sign out \u{2014} check your connection and try again."
+                                                    .to_owned(),
+                                            ),
+                                        }
+                                    });
+                                },
+                                "Sign out"
+                            }
+                        }
+                    }
+                    div { class: "wrap",
+                        div { class: "galley__head",
+                            h2 { class: "galley__title", "Posts" }
+                            span { class: "galley__count",
+                                {move || match list_state.get() {
+                                    Load::Ready => format!("{} in the galley", posts.get().len()),
+                                    _ => String::new(),
+                                }}
+                            }
+                        }
+                        if !notice.get().is_empty() {
+                            div { class: "galley__state err", {move || notice.get()} }
+                        }
+                        if matches!(list_state.get(), Load::Loading) {
+                            div { class: "galley__state", "Setting the galley\u{2026}" }
+                        }
+                        if matches!(list_state.get(), Load::Error) {
+                            div { class: "galley__state err", "The galley is unavailable right now." }
+                        }
+                        for row in row_vms(&posts.get()) {
+                            button {
+                                key: row.id,
+                                class: "row",
+                                onclick: {
+                                    let id = row.id;
+                                    move || open_post(id, editor, title, slug, status, current_id, notice, auth)
+                                },
+                                span { class: "row__mark", "\u{2295}" }
+                                span {
+                                    span { class: "row__title", {row.title} }
+                                    span { class: "row__slug", {row.slug_path} }
+                                }
+                                span { class: row.stamp_class, {row.stamp_label} }
+                                span { class: "row__time", {row.time} }
+                                span { class: "row__edit", "Edit \u{2192}" }
+                            }
+                        }
+                        if matches!(list_state.get(), Load::Ready) && posts.get().is_empty() {
+                            div { class: "galley__state", "No posts yet." }
+                        }
+                    }
+                },
+
+                // ── EDITOR (THE SHEET) ─────────────────────────────────────────
+                View::Editor => div {
+                    header { class: "masthead",
+                        div { class: "ruler" }
+                        div { class: "masthead__bar",
+                            button {
+                                class: "btn btn--quiet",
+                                onclick: move || {
+                                    notice.set(String::new());
+                                    load_posts(posts, list_state, auth);
+                                    view.set(View::List);
+                                },
+                                "\u{2190} Posts"
+                            }
+                            span { class: "masthead__sep", "\u{00B7}" }
+                            span { class: "masthead__here", {move || title.get()} }
+                            span { class: "masthead__spacer" }
+                            button {
+                                class: "btn btn--primary",
+                                style: "width:auto",
+                                onclick: move || save_post(
+                                    editor, current_id.get(), title, slug, status, saving, notice, toast, auth,
+                                ),
+                                {move || if saving.get() { "Saving\u{2026}" } else { "Save" }}
+                            }
+                        }
+                    }
+                    div { class: "wrap",
+                        div { class: "editor__meta",
+                            div { class: "metaitem",
+                                label { "Slug" }
+                                span { class: "slugbox",
+                                    span { class: "slugbox__host", "/" }
+                                    input {
+                                        value: slug.get(),
+                                        spellcheck: "false",
+                                        oninput: move |v: String| slug.set(v),
+                                    }
+                                }
+                            }
+                            div { class: "metaitem",
+                                label { "Status" }
+                                div { class: "statusbar",
+                                    for entry in api::STATUSES {
+                                        button {
+                                            key: entry.0,
+                                            class: {move || if status.get() == entry.0 { "statusbtn is-on" } else { "statusbtn" }},
+                                            onclick: move || status.set(entry.0.to_owned()),
+                                            {entry.1}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !notice.get().is_empty() {
+                            div { class: "editor__error", {move || notice.get()} }
+                        }
+                        div { class: "toolbar", role: "toolbar",
+                            button { class: "tool tool--i", title: "Bold", onclick: move || { editor.get().command("toggleBold"); }, b { "B" } }
+                            button { class: "tool tool--i", title: "Italic", onclick: move || { editor.get().command("toggleItalic"); }, i { "I" } }
+                            button { class: "tool tool--label", title: "Inline code", onclick: move || { editor.get().command("toggleCode"); }, "</>" }
+                            span { class: "toolbar__sep" }
+                            button { class: "tool tool--label", title: "Heading 2", onclick: move || { editor.get().command("setHeading2"); }, "H2" }
+                            button { class: "tool tool--label", title: "Heading 3", onclick: move || { editor.get().command("setHeading3"); }, "H3" }
+                            span { class: "toolbar__sep" }
+                            button { class: "tool", title: "Quote", onclick: move || { editor.get().command("wrapInBlockquote"); }, "\u{201C}" }
+                            button { class: "tool", title: "Bulleted list", onclick: move || { editor.get().command("toggleBulletList"); }, "\u{2022}" }
+                            button { class: "tool tool--label", title: "Code block", onclick: move || { editor.get().command("setCodeBlock"); }, "{ }" }
+                            span { class: "toolbar__spacer" }
+                            span { class: "toolbar__measure",
+                                span { class: "regmark", style: "font-size:.75rem", "\u{2295}" }
+                                "measure"
+                            }
+                        }
+                        div { class: "sheet",
+                            div { class: "sheet__inner",
+                                Editor { editor: editor.get(), content: "" }
+                            }
+                        }
+                    }
+                },
+            }
+
+            div { class: {move || if toast.get() { "toast is-shown" } else { "toast" }},
+                span { class: "regmark", style: "font-size:.85rem", "\u{2295}" }
+                "Saved"
+            }
+        }
+    }
+}
+
+/// A galley row's presentation fields, precomputed so the reactive `for` body reads
+/// each one exactly once (each `{…}` child moves its value; a shared `post.status`
+/// used for both the stamp class and label would double-move).
+#[derive(Clone, PartialEq)]
+struct RowVm {
+    id: u64,
+    title: String,
+    slug_path: String,
+    stamp_class: &'static str,
+    stamp_label: String,
+    time: String,
+}
+
+fn row_vms(posts: &[PostSummary]) -> Vec<RowVm> {
+    posts
+        .iter()
+        .map(|p| RowVm {
+            id: p.id,
+            title: p.title.clone(),
+            slug_path: format!("/{}", p.slug),
+            stamp_class: api::status_stamp_class(&p.status),
+            stamp_label: api::status_label(&p.status),
+            time: api::fmt_relative(p.updated_at),
+        })
+        .collect()
+}
+
+/// Fetch the post list into `posts`, tracking `state`. A 401 routes back to login
+/// (an expired session), NOT a false "galley unavailable" outage.
+fn load_posts(posts: Signal<Vec<PostSummary>>, state: Signal<Load>, auth: AuthCtx) {
+    state.set(Load::Loading);
+    spawn_local(async move {
+        match api::list_posts().await {
+            Ok(list) => {
+                posts.set(list);
+                state.set(Load::Ready);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(_)) => state.set(Load::Error),
+        }
+    });
+}
+
+/// Open a post in the editor: fetch it, populate the meta fields, bridge its
+/// `BlockTree` into the editor, then switch to the editor view. A bridge failure
+/// loads an EMPTY document and surfaces a warning rather than corrupting content.
+#[allow(clippy::too_many_arguments)]
+fn open_post(
+    id: u64,
+    editor: Signal<EditorHandle>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    current_id: Signal<Option<u64>>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    notice.set(String::new());
+    spawn_local(async move {
+        match api::get_post(id).await {
+            Ok(detail) => {
+                title.set(detail.title);
+                slug.set(detail.slug);
+                status.set(detail.status);
+                current_id.set(Some(detail.id));
+
+                let schema = Schema::starter_kit();
+                let handle = editor.get();
+                match bridge::block_tree_json_to_node(&schema, &detail.block_tree) {
+                    Ok(node) => handle.load_doc(node),
+                    Err(e) => {
+                        if let Ok(node) = bridge::block_tree_json_to_node(&schema, &empty_tree()) {
+                            handle.load_doc(node);
+                        }
+                        notice.set(format!(
+                            "This post uses content the editor couldn't load ({e}). Saving will overwrite it."
+                        ));
+                    }
+                }
+                auth.view.set(View::Editor);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(e)) => notice.set(format!("Couldn't open that post: {e}")),
+        }
+    });
+}
+
+/// Persist the current editor document: read it back, bridge to `BlockTree`, and
+/// `PUT` it. Surfaces the server's 400/409 message; stamps a "Saved" toast on 200.
+#[allow(clippy::too_many_arguments)]
+fn save_post(
+    editor: Signal<EditorHandle>,
+    id: Option<u64>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    saving: Signal<bool>,
+    notice: Signal<String>,
+    toast: Signal<bool>,
+    auth: AuthCtx,
+) {
+    if saving.get() {
+        return;
+    }
+    let Some(id) = id else {
+        return;
+    };
+
+    let node = editor.get().doc();
+    let block_tree = match bridge::node_to_block_tree_json(&node) {
+        Ok(v) => v,
+        Err(e) => {
+            notice.set(format!("Couldn't prepare the document to save: {e}"));
+            return;
+        }
+    };
+    let slug_val = slug.get().trim().to_owned();
+    if slug_val.is_empty() {
+        notice.set("The slug can't be empty.".to_owned());
+        return;
+    }
+
+    notice.set(String::new());
+    saving.set(true);
+    let body = api::SaveRequest {
+        title: title.get(),
+        slug: slug_val,
+        status: status.get(),
+        block_tree,
+    };
+    spawn_local(async move {
+        match api::save_post(id, &body).await {
+            Ok(()) => {
+                toast.set(true);
+                saving.set(false);
+                TimeoutFuture::new(1600).await;
+                toast.set(false);
+            }
+            Err(api::ApiError::Unauthorized) => {
+                saving.set(false);
+                auth.session_expired();
+            }
+            Err(api::ApiError::Message(e)) => {
+                notice.set(e);
+                saving.set(false);
+            }
+        }
+    });
+}
+
+fn empty_tree() -> serde_json::Value {
+    serde_json::json!({ "schema_version": 1, "blocks": [] })
+}
+
+/// The masthead avatar letter — the display name's (or username's) first char.
+fn avatar_initial(user: &Option<UserDto>) -> String {
+    user.as_ref()
+        .and_then(|u| {
+            u.display_name
+                .chars()
+                .next()
+                .or_else(|| u.username.chars().next())
+        })
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default()
+}
+
+/// The signed-in user's display name (falls back to the username).
+fn display_name(user: &Option<UserDto>) -> String {
+    user.as_ref()
+        .map(|u| {
+            if u.display_name.is_empty() {
+                u.username.clone()
+            } else {
+                u.display_name.clone()
+            }
+        })
+        .unwrap_or_default()
+}

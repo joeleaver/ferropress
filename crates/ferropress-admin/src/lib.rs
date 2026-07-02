@@ -1,46 +1,31 @@
 //! # ferropress-admin
 //!
-//! The Ferropress admin + editor SPA. The finished crate is a **rinch** WASM
-//! application mounted into the browser via `rinch-web::mount()`, with
-//! `crate-type = ["cdylib"]` and a `wasm32-unknown-unknown` target. Its editor
-//! preview deliberately calls the SAME `ferropress-render` (block-tree -> HTML)
-//! path as the public site, so what an author sees is exactly what gets
-//! published (WYSIWYG parity); its edit UI comes from `ferropress-render-form`.
+//! The Ferropress admin + editor SPA — a rinch WASM app mounted whole-page via
+//! `rinch_web::mount`. Three views (login → post list → rich-text editor) call the
+//! rinch-free admin API in `ferropress-http` (`/admin/api/*`); the HttpOnly session
+//! cookie rides along automatically on same-origin fetches.
 //!
-//! ## rinch implementation pending upstream
+//! Content crosses the wire as Ferropress `BlockTree` JSON and is converted to/from
+//! the rinch editor's `DocNode` by `ferropress-editor-bridge`. The public site's
+//! WYSIWYG parity comes for free: the editor and the public renderer share the same
+//! `BlockKind` vocabulary (the bridge only round-trips marks both understand).
 //!
-//! The rinch SPA cannot be built until these upstream rinch issues land:
-//!   - rinch #50 — content-editor (CE) serde (editor state <-> JSON over the wire).
-//!   - rinch #51 — content-editor in the WASM-DOM backend (the editor in-browser).
-//!
-//! Until then this crate is a **rinch-FREE placeholder**: NO rinch / rinch-web
-//! dependency, no cdylib, no wasm target — just enough structure to establish the
-//! crate in the workspace and keep everything compiling on the host. The
-//! `app()` entry point below has the real shape the rinch mount will call; its
-//! body is a stub. Once rinch is wired up, `app()` becomes the rinch root
-//! component and `mount()` hands it to `rinch-web`.
+//! Built to a wasm32 `cdylib` by `cargo xtask build-admin` and served at
+//! `/_fp/admin`; the server-rendered shell at `/admin` boots it. See the crate
+//! `Cargo.toml` for why this lives outside the host workspace.
 
-use ferropress_render::RenderMode;
-use ferropress_render_form::FormSchemaRenderer;
+mod api;
+mod app;
+mod styles;
 
-/// Placeholder for the admin SPA's root view. Once rinch lands this becomes the
-/// rinch view node (the root component) that `rinch-web::mount()` renders into
-/// the document. Newtype so the eventual swap to the rinch type is contained.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct AdminApp;
+use rinch_core::element::ThemeProviderProps;
+use wasm_bindgen::prelude::*;
 
-/// Build the admin SPA root. PLACEHOLDER shape of the future rinch entry point:
-/// `rinch-web::mount()` will call this to obtain the root component. Editor
-/// preview will render through `ferropress_render::render(.., RenderMode::Preview)`
-/// (the same path the public site uses) and the edit UI through
-/// `ferropress_render_form::FormSchemaRenderer`.
-pub fn app() -> AdminApp {
-    // Keep the cross-crate wiring intent live until the rinch impl lands: the
-    // editor preview uses the public render path, the forms use the one form
-    // renderer.
-    let _preview_mode = RenderMode::Preview;
-    let _forms = FormSchemaRenderer::new();
-    // TODO(rinch #50/#51): assemble the rinch admin/editor component tree and
-    // return it as the root node for `rinch-web::mount()`.
-    todo!("build the rinch admin SPA root (pending rinch #50/#51)")
+/// WASM entry point: install the panic hook, inject the admin stylesheet, then mount
+/// the whole-page rinch app (which decides login vs list from the session cookie).
+#[wasm_bindgen(start)]
+pub fn start() {
+    console_error_panic_hook::set_once();
+    styles::inject_admin_styles();
+    rinch_web::mount(ThemeProviderProps::default(), app::app);
 }

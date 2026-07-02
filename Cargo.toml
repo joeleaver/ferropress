@@ -9,11 +9,13 @@
 # by git, pinned to an exact rev so every rhypedb-* crate resolves to the same
 # tree (they share version 0.1.0 in one repo — mixing revs is unsupported).
 #
-# rinch is consumed ONLY by the excluded `crates/ferropress-islands` (a wasm32
-# cdylib, outside this workspace, which pins rinch by git rev directly) — so rinch
-# has NO entry in [workspace.dependencies] and never enters the host workspace
-# graph. The admin / render-form crates remain rinch-free compiling placeholders
-# until their upstream rinch features land.
+# rinch is consumed ONLY by the excluded wasm32 cdylibs — `crates/ferropress-islands`
+# (public-site islands) and `crates/ferropress-admin` (the admin SPA), plus the
+# excluded host+wasm `crates/ferropress-editor-bridge` (BlockTree ⇄ rinch DocNode
+# conversion, which pins `rinch-editor-core` by git rev). None of them are in
+# [workspace.dependencies]; they live outside the workspace with their own
+# Cargo.lock and never enter the host workspace graph. `ferropress-render-form`
+# remains a rinch-free compiling placeholder until its form-renderer slice lands.
 #
 # Dependency-graph invariant (enforced by xtask + CI): rhypedb appears ONLY on
 # ferropress-store-embedded (engine/subscribe) and ferropress-schema-sdl
@@ -29,9 +31,22 @@ members = ["crates/*"]
 #     (browser/web_sys only). The workspace's host `cargo check --workspace`
 #     cannot build it, so it lives outside with its OWN Cargo.lock and is built
 #     for wasm via `cargo xtask build-islands`.
+#   * crates/ferropress-admin — the admin SPA: a wasm32-only `cdylib` depending on
+#     rinch-web (browser/web_sys only), same posture as ferropress-islands. Built
+#     for wasm via `cargo xtask build-admin`; served at `/_fp/admin`.
+#   * crates/ferropress-editor-bridge — the BlockTree ⇄ rinch `DocNode` converter
+#     used by the admin SPA. Excluded because it git-deps `rinch-editor-core` (which
+#     the dep-graph lint bans from any workspace member); it is wasm-clean AND
+#     host-buildable, so its round-trip unit tests run on the host.
 #   * plugins/ — reference WASM plugins (Extism PDK, wasm32 `cdylib`s). Built via
 #     `cargo xtask build-plugins`; loaded at runtime by ferropress-plugin-host.
-exclude = ["xtask", "crates/ferropress-islands", "plugins"]
+exclude = [
+    "xtask",
+    "crates/ferropress-islands",
+    "crates/ferropress-admin",
+    "crates/ferropress-editor-bridge",
+    "plugins",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -66,9 +81,9 @@ ferropress-cert-acme       = { path = "crates/ferropress-cert-acme" }
 ferropress-plugin-host     = { path = "crates/ferropress-plugin-host" }
 ferropress-serve           = { path = "crates/ferropress-serve" }
 ferropress-http            = { path = "crates/ferropress-http" }
-ferropress-admin           = { path = "crates/ferropress-admin" }
-# NB: ferropress-islands is NOT listed here — it is excluded from the workspace
-# (wasm32-only cdylib, see [workspace].exclude) and declares its deps directly.
+# NB: ferropress-islands, ferropress-admin, and ferropress-editor-bridge are NOT
+# listed here — they are excluded from the workspace (see [workspace].exclude) and
+# declare their deps directly, pinning rinch by git rev.
 
 # --- rhypedb (UPSTREAM, git, pinned rev) -------------------------------------
 # ALL rhypedb-* deps MUST share this exact pinned rev (the crates share one repo

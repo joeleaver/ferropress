@@ -1,20 +1,65 @@
+# ferropress-admin — the admin/editor SPA: a rinch WASM app (login → post list →
+# rich-text editor) that calls the rinch-free admin API in `ferropress-http`.
+#
+# EXCLUDED from the root workspace (see the root Cargo.toml), exactly like
+# `ferropress-islands`: a wasm32-only `cdylib` depending on `rinch-web`
+# (browser/web_sys only), so the host `cargo check --workspace` cannot build it. It
+# carries its OWN Cargo.lock and declares its deps directly. rinch is an UPSTREAM
+# (CLAUDE.local.md): pinned by exact git rev, never a path dep.
+#
+# The BlockTree ⇄ editor `DocNode` conversion lives in `ferropress-editor-bridge`
+# (a path dep — our own crate), which pins `rinch-editor-core` at the SAME rev as
+# below so the `DocNode` type is identical across the bridge and this SPA.
+#
+# Build with `cargo xtask build-admin` (wasm32 + wasm-bindgen into `dist/`); the
+# server serves `dist/` at `/_fp/admin` and the SPA shell at `/admin`.
 [package]
 name = "ferropress-admin"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "The admin/editor SPA (will be a rinch WASM app). rinch implementation pending upstream; rinch-free compiling placeholder for now."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The Ferropress admin + editor SPA (rinch WASM): login, post list, and the rich-text editor over the admin API."
+publish = false
 
-[lints]
-workspace = true
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
-# NOTE: rinch is DEFERRED. This crate will become a rinch WASM SPA mounted via
-# `rinch-web::mount()` and gain `crate-type = ["cdylib"]` + a wasm32 target once
-# the upstream rinch features land (rinch #50 CE serde, #51 CE in WASM-DOM). For
-# now it is a rinch-FREE placeholder so the workspace compiles on the host.
-# Editor preview will call the SAME ferropress-render path as the public site
-# (WYSIWYG parity), and the edit UI comes from ferropress-render-form.
-ferropress-core = { workspace = true }
-ferropress-render = { workspace = true }
-ferropress-render-form = { workspace = true }
+# rinch — UPSTREAM, pinned git rev (MUST match ferropress-editor-bridge).
+# default-features=false drops the desktop/wgpu stack; the web DOM backend is
+# rinch-web, which re-exports the editor (Editor / EditorHandle / create_editor).
+rinch = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96", default-features = false, features = ["components", "theme"] }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96", features = ["theme"] }
+rinch-web = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96" }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", rev = "2f360269fb665408f091ee8ceada3cc58df33a96", features = ["serde"] }
+
+# The BlockTree ⇄ DocNode bridge (our own crate; path is fine — the no-path rule is
+# only for the rinch/rhypedb/jkbase upstreams).
+ferropress-editor-bridge = { path = "../ferropress-editor-bridge" }
+
+# WASM glue.
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "Node",
+    "HtmlHeadElement",
+    "RequestCredentials",
+] }
+
+# HTTP (fetch) + JSON + a small timer for the save toast.
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Smaller, faster wasm in dev (mirrors the islands / rinch web examples).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

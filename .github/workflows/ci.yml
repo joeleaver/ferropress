@@ -95,6 +95,33 @@ jobs:
       - run: cargo install wasm-bindgen-cli --version 0.2.125 --locked
       - run: cargo run --manifest-path xtask/Cargo.toml -- build-islands
 
+  # The admin SPA (ferropress-admin) + its BlockTree⇄DocNode bridge
+  # (ferropress-editor-bridge) are EXCLUDED from the workspace, so the --workspace
+  # jobs above never touch them. Lint the SPA for wasm32, lint + host-test the
+  # bridge (its round-trip fidelity tests are the correctness gate for the seam,
+  # and only run here since the crate is out of the workspace), then build the
+  # wasm bundle. The wasm-bindgen CLI version MUST match the crate's `wasm-bindgen`
+  # (bumped from the islands' 0.2.125 by the newer rinch pin) — bump both together.
+  admin-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/ferropress-admin
+            crates/ferropress-editor-bridge
+      - run: cargo clippy --manifest-path crates/ferropress-editor-bridge/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path crates/ferropress-editor-bridge/Cargo.toml
+      - run: cargo clippy --manifest-path crates/ferropress-admin/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - run: cargo run --manifest-path xtask/Cargo.toml -- build-admin
+
   # Reference WASM plugins (Extism PDK) are EXCLUDED from the workspace, so the
   # --workspace jobs don't cover them. Lint + build them for wasm32, then run the
   # tests that LOAD the built wasm — the extism ABI conformance proofs (the
