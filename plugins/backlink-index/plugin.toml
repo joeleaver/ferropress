@@ -1,0 +1,27 @@
+# Declarative manifest for the backlink-index plugin. `cargo xtask build-plugins`
+# copies this (alongside the built wasm) into plugins/dist/backlink-index/, which
+# the server loads via --plugins-dir. The change-feed -> action bridge dispatches
+# `post.created` / `post.updated` (post-persist) to this plugin's `on_change`.
+id = "backlink-index"
+wasm = "ferropress_plugin_backlink_index.wasm"
+
+# GRANTED content:read AND content:write. read_store wires `fp_lookup_slug` (to
+# resolve each [[target]] slug -> published page); write_store wires `fp_set_meta`
+# (to record the backlink on the target). Deny-by-default is structural: without a
+# grant + a wired backend the host function is absent and the plugin fails to load.
+[capabilities]
+read_store = true
+write_store = true
+
+# React to both a new post and an edited one (past-tense = post-persist ACTION).
+[[hooks]]
+event = "post.created"
+kind = "action"
+export = "on_change"
+priority = 10
+
+[[hooks]]
+event = "post.updated"
+kind = "action"
+export = "on_change"
+priority = 10

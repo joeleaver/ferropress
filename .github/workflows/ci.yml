@@ -117,10 +117,12 @@ jobs:
             plugins/comment-mod
             plugins/audit-log
             plugins/wiki
+            plugins/backlink-index
       - run: cargo clippy --manifest-path plugins/callout/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: cargo clippy --manifest-path plugins/comment-mod/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: cargo clippy --manifest-path plugins/audit-log/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: cargo clippy --manifest-path plugins/wiki/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --manifest-path plugins/backlink-index/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - run: cargo run --manifest-path xtask/Cargo.toml -- build-plugins
       - run: cargo test -p ferropress-plugin-host
       - run: cargo test -p ferropress-http

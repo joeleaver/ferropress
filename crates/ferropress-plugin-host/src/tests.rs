@@ -6,11 +6,11 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ferropress_core::error::{CoreError, Result as CoreResult};
 use ferropress_core::hook::{HookEvent, HookKind};
-use ferropress_core::plugin_caps::{ContentReader, PublishedRef};
+use ferropress_core::plugin_caps::{ContentReader, ContentWriter, PublishedRef};
 use ferropress_render::CustomBlockRenderer;
 
 use crate::{Capabilities, HookRegistration, HostLimits, PluginHost};
@@ -340,5 +340,184 @@ fn wiki_plugin_without_capability_backend_fails_to_load() {
     assert!(
         err.to_string().contains("fp_lookup_slug"),
         "the failure must be the unresolved fp_lookup_slug host import: {err}"
+    );
+}
+
+/// A [`ContentWriter`] double that RECORDS every `set_meta` call (the host has
+/// already namespaced the key under the calling plugin's id by the time it lands
+/// here), so a test can assert exactly what a plugin wrote.
+/// A recorded `set_meta` call: `(type_name, id, namespace, key, value)`.
+type SetMetaCall = (String, u64, String, String, serde_json::Value);
+
+struct StubWriter {
+    set_meta_calls: Mutex<Vec<SetMetaCall>>,
+}
+
+impl ContentWriter for StubWriter {
+    fn create_page_stub(&self, _slug: &str, _title: &str) -> CoreResult<u64> {
+        Ok(999)
+    }
+    fn set_meta(
+        &self,
+        type_name: &str,
+        id: u64,
+        namespace: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> CoreResult<()> {
+        self.set_meta_calls.lock().unwrap().push((
+            type_name.to_owned(),
+            id,
+            namespace.to_owned(),
+            key.to_owned(),
+            value,
+        ));
+        Ok(())
+    }
+}
+
+/// Read the built backlink-index plugin wasm, or `None` if not built yet.
+fn backlink_wasm() -> Option<Vec<u8>> {
+    std::fs::read(
+        repo_root().join("plugins/dist/backlink-index/ferropress_plugin_backlink_index.wasm"),
+    )
+    .ok()
+}
+
+/// A post.updated payload whose body links to `[[Target Page]]` (published) and
+/// `[[Missing]]` (not) — the shape the change-feed → action bridge delivers.
+fn post_update_event(source_id: u64, source_slug: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "type": "Post",
+        "kind": "update",
+        "object_id": source_id,
+        "fields": {
+            "slug": source_slug,
+            "block_tree": {
+                "schema_version": 1,
+                "blocks": [{
+                    "uid": "b1",
+                    "kind": {
+                        "type": "custom",
+                        "plugin": "wiki",
+                        "name": "wiki",
+                        "data": { "text": "See [[Target Page]] and [[Missing]]." }
+                    },
+                    "children": []
+                }]
+            }
+        }
+    }))
+    .expect("serialize payload")
+}
+
+/// The backlink-index plugin (granted `content:read` + `content:write`) parses a
+/// post's `wiki` [[targets]], resolves each via `fp_lookup_slug`, and records a
+/// backlink on each RESOLVABLE target via `fp_set_meta`. This is the end-to-end
+/// proof that the content:write host function works with a real wasm guest — the
+/// host namespaces the meta key under the plugin id, and only published targets
+/// get a backlink. (The action-via-bridge loop guard is separate — rhypedb#13.)
+#[test]
+fn backlink_index_writes_backlink_via_capabilities() {
+    let Some(wasm) = backlink_wasm() else {
+        eprintln!(
+            "skipping backlink_index_writes_backlink_via_capabilities: backlink-index wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    };
+
+    // Only "target-page" is published; "missing" resolves to null.
+    let reader = Arc::new(StubReader {
+        existing: ["target-page".to_owned()].into_iter().collect(),
+    });
+    let writer = Arc::new(StubWriter {
+        set_meta_calls: Mutex::new(Vec::new()),
+    });
+    let mut host = PluginHost::new()
+        .with_content_reader(reader)
+        .with_content_writer(writer.clone());
+    host.load_plugin(
+        "backlink-index",
+        &wasm,
+        Capabilities {
+            read_store: true,
+            write_store: true,
+            ..Default::default()
+        },
+        HostLimits::default(),
+    )
+    .expect("load backlink-index plugin");
+
+    host.call(
+        "backlink-index",
+        "on_change",
+        &post_update_event(42, "source-post"),
+    )
+    .expect("dispatch on_change");
+
+    let calls = writer.set_meta_calls.lock().unwrap();
+    // EXACTLY one backlink — only the published target, never the red link.
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the resolvable target gets a backlink: {calls:?}"
+    );
+    let (type_name, id, namespace, key, value) = &calls[0];
+    // StubReader resolves any existing slug to a Post with id 1.
+    assert_eq!(type_name, "Post");
+    assert_eq!(*id, 1);
+    // The host passed the calling plugin's id as the namespace (meta[namespace][key]),
+    // NOT a string-joined key — so isolation can't be forged.
+    assert_eq!(
+        namespace, "backlink-index",
+        "meta write must be namespaced under the calling plugin id: {namespace}"
+    );
+    assert_eq!(
+        key, "from:42",
+        "the plugin's own key is nested, not joined: {key}"
+    );
+    assert_eq!(value, &serde_json::json!("source-post"));
+}
+
+/// Deny-by-default is STRUCTURAL for `write_store` exactly as for `read_store`: a
+/// plugin that declares `write_store` but is loaded with NO `ContentWriter` wired
+/// has no `fp_set_meta` import, so it fails to instantiate. A `ContentReader` IS
+/// wired here (so `fp_lookup_slug` resolves), pinning the failure to the missing
+/// WRITE backend specifically.
+#[test]
+fn backlink_index_without_writer_backend_fails_to_load() {
+    let Some(wasm) = backlink_wasm() else {
+        eprintln!(
+            "skipping backlink_index_without_writer_backend_fails_to_load: backlink-index wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    };
+
+    // Reader wired, writer NOT — so only the write host functions are unresolved.
+    let reader = Arc::new(StubReader {
+        existing: HashSet::new(),
+    });
+    let mut host = PluginHost::new().with_content_reader(reader);
+    let err = host
+        .load_plugin(
+            "backlink-index",
+            &wasm,
+            Capabilities {
+                read_store: true,
+                write_store: true,
+                ..Default::default()
+            },
+            HostLimits::default(),
+        )
+        .expect_err("a write_store plugin must fail to load when no ContentWriter backs it");
+
+    assert!(
+        matches!(err, CoreError::Unavailable(_)),
+        "expected an instantiation failure, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("fp_set_meta"),
+        "the failure must be the unresolved fp_set_meta host import: {err}"
     );
 }
