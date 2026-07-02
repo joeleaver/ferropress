@@ -115,12 +115,16 @@ pub fn to_restrict_set(restrict: Option<Vec<ObjectId>>) -> Option<HashSet<u64>> 
 
 /// core::SubscribeFilter -> rhypedb `SubscriptionFilter`. The two structs are
 /// field-for-field equivalent (type/object are optional narrowings, `kinds` empty
-/// means "all kinds"); this just unwraps the core newtypes and maps the kind enum.
+/// means "all kinds", `exclude_origin` drops a subscriber's own write-origin);
+/// this just unwraps the core newtypes and maps the kind enum. `exclude_origin` is
+/// carried through verbatim (the engine hub applies it in-process — see rhypedb#13
+/// — so the action-hook bridge never receives a plugin's own writes).
 pub fn to_subscription_filter(filter: SubscribeFilter) -> SubscriptionFilter {
     SubscriptionFilter {
         type_name: filter.type_name.map(|TypeName(s)| s),
         object_id: filter.object_id.map(|ObjectId(n)| n),
         kinds: filter.kinds.into_iter().map(to_db_change_kind).collect(),
+        exclude_origin: filter.exclude_origin,
     }
 }
 
@@ -158,6 +162,11 @@ pub fn from_change_event(ev: ChangeEvent) -> Change {
         fields: ev
             .fields
             .map(|m| serde_json::Value::Object(m.into_iter().collect())),
+        // Forward the write origin verbatim. The hub already drops plugin-origin
+        // events from the action bridge's (exclude_origin) subscription; carrying
+        // it here lets the bridge apply a belt-and-suspenders check too, and the
+        // regen loop's unfiltered subscription still sees it.
+        origin: ev.origin,
     }
 }
 
@@ -192,10 +201,13 @@ mod tests {
             type_name: "Post".to_owned(),
             object_id: 7,
             fields: Some(fields),
+            origin: None,
         };
         let change = from_change_event(ev);
         // Delete now carries the (pre-delete) scalar fields, forwarded as JSON.
         let fields = change.fields.expect("fields forwarded");
         assert_eq!(fields["slug"], "hello");
+        // An untagged event forwards `origin = None`.
+        assert_eq!(change.origin, None);
     }
 }

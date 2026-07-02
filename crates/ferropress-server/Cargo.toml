@@ -34,3 +34,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# The full-stack feed-loop e2e drives a REAL EmbeddedStore + PluginHost + HookBridge
+# with the real backlink-index wasm (wasm-gated; skips if not built). It reaches the
+# subsystems this crate already depends on — no new production edge.
+tempfile = { workspace = true }
+serde_json = { workspace = true }

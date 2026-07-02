@@ -16,6 +16,27 @@
 
 use crate::error::Result;
 
+/// The write **origin** tag Ferropress stamps on EVERY plugin-originated write
+/// (every mutation the [`ContentWriter`] backend performs). It exists solely to
+/// break the `write → change → action → write` feed loop: the action-hook bridge
+/// subscribes to the change feed with `exclude_origin = PLUGIN_ORIGIN`, so a
+/// plugin's own writes are filtered off the hub before they can re-trigger an
+/// action hook. The static-first **regen loop deliberately does NOT exclude it** —
+/// a plugin-created stub page must still be (re)prerendered — so plugin writes
+/// still drive cache regeneration; they just never drive another action.
+///
+/// v1 uses ONE origin for ALL plugin writes: the loop only needs to answer "is
+/// this a plugin write?", not "which plugin?". Per-plugin origins are a future
+/// refinement (they would let the bridge deliver plugin A's write to plugin B
+/// while still excluding a plugin's own).
+///
+/// A fixed, nonzero sentinel. Ferropress's own (non-plugin) writes are all
+/// UNTAGGED (`origin = None`, which the hub never excludes), so this value can
+/// never collide with a legitimate first-party write; the distinctive high bits
+/// (`0xF377…` — "ferro") make an accidental clash with any external embedder's
+/// origin scheme vanishingly unlikely and make the tag recognizable in a log.
+pub const PLUGIN_ORIGIN: u64 = 0xF377_0000_0000_0001;
+
 /// A minimal, public summary of a published entity handed to a plugin. Carries
 /// identity + display fields only — never body, never moderation/PII fields.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -61,12 +82,14 @@ pub trait ContentReader: Send + Sync {
 ///
 /// FEED-LOOP NOTE: a write here commits and therefore emits a `ChangeEvent`,
 /// which the action-hook bridge would otherwise re-dispatch — enabling a
-/// write→change→action→write loop. Breaking that loop requires correlating a
-/// write with its own `ChangeEvent`, which needs a token the engine does not yet
-/// surface at write time (see rhypedb#13). Until that lands, the composition root
-/// does NOT wire a `ContentWriter` in production (deny-by-default: an ungranted /
-/// un-backed `write_store` plugin fails to instantiate), so this surface is
-/// exercised only in isolation.
+/// `write→change→action→write` loop. That loop is broken by the write **origin**
+/// tag: the [`ContentWriter`] backend stamps every plugin write with
+/// [`PLUGIN_ORIGIN`], and the action-hook bridge subscribes with
+/// `exclude_origin = PLUGIN_ORIGIN`, so a plugin's own writes never reach an action
+/// hook (the regen loop keeps its unfiltered subscription and still prerenders
+/// them). With the guard in place the composition root DOES wire a `ContentWriter`
+/// in production; deny-by-default remains structural (an ungranted / un-backed
+/// `write_store` plugin fails to instantiate).
 pub trait ContentWriter: Send + Sync {
     /// Create a **draft** stub `Page` at `slug` with `title` and an empty body,
     /// returning its new object id. Used e.g. to auto-create a placeholder for a

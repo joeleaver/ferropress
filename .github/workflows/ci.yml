@@ -98,9 +98,10 @@ jobs:
   # Reference WASM plugins (Extism PDK) are EXCLUDED from the workspace, so the
   # --workspace jobs don't cover them. Lint + build them for wasm32, then run the
   # tests that LOAD the built wasm — the extism ABI conformance proofs (the
-  # plugin-host integration tests + the ferropress-http full-stack e2e for the
-  # custom-block renderer and the comment-moderation filter). These skip in the
-  # plain `test` job, where plugins aren't built.
+  # plugin-host integration tests, the ferropress-http full-stack e2e for the
+  # custom-block renderer and the comment-moderation filter, and the
+  # ferropress-server feed-loop e2e for content:write via the real bridge). These
+  # skip in the plain `test` job, where plugins aren't built.
   plugins-wasm:
     runs-on: ubuntu-latest
     steps:
@@ -126,6 +127,9 @@ jobs:
       - run: cargo run --manifest-path xtask/Cargo.toml -- build-plugins
       - run: cargo test -p ferropress-plugin-host
       - run: cargo test -p ferropress-http
+      # Full-stack feed-loop e2e: real store + PluginHost + HookBridge + backlink-index
+      # wasm (skips if not built — but build-plugins above builds it).
+      - run: cargo test -p ferropress-server
 
   # Portability boundary: ferropress-core must build entirely on its own, naming
   # ZERO external upstream (no rhypedb, no rinch, no jkbase). Building just this

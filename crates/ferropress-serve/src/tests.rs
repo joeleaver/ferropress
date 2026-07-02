@@ -89,6 +89,7 @@ fn change(kind: ChangeKind, id: ObjectId) -> Change {
         type_name: TypeName::from(POST_TYPE),
         object_id: id,
         fields: None,
+        origin: None,
     }
 }
 
@@ -323,6 +324,7 @@ async fn regen_evicts_cache_on_delete() {
         type_name: TypeName::from(POST_TYPE),
         object_id: id,
         fields: Some(serde_json::json!({ "slug": SLUG })),
+        origin: None,
     };
     engine.apply_change(&del).await.expect("evict on delete");
     assert!(
@@ -361,6 +363,7 @@ async fn regen_uses_slug_from_change_feed_without_reget() {
         type_name: TypeName::from(POST_TYPE),
         object_id: ObjectId(99_999),
         fields: Some(serde_json::json!({ "slug": SLUG })),
+        origin: None,
     };
     engine
         .apply_change(&change)
@@ -438,6 +441,7 @@ async fn live_regen_evicts_on_delete() {
 
 use crate::HookBridge;
 use crate::hook_bridge::{action_name, change_payload};
+use ferropress_core::ContentWriter;
 
 /// A [`HookDispatcher`] double that records every dispatched event and answers
 /// [`has_hooks`] from a fixed allow-set — so a test can both prove the gate and
@@ -480,6 +484,7 @@ fn change_of(kind: ChangeKind, type_name: &str, id: u64, version: u64) -> Change
         type_name: TypeName::from(type_name),
         object_id: ObjectId(id),
         fields: None,
+        origin: None,
     }
 }
 
@@ -520,6 +525,7 @@ fn change_payload_forwards_present_fields() {
         type_name: TypeName::from(POST_TYPE),
         object_id: ObjectId(9),
         fields: Some(serde_json::json!({ "title": "hi", "n": 42 })),
+        origin: None,
     };
 
     let payload = change_payload(&change);
@@ -603,4 +609,134 @@ async fn live_bridge_dispatches_action_on_change() {
     );
     assert_eq!(payload["type"], "Post");
     assert_eq!(payload["kind"], "update");
+}
+
+/// A [`HookDispatcher`] that, on each `post.created`/`post.updated` action, does a
+/// real `content:write`-style write (`set_meta`) via the injected [`ContentWriter`]
+/// — exactly what the backlink-index plugin does — and counts every dispatch. Used
+/// to prove the feed-loop guard.
+struct WriteOnActionDispatcher {
+    writer: Arc<dyn ContentWriter>,
+    post_id: u64,
+    dispatches: Mutex<u64>,
+}
+
+impl HookDispatcher for WriteOnActionDispatcher {
+    fn dispatch(&self, event: HookEvent) -> ferropress_core::error::Result<HookEvent> {
+        let seq = {
+            let mut n = self.dispatches.lock().unwrap();
+            *n += 1;
+            *n
+        };
+        // A plugin-style write on the SAME post. The ContentWriter impl stamps it
+        // with PLUGIN_ORIGIN, which the bridge's subscription excludes — so this
+        // write must NOT come back around as another action dispatch.
+        let _ = self.writer.set_meta(
+            POST_TYPE,
+            self.post_id,
+            "loop-test",
+            "touched",
+            serde_json::json!(seq),
+        );
+        Ok(event)
+    }
+    fn has_hooks(&self, name: &str) -> bool {
+        name == "post.created" || name == "post.updated"
+    }
+}
+
+/// THE feed-loop correctness proof (what rhypedb#13 unblocked): a write from an
+/// ACTION does not cause unbounded re-dispatch. A real `HookBridge` runs over a
+/// real store with a write-capable action; every external post update dispatches
+/// the action, which writes back via `content:write`. Because that write is stamped
+/// PLUGIN_ORIGIN and the bridge subscribes with `exclude_origin = PLUGIN_ORIGIN`,
+/// the action's OWN write never re-dispatches — so total dispatches can never exceed
+/// the number of external (untagged) updates. A broken guard would self-amplify past
+/// that bound and never quiesce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_capable_action_does_not_feed_loop() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let concrete = Arc::new(EmbeddedStore::open(tmp.path().join("db")).expect("open"));
+    let store: Arc<dyn RhypeStore> = concrete.clone();
+    let writer: Arc<dyn ContentWriter> = concrete.clone();
+
+    let id = seed_post(&store, SLUG, Status::Published).await;
+
+    let disp = Arc::new(WriteOnActionDispatcher {
+        writer,
+        post_id: id.0,
+        dispatches: Mutex::new(0),
+    });
+    let bridge = Arc::new(HookBridge::new(Arc::clone(&store), disp.clone()));
+    let run = Arc::clone(&bridge);
+    let handle = tokio::spawn(async move {
+        let _ = run.run().await;
+    });
+
+    // Drive EXTERNAL (untagged) updates until the action fires at least once — the
+    // same touch-loop the live-bridge test uses to dodge the subscribe race. Count
+    // every external update issued; each can dispatch the action at most once.
+    let mut external = 0u64;
+    let mut fired = false;
+    for i in 0..200u32 {
+        let mut patch: HashMap<String, Value> = HashMap::new();
+        patch.insert("title".to_owned(), Value::String(format!("touch {i}")));
+        store
+            .update(&TypeName::from(POST_TYPE), id, patch)
+            .await
+            .expect("touch update");
+        external += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if *disp.dispatches.lock().unwrap() >= 1 {
+            fired = true;
+            break;
+        }
+    }
+    assert!(fired, "the write-capable action must fire at least once");
+
+    // Quiesce: stop issuing external updates and let any (erroneous) self-dispatch
+    // propagate. With a broken guard the count would keep climbing here with no new
+    // external write; with the guard it holds steady. Wait for it to stabilize.
+    let mut last = *disp.dispatches.lock().unwrap();
+    let mut stable = 0u32;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let now = *disp.dispatches.lock().unwrap();
+        if now == last {
+            stable += 1;
+            if stable >= 4 {
+                break;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+    }
+    handle.abort();
+
+    let dispatches = *disp.dispatches.lock().unwrap();
+    // (a) the guard was actually exercised — an action ran and did a plugin write.
+    assert!(dispatches >= 1, "the action never dispatched");
+    // (b) THE PROOF: dispatches never exceed external updates. Each external
+    //     (untagged) update dispatches at most once; each plugin write is filtered
+    //     (PLUGIN_ORIGIN excluded) and adds ZERO dispatches. Self-amplification
+    //     would push this past `external`.
+    assert!(
+        dispatches <= external,
+        "feed loop detected: {dispatches} dispatches for only {external} external updates"
+    );
+    // (c) the plugin write REALLY landed (so (b) isn't vacuously true because the
+    //     write silently failed and emitted no event to filter): the action's meta
+    //     key is present on the post.
+    let obj = RhypeStore::get(store.as_ref(), &TypeName::from(POST_TYPE), id)
+        .await
+        .expect("get post");
+    let meta = match obj.get("meta") {
+        Some(Value::Json(serde_json::Value::Object(m))) => m.clone(),
+        other => panic!("meta must be a JSON object, got {other:?}"),
+    };
+    assert!(
+        meta.get("loop-test").is_some(),
+        "the action's content:write must have landed (else the guard is untested): {meta:?}"
+    );
 }

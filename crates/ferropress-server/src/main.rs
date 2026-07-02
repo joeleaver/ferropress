@@ -26,7 +26,9 @@ use uuid::Uuid;
 use ferropress_core::ports::{BlobStore, CertSource, Scheduler, SecretStore};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
-use ferropress_core::{Block, BlockKind, BlockTree, ContentReader, InlineRun, POST_TYPE, Status};
+use ferropress_core::{
+    Block, BlockKind, BlockTree, ContentReader, ContentWriter, InlineRun, POST_TYPE, Status,
+};
 
 use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_cert_acme::{AcmeCertSource, AcmeConfig};
@@ -65,12 +67,14 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let blobs = select_blob_store(&cfg);
     let scheduler = select_scheduler();
     let certs = select_cert_source(&cfg);
-    // The concrete store backs TWO ports. Coerce it to the synchronous
-    // `content:read` capability while it is still concrete, then re-bind `store`
-    // to the async data port the rest of the wiring uses. (`store.clone()` coerces
-    // on the result; `Arc::clone(&store)` would force `T = dyn …` and not unsize.)
+    // The concrete store backs THREE ports. Coerce it to the synchronous
+    // `content:read` and `content:write` capabilities while it is still concrete,
+    // then re-bind `store` to the async data port the rest of the wiring uses.
+    // (`store.clone()` coerces on the result; `Arc::clone(&store)` would force
+    // `T = dyn …` and not unsize.)
     let store = select_store(&cfg)?;
     let content_reader: Arc<dyn ContentReader> = store.clone();
+    let content_writer: Arc<dyn ContentWriter> = store.clone();
     let store: Arc<dyn RhypeStore> = store;
 
     // 2. Build the owned subsystems over the ports.
@@ -85,10 +89,18 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // the regen loop (`ServeEngine`) — so a plugin-rendered block is byte-for-byte
     // identical whichever path produced the page. (`Arc<PluginHost>` coerces to
     // `Arc<dyn CustomBlockRenderer>` at each call site.)
-    // The same concrete store (as `content_reader`) backs the synchronous
-    // `content:read` capability a plugin granted `read_store` reaches via
-    // `fp_lookup_slug`.
-    let mut plugins = PluginHost::new().with_content_reader(content_reader);
+    // The same concrete store backs the synchronous `content:read` capability a
+    // plugin granted `read_store` reaches via `fp_lookup_slug`, AND the
+    // `content:write` capability a plugin granted `write_store` reaches via
+    // `fp_create_page_stub` / `fp_set_meta`. content:write is safe to wire here
+    // because every plugin write is stamped with PLUGIN_ORIGIN and the action-hook
+    // bridge (spawned below) subscribes with `exclude_origin = PLUGIN_ORIGIN`, so a
+    // plugin's own writes never re-trigger an action (the feed-loop guard); the
+    // regen loop stays unfiltered and still prerenders them. Deny-by-default is
+    // structural: an ungranted plugin never gets the host functions.
+    let mut plugins = PluginHost::new()
+        .with_content_reader(content_reader)
+        .with_content_writer(content_writer);
     plugins
         .load_dir(&cfg.plugins_dir)
         .context("loading plugins")?;

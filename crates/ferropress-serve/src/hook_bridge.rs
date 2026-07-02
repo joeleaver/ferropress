@@ -27,6 +27,7 @@
 use std::sync::Arc;
 
 use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
+use ferropress_core::plugin_caps::PLUGIN_ORIGIN;
 use ferropress_core::query::{Change, ChangeKind, SubscribeFilter};
 use ferropress_core::store::RhypeStore;
 
@@ -48,13 +49,26 @@ impl HookBridge {
     /// The loop ends only when the change feed does (the store / process is going
     /// away). A per-change failure is logged inside [`dispatch_change`] and never
     /// tears the loop down.
+    ///
+    /// FEED-LOOP GUARD: the subscription **excludes [`PLUGIN_ORIGIN`]** so a
+    /// plugin's own writes (a `content:write` action's `set_meta` /
+    /// `create_page_stub`, all stamped with that origin) are dropped by the hub
+    /// before they reach an action hook — breaking the `write→change→action→write`
+    /// loop at the source. The regen loop deliberately does NOT exclude it, so
+    /// plugin writes still regenerate pages; only re-dispatch is suppressed.
     pub async fn run(&self) -> ferropress_core::error::Result<()> {
         // `tokio-stream`'s `StreamExt::next` drives the `BoxStream` (the concrete
         // `SubscriptionStream` is `Unpin`), mirroring the regen loop.
         use tokio_stream::StreamExt;
 
-        let mut stream = self.store.subscribe(SubscribeFilter::default()).await?;
-        tracing::info!("hook bridge subscribed to the change feed");
+        let filter = SubscribeFilter {
+            exclude_origin: Some(PLUGIN_ORIGIN),
+            ..SubscribeFilter::default()
+        };
+        let mut stream = self.store.subscribe(filter).await?;
+        tracing::info!(
+            "hook bridge subscribed to the change feed (excluding plugin-origin writes)"
+        );
 
         while let Some(change) = stream.next().await {
             self.dispatch_change(&change).await;
@@ -71,6 +85,15 @@ impl HookBridge {
     /// is ignored (actions observe) beyond logging a failure — one bad plugin must
     /// never break the feed.
     pub(crate) async fn dispatch_change(&self, change: &Change) {
+        // Belt-and-suspenders feed-loop guard: never dispatch an action for a
+        // plugin's OWN write. The `run` subscription already excludes PLUGIN_ORIGIN
+        // at the hub, so this is redundant on that path — but it also covers any
+        // caller that reaches `dispatch_change` with an unfiltered change, keeping
+        // the "a plugin write never re-triggers an action" invariant local to the
+        // dispatch itself.
+        if change.origin == Some(PLUGIN_ORIGIN) {
+            return;
+        }
         let name = action_name(change);
         if !self.hooks.has_hooks(&name) {
             return;

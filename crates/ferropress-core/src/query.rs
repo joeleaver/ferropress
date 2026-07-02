@@ -69,6 +69,14 @@ pub struct SubscribeFilter {
     pub object_id: Option<ObjectId>,
     /// Empty = all kinds.
     pub kinds: Vec<ChangeKind>,
+    /// Drop changes carrying this write [origin](Change::origin) (`None` = no
+    /// origin filter). This is the loop-breaker for a subscriber that also writes
+    /// in reaction to the feed: the action-hook bridge sets it to
+    /// [`PLUGIN_ORIGIN`](crate::plugin_caps::PLUGIN_ORIGIN) so a plugin's own
+    /// writes never re-trigger an action. An untagged change (`origin = None`) is
+    /// never excluded, so the regen loop (which leaves this `None`) still sees
+    /// every write.
+    pub exclude_origin: Option<u64>,
 }
 
 /// The kind of a change event (mirrors rhypedb `ChangeKind`).
@@ -97,4 +105,11 @@ pub struct Change {
     pub type_name: TypeName,
     pub object_id: ObjectId,
     pub fields: Option<serde_json::Value>,
+    /// The opaque write **origin** the mutating verb stamped on this change, or
+    /// `None` for an untagged (first-party) write. Ferropress stamps
+    /// [`PLUGIN_ORIGIN`](crate::plugin_caps::PLUGIN_ORIGIN) on plugin writes; the
+    /// action-hook bridge uses it (both via [`SubscribeFilter::exclude_origin`]
+    /// and a belt-and-suspenders check) to avoid re-dispatching a plugin's own
+    /// write. See [`PLUGIN_ORIGIN`](crate::plugin_caps::PLUGIN_ORIGIN).
+    pub origin: Option<u64>,
 }

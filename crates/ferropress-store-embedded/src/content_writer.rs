@@ -14,14 +14,18 @@
 //! `meta` write, so a `write_store` grant can't corrupt the content model.
 //!
 //! FEED-LOOP: a write here commits and emits a `ChangeEvent`; the action-hook
-//! bridge must not re-dispatch a plugin's own write (see rhypedb#13). This backend
-//! is therefore NOT wired into the production composition root until that guard
-//! exists — it is exercised only in isolation (deny-by-default holds: an un-backed
-//! `write_store` plugin fails to instantiate).
+//! bridge must not re-dispatch a plugin's own write. Every write this backend
+//! makes is therefore stamped with the [`PLUGIN_ORIGIN`] write origin (via the
+//! engine's `*_with_origin` verbs), and the bridge subscribes with
+//! `exclude_origin = PLUGIN_ORIGIN`, so a plugin's own writes are filtered off the
+//! hub before they reach an action hook (the regen loop keeps its unfiltered
+//! subscription and still prerenders them). With that guard the backend IS wired
+//! into the production composition root; deny-by-default still holds structurally
+//! (an un-backed `write_store` plugin fails to instantiate).
 
 use ferropress_core::block::BlockTree;
 use ferropress_core::error::{CoreError, Result as CoreResult};
-use ferropress_core::plugin_caps::ContentWriter;
+use ferropress_core::plugin_caps::{ContentWriter, PLUGIN_ORIGIN};
 use ferropress_core::query::Compare;
 use ferropress_core::value::{FieldMap, Value, now_millis};
 use ferropress_core::{PAGE_TYPE, POST_TYPE, Status};
@@ -62,9 +66,16 @@ impl ContentWriter for EmbeddedStore {
         fields.insert("block_tree".to_owned(), Value::Json(empty_body));
         fields.insert("created_at".to_owned(), Value::DateTime(now_millis()));
 
+        // Stamp the plugin write origin so this create can't loop back through the
+        // action-hook bridge (it excludes PLUGIN_ORIGIN); the regen loop, which does
+        // not exclude it, still prerenders the new stub.
         let obj = self
             .db()
-            .create(PAGE_TYPE, convert::to_db_fields(fields))
+            .create_with_origin(
+                PAGE_TYPE,
+                convert::to_db_fields(fields),
+                Some(PLUGIN_ORIGIN),
+            )
             .map_err(AdapterError::from)?;
         Ok(obj.id)
     }
@@ -123,8 +134,16 @@ impl ContentWriter for EmbeddedStore {
             "meta".to_owned(),
             Value::Json(serde_json::Value::Object(meta)),
         );
+        // Stamp the plugin write origin (see create_page_stub) so this meta write
+        // is filtered out of the action-hook bridge and can't re-trigger the very
+        // action that wrote it.
         self.db()
-            .update(type_name, id, convert::to_db_fields(patch))
+            .update_with_origin(
+                type_name,
+                id,
+                convert::to_db_fields(patch),
+                Some(PLUGIN_ORIGIN),
+            )
             .map_err(AdapterError::from)?;
         Ok(())
     }
@@ -250,6 +269,100 @@ mod tests {
         assert!(
             err.to_string().contains("not writable"),
             "expected a not-writable error, got: {err}"
+        );
+    }
+
+    /// The FEED-LOOP GUARD at the adapter layer: a `ContentWriter` (plugin) write
+    /// is stamped with [`PLUGIN_ORIGIN`] on the change feed, so a subscriber that
+    /// sets `exclude_origin = PLUGIN_ORIGIN` (the action-hook bridge) never receives
+    /// it, while an unfiltered subscriber (the regen loop) still does. Proven
+    /// deterministically — no "wait and see nothing" — by writing a second, EXTERNAL
+    /// (untagged) update right after the plugin write: the excluding stream's FIRST
+    /// delivered event is that external write, which can only be true if the plugin
+    /// write was dropped from it. The unfiltered stream sees BOTH, in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_writes_are_tagged_and_excludable_from_the_feed() {
+        use ferropress_core::plugin_caps::PLUGIN_ORIGIN;
+        use ferropress_core::query::{ChangeKind, SubscribeFilter};
+        use std::time::Duration;
+        use tokio_stream::StreamExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(EmbeddedStore::open(tmp.path().join("db")).expect("open"));
+
+        // Seed a published Post to write meta onto (created BEFORE subscribing, so
+        // the streams below start empty and carry only the two writes under test).
+        let mut fields: FieldMap = FieldMap::new();
+        fields.insert("slug".to_owned(), Value::String("target".to_owned()));
+        fields.insert("title".to_owned(), Value::String("Target".to_owned()));
+        fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+        fields.insert(
+            "status".to_owned(),
+            Value::String(Status::Published.as_str().to_owned()),
+        );
+        let id = RhypeStore::create(store.as_ref(), &TypeName::from(POST_TYPE), fields)
+            .await
+            .expect("seed post");
+
+        // Two live subscriptions, registered BEFORE either write (no subscribe race):
+        //   * `regen`  — unfiltered, like the ServeEngine regen loop: must see both.
+        //   * `bridge` — excludes PLUGIN_ORIGIN, like the HookBridge: must skip the
+        //                plugin write and see only the external one.
+        let mut regen = RhypeStore::subscribe(store.as_ref(), SubscribeFilter::default())
+            .await
+            .expect("regen subscribe");
+        let mut bridge = RhypeStore::subscribe(
+            store.as_ref(),
+            SubscribeFilter {
+                exclude_origin: Some(PLUGIN_ORIGIN),
+                ..SubscribeFilter::default()
+            },
+        )
+        .await
+        .expect("bridge subscribe");
+
+        // (1) A plugin write via the ContentWriter surface — stamped PLUGIN_ORIGIN.
+        store
+            .set_meta(POST_TYPE, id.0, "plug", "k", serde_json::json!(1))
+            .expect("plugin set_meta");
+        // (2) An EXTERNAL (first-party) write via the async data port — untagged.
+        let mut patch: FieldMap = FieldMap::new();
+        patch.insert("title".to_owned(), Value::String("external".to_owned()));
+        RhypeStore::update(store.as_ref(), &TypeName::from(POST_TYPE), id, patch)
+            .await
+            .expect("external update");
+
+        // Fail fast rather than hang the suite if delivery stalls.
+        async fn next_change(
+            s: &mut futures_core::stream::BoxStream<'static, ferropress_core::query::Change>,
+        ) -> ferropress_core::query::Change {
+            tokio::time::timeout(Duration::from_secs(5), s.next())
+                .await
+                .expect("a change must arrive within 5s")
+                .expect("the stream must not end")
+        }
+
+        // The unfiltered (regen) stream sees the plugin write FIRST (tagged), then
+        // the external write (untagged) — both, in commit order.
+        let r1 = next_change(&mut regen).await;
+        assert_eq!(r1.kind, ChangeKind::Update);
+        assert_eq!(r1.object_id, id);
+        assert_eq!(
+            r1.origin,
+            Some(PLUGIN_ORIGIN),
+            "the regen loop must see the plugin write, tagged with PLUGIN_ORIGIN"
+        );
+        let r2 = next_change(&mut regen).await;
+        assert_eq!(r2.origin, None, "and then the untagged external write");
+
+        // The excluding (bridge) stream DROPS the plugin write: its first delivered
+        // event is the external (untagged) write. The plugin write never re-triggers
+        // an action — this is the loop-breaker.
+        let b1 = next_change(&mut bridge).await;
+        assert_eq!(b1.object_id, id);
+        assert_eq!(
+            b1.origin, None,
+            "the bridge must skip the plugin write and receive only the external one"
         );
     }
 }

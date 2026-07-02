@@ -231,8 +231,9 @@ pub struct PluginHost {
     /// The `content:write` capability backend. `None` until injected via
     /// [`with_content_writer`](Self::with_content_writer); when absent, a plugin's
     /// `write_store` grant has no effect (the `fp_create_page_stub` / `fp_set_meta`
-    /// host functions are not wired, so deny-by-default holds). Production leaves
-    /// this unset until the change-feed loop guard lands (rhypedb#13).
+    /// host functions are not wired, so deny-by-default holds). Production DOES wire
+    /// this now that the feed-loop guard exists (plugin writes carry `PLUGIN_ORIGIN`
+    /// and the action-hook bridge excludes it — see [`with_content_writer`]).
     writer: Option<Arc<dyn ContentWriter>>,
 }
 
@@ -263,11 +264,14 @@ impl PluginHost {
     /// `fp_create_page_stub` / `fp_set_meta` host functions backed by it. MUST be
     /// set before [`load_dir`](Self::load_dir) / [`load_plugin`](Self::load_plugin).
     ///
-    /// ⚠️ A write from a plugin commits and emits a `ChangeEvent`, which the
-    /// action-hook bridge would re-dispatch — a `write→change→action→write` loop.
-    /// Do NOT wire this in a deployment that also runs the action-hook bridge until
-    /// the feed-loop guard exists (needs a write-origin token on the feed —
-    /// rhypedb#13). It is safe to wire in isolation (e.g. tests) where no bridge runs.
+    /// A write from a plugin commits and emits a `ChangeEvent`, which the
+    /// action-hook bridge would otherwise re-dispatch — a `write→change→action→write`
+    /// loop. That loop is broken by the write-origin guard: the `ContentWriter`
+    /// backend stamps every plugin write with
+    /// [`PLUGIN_ORIGIN`](ferropress_core::plugin_caps::PLUGIN_ORIGIN) and the bridge
+    /// subscribes with `exclude_origin = PLUGIN_ORIGIN`, so a plugin's own writes are
+    /// filtered off the hub before they reach an action. It is therefore safe to wire
+    /// this in production alongside the bridge (the composition root does).
     pub fn with_content_writer(mut self, writer: Arc<dyn ContentWriter>) -> Self {
         self.writer = Some(writer);
         self
@@ -398,8 +402,8 @@ impl PluginHost {
         // backed by the injected `ContentWriter`. Same deny-by-default posture as
         // read_store: if the backend is unwired, the host functions are absent and a
         // `write_store` plugin fails to instantiate (rather than silently granting
-        // nothing). Production leaves the writer unwired until the feed-loop guard
-        // lands (rhypedb#13), so this branch is a no-op there by design.
+        // nothing). Production DOES wire the writer now that the feed-loop guard
+        // exists (plugin writes carry PLUGIN_ORIGIN; the action bridge excludes it).
         if capabilities.write_store {
             match &self.writer {
                 Some(writer) => {
