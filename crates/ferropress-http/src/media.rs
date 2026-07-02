@@ -38,19 +38,22 @@ use axum::response::{IntoResponse, Response};
 
 use ferropress_core::MEDIA_TYPE;
 use ferropress_core::error::CoreError;
+use ferropress_core::is_media_token;
 use ferropress_core::ports::BlobKey;
-use ferropress_core::value::{ObjectId, TypeName, Value};
+use ferropress_core::query::{Compare, FilterSpec};
+use ferropress_core::value::{TypeName, Value};
 
 use crate::AppState;
 
-/// `GET /media/{id}` — the media original's bytes with its stored `Content-Type`.
+/// `GET /media/{token}` — the media original's bytes with its stored `Content-Type`.
 ///
-/// A missing `Media` row, a row without a `blob_key`, or missing blob bytes all map
-/// to 404 (an id that resolves to nothing is "not found", not an error). A genuine
-/// backend fault is logged and returned as a generic 500. Each media id is immutable
-/// (a new upload is a new id), so the bytes carry a long, `immutable` cache lifetime.
-pub async fn serve(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
-    match load(&state, id).await {
+/// `token` is the `Media.uuid` (unguessable, so URLs aren't enumerable). A malformed
+/// token, a missing `Media` row, a row without a `blob_key`, or missing blob bytes all
+/// map to 404 (a token that resolves to nothing is "not found", not an error). A
+/// genuine backend fault is logged and returned as a generic 500. Each media reference
+/// is immutable (a new upload is a new uuid), so bytes carry a long `immutable` cache.
+pub async fn serve(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    match load(&state, &token).await {
         Ok(Some((bytes, mime))) => (
             StatusCode::OK,
             [
@@ -66,22 +69,35 @@ pub async fn serve(State(state): State<AppState>, Path(id): Path<u64>) -> Respon
         Ok(None) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
         Err(e) => {
             // Log the real cause; return a generic body so internals never leak.
-            tracing::error!(media_id = id, error = %e, "media serve failed");
+            tracing::error!(media_token = %token, error = %e, "media serve failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
         }
     }
 }
 
-/// Resolve a media id to `(bytes, mime_type)`, or `None` if it names nothing.
-async fn load(state: &AppState, id: u64) -> Result<Option<(Vec<u8>, String)>, CoreError> {
-    let obj = match state
+/// Resolve a media reference token (a `Media.uuid`) to `(bytes, mime_type)`, or `None`
+/// if it names nothing.
+async fn load(state: &AppState, token: &str) -> Result<Option<(Vec<u8>, String)>, CoreError> {
+    // A token failing the charset check can't be any real uuid → 404 without a query.
+    if !is_media_token(token) {
+        return Ok(None);
+    }
+
+    // `Media.uuid` is `@unique @indexed`; the single-predicate filter is the engine's
+    // fast path. (There is no by-uuid `get`; identity `get` is by object id.)
+    let hits = state
         .store
-        .get(&TypeName::from(MEDIA_TYPE), ObjectId(id))
-        .await
-    {
-        Ok(obj) => obj,
-        Err(CoreError::NotFound { .. }) => return Ok(None),
-        Err(e) => return Err(e),
+        .filter(FilterSpec {
+            type_name: TypeName::from(MEDIA_TYPE),
+            field: "uuid".to_owned(),
+            op: Compare::Eq,
+            value: Value::String(token.to_owned()),
+            limit: Some(1),
+        })
+        .await?;
+    let obj = match hits.into_iter().next() {
+        Some(obj) => obj,
+        None => return Ok(None),
     };
 
     let blob_key = match obj.get("blob_key") {

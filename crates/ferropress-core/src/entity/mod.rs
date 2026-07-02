@@ -31,7 +31,9 @@ pub mod taxonomy;
 pub mod user;
 
 pub use comment::Comment;
-pub use media::{MEDIA_ID_ATTR, MEDIA_URL_PREFIX, Media, media_id_from_url, media_url};
+pub use media::{
+    MEDIA_ID_ATTR, MEDIA_URL_PREFIX, Media, is_media_token, media_token_from_url, media_url,
+};
 pub use menu::{LinkTarget, Menu, MenuItem};
 pub use page::Page;
 pub use post::Post;

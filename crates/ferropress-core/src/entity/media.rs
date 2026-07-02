@@ -17,22 +17,34 @@ use crate::value::ObjectId;
 /// follows.
 pub const MEDIA_URL_PREFIX: &str = "/media/";
 
-/// The HTML attribute the pure renderer emits carrying a media id (the image ships
-/// `src`-less, since the renderer has no DB to resolve a URL). The serve layer
-/// rewrites it into a real `src`; naming it here keeps the emitter
+/// The HTML attribute the pure renderer emits carrying a media reference token (the
+/// image ships `src`-less, since the renderer has no DB to resolve a URL). The serve
+/// layer rewrites it into a real `src`; naming it here keeps the emitter
 /// (`ferropress-render`) and the rewriter (`ferropress-serve`) in lockstep.
 pub const MEDIA_ID_ATTR: &str = "data-media-id";
 
-/// The public URL for a media original by id: `"/media/{id}"`. The inverse is
-/// [`media_id_from_url`].
-pub fn media_url(id: u64) -> String {
-    format!("{MEDIA_URL_PREFIX}{id}")
+/// The public URL for a media original by its reference token (a `Media.uuid`):
+/// `"/media/{token}"`. The inverse is [`media_token_from_url`].
+pub fn media_url(token: &str) -> String {
+    format!("{MEDIA_URL_PREFIX}{token}")
 }
 
-/// Recover the media id from a [`media_url`], or `None` if `src` is not one (e.g. an
-/// external image URL or a malformed id). The inverse of [`media_url`].
-pub fn media_id_from_url(src: &str) -> Option<u64> {
-    src.strip_prefix(MEDIA_URL_PREFIX)?.parse().ok()
+/// Whether `s` is a valid media reference token: a single URL path segment of
+/// `[0-9a-fA-F-]` (a `uuid`), non-empty and ≤ 64 chars. Restricting the charset is
+/// what makes the token SAFE to interpolate into an HTML attribute / URL — a token
+/// can never carry markup or a path separator — so a hand-crafted `block_tree` can't
+/// smuggle an XSS payload through the image placeholder, and the serve rewrite / media
+/// route can trust anything that passes this.
+pub fn is_media_token(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// Recover the media reference token from a [`media_url`], or `None` if `src` is not a
+/// well-formed media URL (wrong prefix, or a token failing [`is_media_token`] — e.g. an
+/// externally-pasted image URL). The inverse of [`media_url`].
+pub fn media_token_from_url(src: &str) -> Option<&str> {
+    let token = src.strip_prefix(MEDIA_URL_PREFIX)?;
+    is_media_token(token).then_some(token)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,23 +76,34 @@ pub struct Media {
 
 #[cfg(test)]
 mod tests {
-    use super::{MEDIA_URL_PREFIX, media_id_from_url, media_url};
+    use super::{MEDIA_URL_PREFIX, is_media_token, media_token_from_url, media_url};
 
     #[test]
-    fn media_url_round_trips_through_id() {
-        for id in [0u64, 1, 42, u64::MAX] {
-            let url = media_url(id);
+    fn media_url_round_trips_through_token() {
+        for token in ["1", "42", "018f3c2a-7b19-7c44-9e0d-2a1f6b8e5d90"] {
+            let url = media_url(token);
             assert!(url.starts_with(MEDIA_URL_PREFIX));
-            assert_eq!(media_id_from_url(&url), Some(id));
+            assert_eq!(media_token_from_url(&url), Some(token));
         }
     }
 
     #[test]
     fn non_media_srcs_yield_none() {
-        assert_eq!(media_id_from_url("fp-media:42"), None); // the retired scheme
-        assert_eq!(media_id_from_url("https://example.com/cat.png"), None);
-        assert_eq!(media_id_from_url("/media/"), None); // no id
-        assert_eq!(media_id_from_url("/media/not-a-number"), None);
-        assert_eq!(media_id_from_url("/mediaX/1"), None); // prefix must match exactly
+        assert_eq!(media_token_from_url("fp-media:42"), None); // the retired scheme
+        assert_eq!(media_token_from_url("https://example.com/cat.png"), None);
+        assert_eq!(media_token_from_url("/media/"), None); // no token
+        assert_eq!(media_token_from_url("/mediaX/1"), None); // prefix must match exactly
+    }
+
+    #[test]
+    fn token_charset_is_restricted_to_uuid_shape() {
+        assert!(is_media_token("018f3c2a-7b19-7c44-9e0d-2a1f6b8e5d90"));
+        assert!(is_media_token("42"));
+        assert!(!is_media_token("")); // empty
+        assert!(!is_media_token("a/b")); // path separator
+        assert!(!is_media_token("\"><script>")); // markup can never be a token
+        assert!(!is_media_token(&"a".repeat(65))); // over the length cap
+        // A crafted src whose "token" carries markup is rejected outright.
+        assert_eq!(media_token_from_url("/media/\"><script>"), None);
     }
 }

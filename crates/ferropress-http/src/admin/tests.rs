@@ -756,7 +756,8 @@ async fn media_upload_then_serve_roundtrips() {
     assert_eq!(resp.status(), StatusCode::OK, "upload should succeed");
     let up = to_json(resp).await;
     let id = up["id"].as_u64().expect("upload returns an id");
-    assert_eq!(up["url"], format!("/media/{id}"), "url is the served path");
+    let url = up["url"].as_str().expect("upload returns a url").to_owned();
+    assert!(url.starts_with("/media/"), "url is the served path: {url}");
     assert_eq!(up["mime_type"], "image/png");
     assert_eq!(up["width"], 1);
     assert_eq!(up["height"], 1);
@@ -775,6 +776,17 @@ async fn media_upload_then_serve_roundtrips() {
         "slug is derived from the filename stem: {:?}",
         obj.get("slug")
     );
+    // The public URL is keyed by the unguessable uuid, NOT the sequential object id.
+    let uuid = match obj.get("uuid") {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("media uuid must be a string, got {other:?}"),
+    };
+    assert_eq!(url, format!("/media/{uuid}"), "url is keyed by the uuid");
+    assert_ne!(
+        url,
+        format!("/media/{id}"),
+        "url must NOT be the sequential id"
+    );
 
     // Attributed to its uploader via the `uploaded_by` relation.
     let links = store
@@ -790,11 +802,8 @@ async fn media_upload_then_serve_roundtrips() {
         "media must be attributed to its uploader {jane:?}: {links:?}"
     );
 
-    // GET /media/{id} is PUBLIC (no cookie) and returns the exact bytes + content-type.
-    let req = Request::builder()
-        .uri(format!("/media/{id}"))
-        .body(Body::empty())
-        .unwrap();
+    // GET /media/{uuid} is PUBLIC (no cookie) and returns the exact bytes + content-type.
+    let req = Request::builder().uri(&url).body(Body::empty()).unwrap();
     let resp = router(state).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(

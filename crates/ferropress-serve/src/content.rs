@@ -352,10 +352,12 @@ pub(crate) fn render_object(
 /// leading fast-path check makes the common (image-less) page free.
 ///
 /// Robustness: the needle anchors on the renderer's exact opener `<img data-media-id="`
-/// (the id is the FIRST attribute). This literal cannot appear inside an attribute
+/// (the token is the FIRST attribute). This literal cannot appear inside an attribute
 /// VALUE — any `"` there is escaped to `&quot;` — so the match only ever lands on a
-/// real image tag. A malformed match (non-numeric id / no closing quote, which the
-/// renderer never emits) is copied through unchanged.
+/// real image tag. The value is only rewritten if it passes
+/// [`ferropress_core::is_media_token`] (a uuid-shaped token); a hand-crafted non-token
+/// value (which the renderer already attribute-escaped) is copied through with NO `src`,
+/// so it can neither be fetched nor inject markup.
 fn rewrite_media_srcs(html: &str) -> String {
     let needle = MEDIA_IMG_NEEDLE.as_str();
     if !html.contains(needle) {
@@ -366,27 +368,28 @@ fn rewrite_media_srcs(html: &str) -> String {
     while let Some(pos) = rest.find(needle) {
         let after = pos + needle.len();
         let tail = &rest[after..];
-        // The id runs to the closing quote; the renderer only ever emits a u64 there.
+        // The token runs to the closing quote. A valid token is uuid-shaped, so it is
+        // unaffected by attribute-escaping (it equals its raw form here).
         match tail.find('"') {
-            Some(q) if tail[..q].parse::<u64>().is_ok() => {
-                // `id` is already the normalized u64 text sitting in the HTML, so we
-                // reuse it verbatim: `MEDIA_URL_PREFIX + id` == `media_url(id)` with no
-                // per-image allocation.
-                let id = &tail[..q];
+            Some(q) if ferropress_core::is_media_token(&tail[..q]) => {
+                // The token already sits in the HTML, so reuse it verbatim:
+                // `MEDIA_URL_PREFIX + token` == `media_url(token)` with no allocation.
+                let token = &tail[..q];
                 out.push_str(&rest[..pos]);
                 out.push_str("<img src=\"");
                 out.push_str(ferropress_core::MEDIA_URL_PREFIX);
-                out.push_str(id);
+                out.push_str(token);
                 out.push_str("\" ");
                 out.push_str(ferropress_core::MEDIA_ID_ATTR);
                 out.push_str("=\"");
-                out.push_str(id);
+                out.push_str(token);
                 out.push('"');
                 rest = &tail[q + 1..];
             }
             _ => {
-                // Not the renderer's shape — copy through and advance past the needle
-                // so the loop always makes progress.
+                // Not a valid media token — copy through and advance past the needle so
+                // the loop always makes progress (no `src` added; escaping already
+                // neutralized any crafted value).
                 out.push_str(&rest[..after]);
                 rest = tail;
             }
@@ -408,50 +411,68 @@ mod media_rewrite_tests {
     use ferropress_core::{Block, BlockKind, BlockTree};
     use ferropress_render::{NoCustomBlocks, RenderMode, render_with};
 
+    fn image(media: &str, alt: &str) -> Block {
+        Block {
+            uid: media.to_owned(),
+            kind: BlockKind::Image {
+                media: media.to_owned(),
+                alt: alt.to_owned(),
+            },
+            children: vec![],
+        }
+    }
+
     #[test]
     fn adds_src_to_the_renderers_image_output() {
         // Drive the REAL renderer so the rewrite is tested against its actual markup,
         // not a hand-written string that could drift from the emitter.
-        let tree = BlockTree::from_blocks(vec![Block {
-            uid: "x".to_owned(),
-            kind: BlockKind::Image {
-                media_id: 7,
-                alt: "a proof".to_owned(),
-            },
-            children: vec![],
-        }]);
+        let token = "018f3c2a-7b19-7c44-9e0d-2a1f6b8e5d90";
+        let tree = BlockTree::from_blocks(vec![image(token, "a proof")]);
         let html = render_with(&tree, RenderMode::Publish, &NoCustomBlocks).into_string();
         assert!(!html.contains("src="), "sanity: renderer emits no src");
 
         let out = rewrite_media_srcs(&html);
-        assert!(out.contains("src=\"/media/7\""), "got: {out}");
         assert!(
-            out.contains("data-media-id=\"7\""),
-            "id attr is preserved: {out}"
+            out.contains(&format!("src=\"/media/{token}\"")),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(&format!("data-media-id=\"{token}\"")),
+            "token attr is preserved: {out}"
         );
         assert!(out.contains("alt=\"a proof\""));
     }
 
     #[test]
     fn rewrites_multiple_images() {
-        let img = |id: u64| Block {
-            uid: id.to_string(),
-            kind: BlockKind::Image {
-                media_id: id,
-                alt: String::new(),
-            },
-            children: vec![],
-        };
-        let tree = BlockTree::from_blocks(vec![img(1), img(22)]);
+        let tree = BlockTree::from_blocks(vec![image("aa11", ""), image("bb22", "")]);
         let html = render_with(&tree, RenderMode::Publish, &NoCustomBlocks).into_string();
         let out = rewrite_media_srcs(&html);
-        assert!(out.contains("src=\"/media/1\""), "got: {out}");
-        assert!(out.contains("src=\"/media/22\""), "got: {out}");
+        assert!(out.contains("src=\"/media/aa11\""), "got: {out}");
+        assert!(out.contains("src=\"/media/bb22\""), "got: {out}");
     }
 
     #[test]
     fn passes_image_free_html_through_untouched() {
         let html = "<p>no images here — data-media-id is just text</p>";
         assert_eq!(rewrite_media_srcs(html), html);
+    }
+
+    #[test]
+    fn a_crafted_non_token_media_value_is_escaped_and_never_gets_a_src() {
+        // A hand-crafted block_tree with a markup payload where the uuid should be: the
+        // renderer must attribute-escape it (no raw tag reaches the page) AND the rewrite
+        // must refuse to give it a src (it isn't a valid media token).
+        let tree = BlockTree::from_blocks(vec![image("\"><script>alert(1)</script>", "x")]);
+        let html = render_with(&tree, RenderMode::Publish, &NoCustomBlocks).into_string();
+        let out = rewrite_media_srcs(&html);
+        assert!(
+            !out.contains("<script>"),
+            "payload must be escaped, not live: {out}"
+        );
+        assert!(
+            !out.contains("src="),
+            "a non-token value must not get a src: {out}"
+        );
     }
 }

@@ -127,7 +127,10 @@ pub enum BlockKind {
         runs: Vec<InlineRun>,
     },
     Image {
-        media_id: u64,
+        /// The referenced `Media`'s `uuid` (its unguessable, stable public handle) —
+        /// NOT the sequential object id, so `/media/{media}` URLs aren't enumerable.
+        /// A single URL-safe path segment; see [`crate::is_media_token`].
+        media: String,
         alt: String,
     },
     Quote {
@@ -233,7 +236,7 @@ mod tests {
             ),
             block(
                 BlockKind::Image {
-                    media_id: 3,
+                    media: "a-cat-uuid".to_owned(),
                     alt: "a cat".to_owned(),
                 },
                 vec![],

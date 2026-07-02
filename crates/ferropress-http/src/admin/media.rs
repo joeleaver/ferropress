@@ -167,7 +167,7 @@ pub async fn upload(
 
     let now = now_millis();
     let mut fields: FieldMap = HashMap::new();
-    fields.insert("uuid".to_owned(), Value::String(uuid));
+    fields.insert("uuid".to_owned(), Value::String(uuid.clone()));
     fields.insert("slug".to_owned(), Value::String(slug));
     fields.insert("filename".to_owned(), Value::String(filename));
     fields.insert("mime_type".to_owned(), Value::String(mime.to_owned()));
@@ -223,7 +223,8 @@ pub async fn upload(
 
     Ok(Json(UploadResponse {
         id: id.0,
-        url: media_url(id.0),
+        // The public URL is keyed by the unguessable uuid, NOT the sequential id.
+        url: media_url(&uuid),
         width,
         height,
         mime_type: mime.to_owned(),

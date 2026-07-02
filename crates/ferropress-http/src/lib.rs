@@ -173,8 +173,9 @@ pub async fn serve(state: AppState, addr: SocketAddr) -> ferropress_core::error:
 /// via [`ServeDir`].
 pub fn router(state: AppState) -> Router {
     // The media route is built from the shared URL prefix so it can never drift from
-    // `ferropress_core::media_url` (what the serve rewrite + editor emit).
-    let media_route = format!("{}{{id}}", ferropress_core::MEDIA_URL_PREFIX);
+    // `ferropress_core::media_url` (what the serve rewrite + editor emit). `{token}` is
+    // the `Media.uuid`.
+    let media_route = format!("{}{{token}}", ferropress_core::MEDIA_URL_PREFIX);
     let mut app = Router::new()
         .route("/healthz", get(healthz))
         // Island API: the rhypedb-backed JSON endpoints the public-site islands

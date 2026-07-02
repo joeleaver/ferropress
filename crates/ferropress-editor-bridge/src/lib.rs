@@ -230,9 +230,9 @@ fn block_to_doc(block: &Block) -> DocNode {
         }
 
         // `image` is an INLINE atom; wrap it in a paragraph to be a valid `doc` child.
-        BlockKind::Image { media_id, alt } => {
+        BlockKind::Image { media, alt } => {
             let mut a = BTreeMap::new();
-            a.insert("src".to_owned(), JsonAttr::Str(media_src(*media_id)));
+            a.insert("src".to_owned(), JsonAttr::Str(media_src(media)));
             a.insert("alt".to_owned(), JsonAttr::Str(alt.clone()));
             let image = DocNode {
                 node_type: "image".to_owned(),
@@ -299,8 +299,8 @@ fn simple_mark(name: &str) -> Option<&'static str> {
     }
 }
 
-fn media_src(media_id: u64) -> String {
-    ferropress_core::media_url(media_id)
+fn media_src(media: &str) -> String {
+    ferropress_core::media_url(media)
 }
 
 /// Park a non-prose block's JSON in a `code_block` under a reserved `language`
@@ -325,7 +325,7 @@ fn doc_node_to_block(node: &DocNode) -> Option<Block> {
     let kind = match node.node_type.as_str() {
         "paragraph" => match lone_image(&node.content) {
             Some(img) => BlockKind::Image {
-                media_id: parse_media_id(&attr_str(img, "src")),
+                media: parse_media_ref(&attr_str(img, "src")),
                 alt: attr_str(img, "alt"),
             },
             None => BlockKind::Paragraph {
@@ -509,12 +509,14 @@ fn revive_custom(source: &str) -> Option<Block> {
     ))
 }
 
-/// Recover a media id from an image node's `src`. A `src` that isn't a media URL
-/// (e.g. an externally-pasted image the model can't represent) yields `0` — the
-/// same "no media" sentinel the previous scheme used, so unmappable images collapse
-/// to id 0 rather than corrupting a neighbour.
-fn parse_media_id(src: &str) -> u64 {
-    ferropress_core::media_id_from_url(src).unwrap_or(0)
+/// Recover a media reference token from an image node's `src`. A `src` that isn't a
+/// media URL (e.g. an externally-pasted image the model can't represent) yields an
+/// empty string — "no media" — so an unmappable image collapses to a blank ref rather
+/// than corrupting a neighbour.
+fn parse_media_ref(src: &str) -> String {
+    ferropress_core::media_token_from_url(src)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn new_block(kind: BlockKind, children: Vec<Block>) -> Block {
@@ -705,10 +707,10 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_image_via_media_src_scheme() {
+    fn round_trips_image_via_media_url_scheme() {
         let tree = BlockTree::from_blocks(vec![blk(
             BlockKind::Image {
-                media_id: 42,
+                media: "018f3c2a-7b19-7c44-9e0d-2a1f6b8e5d90".to_owned(),
                 alt: "a proof on paper".to_owned(),
             },
             vec![],
@@ -770,7 +772,7 @@ mod tests {
                 source: String::new(),
             },
             BlockKind::Image {
-                media_id: 1,
+                media: "1".to_owned(),
                 alt: String::new(),
             },
             BlockKind::Embed {
