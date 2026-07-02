@@ -51,10 +51,10 @@ pub trait ContentReader: Send + Sync {
 ///
 /// Security posture: this is NOT "create any type with any fields." A plugin can
 /// only (a) create a *stub Page* (a draft placeholder — never published, so it
-/// can't be used to publish arbitrary content), and (b) set ONE key inside an
-/// object's `meta` JSON (never a core/indexed field like `slug`/`status`, so a
-/// plugin can't corrupt the content model or escalate). This keeps the blast
-/// radius of a write grant small and reviewable.
+/// can't be used to publish arbitrary content), and (b) set ONE key inside its OWN
+/// namespaced sub-object of an object's `meta` JSON (never a core/indexed field
+/// like `slug`/`status`, so a plugin can't corrupt the content model or escalate).
+/// This keeps the blast radius of a write grant small and reviewable.
 ///
 /// Synchronous (see the module docs): implemented by the embedded store adapter
 /// directly over the engine; injected at the composition root.
@@ -76,11 +76,20 @@ pub trait ContentWriter: Send + Sync {
     /// existing id rather than create a duplicate.
     fn create_page_stub(&self, slug: &str, title: &str) -> Result<u64>;
 
-    /// Set a single `key` inside object `(type_name, id)`'s `meta` JSON object to
-    /// `value` (read-modify-write on the `meta` field only). Every other field is
-    /// untouched. Used e.g. by a backlink indexer to record "pages that link
-    /// here" on a target page. The host namespaces `key` under the calling
-    /// plugin's id so plugins can't clobber each other's (or core) meta.
-    fn set_meta(&self, type_name: &str, id: u64, key: &str, value: serde_json::Value)
-    -> Result<()>;
+    /// Set a single `key` inside object `(type_name, id)`'s `meta` JSON, scoped to
+    /// the `namespace` sub-object — i.e. `meta[namespace][key] = value`
+    /// (read-modify-write on the `meta` field only; every other field is untouched).
+    /// The host passes the CALLING PLUGIN's id as `namespace`, and the value is
+    /// nested one level UNDER it (not string-joined), so a plugin can only ever
+    /// mutate its own sub-object: cross-plugin (or core) meta is structurally
+    /// unforgeable regardless of what characters appear in the id or key. Used e.g.
+    /// by a backlink indexer to record "pages that link here" on a target page.
+    fn set_meta(
+        &self,
+        type_name: &str,
+        id: u64,
+        namespace: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<()>;
 }

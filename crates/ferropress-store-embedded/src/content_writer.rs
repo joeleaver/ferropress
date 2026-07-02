@@ -73,6 +73,7 @@ impl ContentWriter for EmbeddedStore {
         &self,
         type_name: &str,
         id: u64,
+        namespace: &str,
         key: &str,
         value: serde_json::Value,
     ) -> CoreResult<()> {
@@ -84,21 +85,38 @@ impl ContentWriter for EmbeddedStore {
                 "set_meta: type `{type_name}` is not writable (only {POST_TYPE}/{PAGE_TYPE})"
             )));
         }
-        if key.is_empty() {
+        if namespace.is_empty() || key.is_empty() {
             return Err(CoreError::Store(
-                "set_meta: key must not be empty".to_owned(),
+                "set_meta: namespace and key must not be empty".to_owned(),
             ));
         }
 
+        // Serialize the read-modify-write: two concurrent set_meta calls to the same
+        // object each read the whole `meta`, edit their sub-object, and write it all
+        // back — without this a second writer's namespace could be lost. Recover a
+        // poisoned lock (a panicked prior write must not wedge all future writes).
+        let _guard = self
+            .meta_write_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // Read-modify-write the `meta` JSON object ONLY. Every other field is left
-        // untouched, so a plugin can't reach a core/indexed field through here.
+        // untouched, so a plugin can't reach a core/indexed field through here. The
+        // value is nested under `meta[namespace][key]` — one level UNDER the caller's
+        // namespace, never string-joined — so a plugin can only ever mutate its own
+        // sub-object and cross-plugin/core keys are structurally unforgeable.
         let obj =
             convert::from_db_object(self.db().get(type_name, id).map_err(AdapterError::from)?);
         let mut meta = match obj.get("meta") {
             Some(Value::Json(serde_json::Value::Object(m))) => m.clone(),
             _ => serde_json::Map::new(),
         };
-        meta.insert(key.to_owned(), value);
+        let mut ns = match meta.get(namespace) {
+            Some(serde_json::Value::Object(m)) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        ns.insert(key.to_owned(), value);
+        meta.insert(namespace.to_owned(), serde_json::Value::Object(ns));
 
         let mut patch: FieldMap = FieldMap::new();
         patch.insert(
@@ -170,11 +188,12 @@ mod tests {
             .await
             .expect("seed post");
 
-        // Set a meta key.
+        // Set a meta key under the plugin's namespace.
         store
             .set_meta(
                 POST_TYPE,
                 id.0,
+                "plug-a",
                 "backlinks",
                 serde_json::json!(["/a", "/b"]),
             )
@@ -182,8 +201,19 @@ mod tests {
 
         // Merge a SECOND key — the first must survive (read-modify-write, not replace).
         store
-            .set_meta(POST_TYPE, id.0, "note", serde_json::json!("hi"))
+            .set_meta(POST_TYPE, id.0, "plug-a", "note", serde_json::json!("hi"))
             .expect("set_meta 2");
+
+        // A DIFFERENT plugin writing the SAME key must NOT collide (separate sub-object).
+        store
+            .set_meta(
+                POST_TYPE,
+                id.0,
+                "plug-b",
+                "backlinks",
+                serde_json::json!(["/z"]),
+            )
+            .expect("set_meta 3");
 
         let obj = RhypeStore::get(store.as_ref(), &TypeName::from(POST_TYPE), id)
             .await
@@ -192,11 +222,16 @@ mod tests {
             Some(Value::Json(serde_json::Value::Object(m))) => m.clone(),
             other => panic!("meta must be a JSON object, got {other:?}"),
         };
+        // plug-a's sub-object holds BOTH of its keys.
         assert_eq!(
-            meta.get("backlinks"),
-            Some(&serde_json::json!(["/a", "/b"]))
+            meta.get("plug-a"),
+            Some(&serde_json::json!({ "backlinks": ["/a", "/b"], "note": "hi" }))
         );
-        assert_eq!(meta.get("note"), Some(&serde_json::json!("hi")));
+        // plug-b's same-named key lives in its OWN sub-object — no clobber.
+        assert_eq!(
+            meta.get("plug-b"),
+            Some(&serde_json::json!({ "backlinks": ["/z"] }))
+        );
         // Core fields untouched.
         assert!(matches!(obj.get("slug"), Some(Value::String(s)) if s == "target"));
         assert!(
@@ -210,7 +245,7 @@ mod tests {
         let store = Arc::new(EmbeddedStore::open(tmp.path().join("db")).expect("open"));
         // User carries a meta field, but the tight surface refuses it.
         let err = store
-            .set_meta("User", 1, "x", serde_json::json!(1))
+            .set_meta("User", 1, "ns", "x", serde_json::json!(1))
             .unwrap_err();
         assert!(
             err.to_string().contains("not writable"),

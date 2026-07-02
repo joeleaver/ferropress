@@ -603,8 +603,9 @@ host_fn!(fp_lookup_slug(user_data: Arc<dyn ContentReader>; slug: String) -> Stri
 });
 
 // The `content:write` capability's UserData: the injected [`ContentWriter`] plus
-// the CALLING plugin's id, so the host can namespace every `meta` key under the
-// plugin (a plugin can't clobber another plugin's — or core — meta).
+// the CALLING plugin's id, which the host passes as the `meta` NAMESPACE so every
+// write nests under `meta[plugin_id]` — a plugin can't clobber another plugin's
+// (or core) meta, and forging is structurally impossible (no string-joined key).
 struct WriteBackend {
     writer: Arc<dyn ContentWriter>,
     plugin_id: String,
@@ -635,11 +636,11 @@ host_fn!(fp_create_page_stub(user_data: WriteBackend; req: String) -> String {
 });
 
 // `fp_set_meta` (the `content:write` capability). The guest passes a JSON request
-// `{"type","id","key","value"}`; the host namespaces `key` under the calling
-// plugin's id and sets that one key inside the object's `meta` JSON. Returns the
-// JSON literal `true` on success, `false` on any failure/denial (malformed
-// request, non-Post/Page type, engine error). Wired only under `write_store` with
-// a backend present.
+// `{"type","id","key","value"}`; the host sets that key inside the object's `meta`
+// JSON UNDER the calling plugin's namespace (`meta[plugin_id][key] = value`), so a
+// plugin can only ever touch its own sub-object. Returns the JSON literal `true` on
+// success, `false` on any failure/denial (malformed request, non-Post/Page type,
+// engine error). Wired only under `write_store` with a backend present.
 host_fn!(fp_set_meta(user_data: WriteBackend; req: String) -> String {
     let cell = user_data.get()?;
     let guard = match cell.lock() {
@@ -655,9 +656,10 @@ host_fn!(fp_set_meta(user_data: WriteBackend; req: String) -> String {
         (Some(t), Some(i), Some(k), Some(val)) => (t, i, k, val),
         _ => return Ok("false".to_owned()),
     };
-    // Namespace so a plugin can only ever write under its own key prefix.
-    let namespaced = format!("{}:{}", guard.plugin_id, key);
-    let json = match guard.writer.set_meta(ty, id, &namespaced, value) {
+    // Pass the calling plugin's id as the namespace; set_meta nests the value under
+    // meta[plugin_id][key], so a plugin can only ever write its own sub-object
+    // (forging another plugin's / core keys is structurally impossible).
+    let json = match guard.writer.set_meta(ty, id, &guard.plugin_id, key, value) {
         Ok(()) => "true".to_owned(),
         Err(e) => {
             tracing::error!(error = %e, "fp_set_meta failed");

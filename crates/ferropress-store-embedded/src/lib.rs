@@ -40,6 +40,12 @@ pub use error::AdapterError;
 pub struct EmbeddedStore {
     db: Arc<Database>,
     vectorizer: Arc<Vectorizer>,
+    /// Serializes the read-modify-write in the `content:write` [`ContentWriter::set_meta`]
+    /// path so two concurrent plugin meta-writes to the SAME object can't lose each
+    /// other's keys (each reads the whole `meta`, edits its own sub-object, and
+    /// writes the whole `meta` back — last-writer-wins without this). Held only
+    /// across that one get+update; the normal async write path never takes it.
+    meta_write_lock: std::sync::Mutex<()>,
 }
 
 impl EmbeddedStore {
@@ -83,7 +89,11 @@ impl EmbeddedStore {
         );
         vectorizer.start_worker(1);
 
-        Ok(Self { db, vectorizer })
+        Ok(Self {
+            db,
+            vectorizer,
+            meta_write_lock: std::sync::Mutex::new(()),
+        })
     }
 
     /// Borrow the raw engine handle. `pub(crate)` so `store_impl`/`convert` can
@@ -94,5 +104,10 @@ impl EmbeddedStore {
 
     pub(crate) fn vectorizer(&self) -> &Arc<Vectorizer> {
         &self.vectorizer
+    }
+
+    /// The lock serializing `set_meta`'s read-modify-write (see the field docs).
+    pub(crate) fn meta_write_lock(&self) -> &std::sync::Mutex<()> {
+        &self.meta_write_lock
     }
 }
