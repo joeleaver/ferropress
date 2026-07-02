@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ferropress · admin</title>
+<!--
+  HTML-FIRST DESIGN MOCKUP for the Ferropress admin SPA (CLAUDE.md §2).
+  Three views: login → post list ("the galley") → post editor ("the sheet").
+  This is a static design artifact to nail structure + visual language BEFORE the
+  rinch/wasm port. The editor surface here is faked with sample formatted content;
+  in the real app it is the rinch-editor-view mounted into the sheet.
+
+  Design language: letterpress composing room. Ink-on-cool-paper, an iron press-bed
+  masthead, minium (red-lead) vermilion as the single registration accent.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    /* Ink & steel — proof paper, iron press-bed, red-lead primer. */
+    --paper:      #EEEFEA;
+    --paper-sink: #E5E6E0;   /* recessed panels / inputs */
+    --paper-raise:#F5F6F1;   /* the sheet, cards */
+    --ink:        #17191C;   /* rich cool ink — masthead, headings */
+    --ink-2:      #383B40;   /* body text */
+    --steel:      #6B6F76;   /* labels, metadata */
+    --steel-2:    #9CA0A6;   /* faint / placeholder */
+    --rule:       #D3D4CD;   /* hairline rules on paper */
+    --rule-ink:   #2C2F34;   /* hairline rules on the press bed */
+    --minium:     #C23A18;   /* registration accent / primary action */
+    --minium-hi:  #D6431E;   /* hover */
+    --minium-deep:#9A2E11;   /* accent text on paper (AA) */
+    --ochre:      #8A6412;   /* draft stamp */
+    --green:      #2E6A4E;   /* published */
+    --steel-tag:  #566069;   /* private */
+
+    --measure: 34rem;        /* the typographic measure of the editor sheet */
+    --gap: 1.5rem;
+    --radius: 3px;           /* pressed metal, barely rounded */
+    --shadow: 0 1px 0 var(--rule), 0 12px 32px -20px rgba(23,25,28,.4);
+    --ff-display: "Zilla Slab", Georgia, serif;
+    --ff-ui: "IBM Plex Sans", system-ui, sans-serif;
+    --ff-mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--paper);
+    color: var(--ink-2);
+    font-family: var(--ff-ui);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  a { color: inherit; }
+  button { font-family: inherit; cursor: pointer; }
+
+  /* Faint pica-ruler tick strip — the typographic measure, used as a top edge. */
+  .ruler {
+    height: 6px;
+    background-image: repeating-linear-gradient(90deg,
+      var(--rule-ink) 0 1px, transparent 1px 12px);
+    opacity: .5;
+  }
+
+  /* The registration crosshair — the Ferropress mark + "active target" motif. */
+  .regmark { display: inline-block; vertical-align: middle; color: var(--minium); }
+  .regmark svg { display: block; }
+
+  .view { display: none; }
+  .view.is-active { display: block; animation: rise .28s ease both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  /* ------------------------------------------------------------------ *
+   *  LOGIN — "composing room"
+   * ------------------------------------------------------------------ */
+  .login {
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: 6px 1fr auto;
+  }
+  .login__stage {
+    display: grid;
+    place-items: center;
+    padding: 2rem;
+  }
+  .login__plate {
+    width: 100%;
+    max-width: 25rem;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: .6rem;
+    justify-content: center;
+    margin-bottom: .35rem;
+  }
+  .brand__word {
+    font-family: var(--ff-display);
+    font-weight: 700;
+    font-size: 2rem;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--ink);
+    /* stamped-metal spacing */
+    margin: 0;
+  }
+  .brand__sub {
+    text-align: center;
+    font-family: var(--ff-mono);
+    font-size: .72rem;
+    letter-spacing: .28em;
+    text-transform: uppercase;
+    color: var(--steel);
+    margin: 0 0 1.75rem;
+  }
+  .brand__sub::before, .brand__sub::after { content: "—"; margin: 0 .5rem; color: var(--steel-2); }
+
+  .card {
+    background: var(--paper-raise);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1.75rem;
+  }
+  .field { margin-bottom: 1.1rem; }
+  .field:last-of-type { margin-bottom: 1.5rem; }
+  .field > label {
+    display: block;
+    font-size: .72rem;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--steel);
+    margin-bottom: .4rem;
+  }
+  .input {
+    width: 100%;
+    padding: .6rem .7rem;
+    background: var(--paper-sink);
+    border: 1px solid var(--rule);
+    border-bottom: 2px solid #C6C7C0;
+    border-radius: var(--radius);
+    color: var(--ink);
+    font-family: var(--ff-ui);
+    font-size: .95rem;
+    transition: border-color .15s, background .15s;
+  }
+  .input--mono { font-family: var(--ff-mono); }
+  .input::placeholder { color: var(--steel-2); }
+  .input:focus {
+    outline: none;
+    background: var(--paper-raise);
+    border-color: var(--steel);
+    border-bottom-color: var(--minium);   /* focused field = the active target */
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: .5rem;
+    padding: .62rem 1.1rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    font-weight: 600;
+    font-size: .92rem;
+    letter-spacing: .02em;
+    transition: background .15s, transform .06s, box-shadow .15s, color .15s, border-color .15s;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn--primary {
+    width: 100%;
+    background: var(--minium);
+    color: #FCF6F2;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 var(--minium-deep);
+  }
+  .btn--primary:hover { background: var(--minium-hi); }
+  .btn--ghost {
+    background: transparent;
+    color: var(--ink-2);
+    border-color: var(--rule);
+  }
+  .btn--ghost:hover { background: var(--paper-sink); border-color: var(--steel-2); }
+  .btn--quiet { background: transparent; color: var(--steel); padding: .4rem .5rem; }
+  .btn--quiet:hover { color: var(--ink); }
+
+  .login__footer {
+    text-align: center;
+    padding: 1.5rem;
+    font-family: var(--ff-mono);
+    font-size: .72rem;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--steel-2);
+  }
+  .note {
+    margin: -.4rem 0 1rem;
+    font-size: .82rem;
+    color: var(--minium-deep);
+    display: none;
+  }
+  .note.is-shown { display: block; }
+
+  /* ------------------------------------------------------------------ *
+   *  MASTHEAD — the iron press bed (shared by list + editor)
+   * ------------------------------------------------------------------ */
+  .masthead {
+    background: var(--ink);
+    color: #E7E8E2;
+    border-bottom: 1px solid #000;
+  }
+  .masthead__bar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0 1.25rem;
+    height: 52px;
+    max-width: 68rem;
+    margin: 0 auto;
+  }
+  .masthead__brand {
+    display: flex; align-items: center; gap: .5rem;
+    font-family: var(--ff-display);
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    font-size: 1.02rem;
+    color: #F3F4EE;
+  }
+  .masthead__sep { color: #4A4D53; }
+  .masthead__here { color: #A9ADB2; font-family: var(--ff-ui); font-weight: 500; letter-spacing: normal; text-transform: none; font-size: .9rem; }
+  .masthead__spacer { flex: 1; }
+  .masthead__user {
+    display: flex; align-items: center; gap: .5rem;
+    color: #C7CACF; font-size: .88rem;
+  }
+  .masthead__avatar {
+    width: 24px; height: 24px; border-radius: 50%;
+    background: var(--minium); color: #fff;
+    display: grid; place-items: center;
+    font-weight: 600; font-size: .72rem;
+  }
+  .masthead .btn--quiet { color: #A9ADB2; }
+  .masthead .btn--quiet:hover { color: #fff; }
+  .masthead .btn--back { color: #C7CACF; }
+  .masthead .btn--back:hover { color: #fff; }
+
+  .wrap { max-width: 68rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+  /* ------------------------------------------------------------------ *
+   *  POST LIST — "the galley"
+   * ------------------------------------------------------------------ */
+  .galley__head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: .6rem;
+    margin-bottom: .25rem;
+  }
+  .galley__title {
+    font-family: var(--ff-display);
+    font-weight: 600;
+    font-size: 1.7rem;
+    color: var(--ink);
+    margin: 0;
+    letter-spacing: .01em;
+  }
+  .galley__count {
+    font-family: var(--ff-mono);
+    font-size: .78rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--steel);
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: 22px 1fr auto auto auto;
+    align-items: center;
+    gap: 1rem;
+    padding: .85rem .5rem .85rem .25rem;
+    border-bottom: 1px solid var(--rule);
+    text-decoration: none;
+    color: inherit;
+    position: relative;
+    transition: background .12s;
+  }
+  .row:hover { background: var(--paper-raise); }
+  .row__mark { color: var(--minium); opacity: 0; transition: opacity .12s; }
+  .row:hover .row__mark, .row:focus-visible .row__mark { opacity: 1; }
+  .row__title {
+    font-family: var(--ff-display);
+    font-weight: 500;
+    font-size: 1.12rem;
+    color: var(--ink);
+    line-height: 1.25;
+  }
+  .row__slug {
+    display: block;
+    font-family: var(--ff-mono);
+    font-size: .78rem;
+    color: var(--steel);
+    margin-top: .1rem;
+  }
+  .row__time {
+    font-family: var(--ff-mono);
+    font-size: .78rem;
+    color: var(--steel);
+    white-space: nowrap;
+  }
+  .row__edit {
+    font-size: .82rem;
+    font-weight: 600;
+    color: var(--steel);
+    display: inline-flex; align-items: center; gap: .3rem;
+    letter-spacing: .02em;
+  }
+  .row:hover .row__edit { color: var(--minium-deep); }
+
+  /* status stamp — inked rubber-stamp look */
+  .stamp {
+    font-family: var(--ff-mono);
+    font-size: .68rem;
+    font-weight: 500;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    padding: .18rem .5rem;
+    border-radius: 2px;
+    border: 1.5px solid currentColor;
+    white-space: nowrap;
+  }
+  .stamp--published { color: var(--green); }
+  .stamp--draft     { color: var(--ochre); border-style: dashed; }
+  .stamp--private   { color: var(--steel-tag); }
+
+  /* ------------------------------------------------------------------ *
+   *  EDITOR — "the sheet" + "the composing stick" toolbar
+   * ------------------------------------------------------------------ */
+  .editor__meta {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    padding-bottom: 1rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .metaitem { display: flex; align-items: center; gap: .55rem; }
+  .metaitem > label {
+    font-size: .7rem; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--steel);
+  }
+  .slugbox {
+    display: inline-flex; align-items: center;
+    background: var(--paper-sink);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    padding: .3rem .5rem;
+    font-family: var(--ff-mono);
+    font-size: .85rem;
+    color: var(--ink);
+  }
+  .slugbox__host { color: var(--steel-2); }
+  .slugbox input {
+    border: 0; background: transparent; font: inherit; color: var(--ink);
+    width: 12ch; padding: 0;
+  }
+  .slugbox input:focus { outline: none; }
+  .select {
+    font-family: var(--ff-mono);
+    font-size: .82rem;
+    padding: .35rem 1.6rem .35rem .6rem;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    background: var(--paper-sink)
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'><path d='M1 1l4 4 4-4' stroke='%236B6F76' stroke-width='1.5' fill='none'/></svg>")
+      no-repeat right .55rem center;
+    color: var(--ink);
+    appearance: none; -webkit-appearance: none;
+  }
+
+  .toolbar {
+    display: flex; align-items: center; gap: .15rem;
+    flex-wrap: wrap;
+    background: var(--paper-raise);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    padding: .3rem;
+    margin: 0 auto 1rem;
+    max-width: calc(var(--measure) + 4rem);
+    position: sticky; top: .75rem; z-index: 5;
+    box-shadow: var(--shadow);
+  }
+  .tool {
+    min-width: 32px; height: 32px;
+    padding: 0 .5rem;
+    display: inline-flex; align-items: center; justify-content: center; gap: .3rem;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    color: var(--ink-2);
+    font-size: .85rem; font-weight: 600;
+  }
+  .tool:hover { background: var(--paper-sink); }
+  .tool.is-on { background: var(--ink); color: var(--paper); }
+  .tool--label { font-family: var(--ff-mono); font-size: .78rem; letter-spacing: .02em; }
+  .tool__i { font-style: normal; font-size: 1rem; }
+  .tool--i b { font-weight: 700; }
+  .tool--i i { font-style: italic; font-family: var(--ff-display); }
+  .toolbar__sep { width: 1px; height: 20px; background: var(--rule); margin: 0 .3rem; }
+  .toolbar__spacer { flex: 1; }
+  .toolbar__measure {
+    font-family: var(--ff-mono); font-size: .68rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--steel-2); padding-right: .4rem;
+    display: inline-flex; align-items: center; gap: .35rem;
+  }
+
+  .sheet {
+    background: var(--paper-raise);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 3rem;
+    max-width: calc(var(--measure) + 6rem);
+    margin: 0 auto;
+  }
+  .sheet__inner { max-width: var(--measure); margin: 0 auto; }
+  /* editor content — set in the reading serif, like a proof on paper */
+  .doc { font-family: var(--ff-display); color: var(--ink); }
+  .doc h1 { font-size: 2.1rem; font-weight: 700; line-height: 1.12; letter-spacing: .005em; margin: 0 0 1rem; }
+  .doc h2 { font-size: 1.4rem; font-weight: 600; margin: 2rem 0 .6rem; }
+  .doc p  { font-size: 1.12rem; line-height: 1.62; margin: 0 0 1.1rem; color: var(--ink-2); }
+  .doc a  { color: var(--minium-deep); text-underline-offset: 2px; }
+  .doc blockquote {
+    margin: 1.6rem 0; padding: .2rem 0 .2rem 1.3rem;
+    border-left: 3px solid var(--minium);
+    font-size: 1.22rem; font-style: italic; color: var(--ink);
+  }
+  .doc ul { margin: 0 0 1.1rem; padding-left: 1.3rem; }
+  .doc li { font-size: 1.12rem; line-height: 1.55; margin-bottom: .3rem; }
+  .doc code {
+    font-family: var(--ff-mono); font-size: .88em;
+    background: var(--paper-sink); padding: .1em .35em; border-radius: 2px;
+  }
+  /* caret target hint — where you'd be typing */
+  .doc [data-caret]::after {
+    content: ""; display: inline-block; width: 2px; height: 1.05em;
+    background: var(--minium); margin-left: 1px; vertical-align: text-bottom;
+    animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* Save button dirty indicator */
+  .save { position: relative; }
+  .save__dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #FCF6F2; box-shadow: 0 0 0 2px var(--minium);
+    display: none;
+  }
+  .save.is-dirty .save__dot { display: inline-block; }
+  .save.is-dirty .save__label::after { content: " changes"; }
+
+  /* Toast — an ink stamp */
+  .toast {
+    position: fixed; left: 50%; bottom: 1.5rem; transform: translateX(-50%) translateY(140%);
+    background: var(--ink); color: var(--paper);
+    font-family: var(--ff-mono); font-size: .8rem; letter-spacing: .12em; text-transform: uppercase;
+    padding: .6rem 1rem; border-radius: var(--radius);
+    display: inline-flex; align-items: center; gap: .55rem;
+    box-shadow: 0 12px 30px -12px rgba(0,0,0,.5);
+    transition: transform .3s cubic-bezier(.2,.8,.2,1);
+    z-index: 40;
+  }
+  .toast.is-shown { transform: translateX(-50%) translateY(0); }
+  .toast .regmark { color: var(--minium-hi); }
+
+  @media (max-width: 640px) {
+    .row { grid-template-columns: 18px 1fr auto; }
+    .row__time, .row__edit { display: none; }
+    .sheet { padding: 1.5rem; }
+    .doc h1 { font-size: 1.7rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  /* dev-only view switcher chip (not part of the product) */
+  .devswitch {
+    position: fixed; right: .75rem; bottom: .75rem; z-index: 50;
+    display: flex; gap: .25rem; background: var(--ink); padding: .3rem; border-radius: 999px;
+    box-shadow: 0 8px 24px -10px rgba(0,0,0,.5);
+  }
+  .devswitch button {
+    border: 0; background: transparent; color: #A9ADB2;
+    font-family: var(--ff-mono); font-size: .68rem; letter-spacing: .08em; text-transform: uppercase;
+    padding: .3rem .6rem; border-radius: 999px;
+  }
+  .devswitch button.is-on { background: var(--minium); color: #fff; }
+</style>
+</head>
+<body>
+
+<!-- =================== LOGIN =================== -->
+<section class="view is-active" id="view-login">
+  <div class="login">
+  <div class="ruler"></div>
+  <div class="login__stage">
+    <div class="login__plate">
+      <div class="brand">
+        <span class="regmark" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 30 30" fill="none">
+            <circle cx="15" cy="15" r="7.5" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M15 0v9M15 21v9M0 15h9M21 15h9" stroke="currentColor" stroke-width="1.6"/>
+          </svg>
+        </span>
+        <h1 class="brand__word">Ferropress</h1>
+      </div>
+      <p class="brand__sub">composing room</p>
+
+      <form class="card" id="login-form" autocomplete="on">
+        <div class="field">
+          <label for="u">Username</label>
+          <input class="input input--mono" id="u" name="username" placeholder="jane" value="jane" />
+        </div>
+        <div class="field">
+          <label for="p">Password</label>
+          <input class="input" id="p" name="password" type="password" placeholder="••••••••" value="correct-horse" />
+        </div>
+        <p class="note" id="login-note">That username and password don't match.</p>
+        <button class="btn btn--primary" type="submit">
+          Sign in
+          <span class="regmark" aria-hidden="true"><svg width="16" height="10" viewBox="0 0 16 10" fill="none"><path d="M1 5h13M10 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" fill="none"/></svg></span>
+        </button>
+      </form>
+    </div>
+  </div>
+  <p class="login__footer">build proofs · press live</p>
+  </div>
+</section>
+
+<!-- =================== POST LIST (GALLEY) =================== -->
+<section class="view" id="view-list">
+  <header class="masthead">
+    <div class="ruler"></div>
+    <div class="masthead__bar">
+      <span class="masthead__brand">
+        <span class="regmark" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7.5" stroke="currentColor" stroke-width="2"/><path d="M15 2v7M15 21v7M2 15h7M21 15h7" stroke="currentColor" stroke-width="2"/></svg></span>
+        Ferropress
+      </span>
+      <span class="masthead__sep">·</span>
+      <span class="masthead__here">Posts</span>
+      <span class="masthead__spacer"></span>
+      <span class="masthead__user"><span class="masthead__avatar">J</span> jane</span>
+      <button class="btn btn--quiet" type="button" data-go="login">Sign out</button>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="galley__head">
+      <h2 class="galley__title">Posts</h2>
+      <span class="galley__count">3 in the galley</span>
+    </div>
+
+    <a class="row" href="#" data-go="editor">
+      <span class="row__mark" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7" stroke="currentColor" stroke-width="2.2"/><path d="M15 3v6M15 21v6M3 15h6M21 15h6" stroke="currentColor" stroke-width="2.2"/></svg></span>
+      <span>
+        <span class="row__title">Welcome to Ferropress</span>
+        <span class="row__slug">/welcome</span>
+      </span>
+      <span class="stamp stamp--published">Published</span>
+      <span class="row__time">2h ago</span>
+      <span class="row__edit">Edit <svg width="14" height="9" viewBox="0 0 16 10" fill="none"><path d="M1 5h13M10 1l4 4-4 4" stroke="currentColor" stroke-width="1.6"/></svg></span>
+    </a>
+
+    <a class="row" href="#" data-go="editor">
+      <span class="row__mark" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7" stroke="currentColor" stroke-width="2.2"/><path d="M15 3v6M15 21v6M3 15h6M21 15h6" stroke="currentColor" stroke-width="2.2"/></svg></span>
+      <span>
+        <span class="row__title">On static-first delivery</span>
+        <span class="row__slug">/static-first-delivery</span>
+      </span>
+      <span class="stamp stamp--draft">Draft</span>
+      <span class="row__time">yesterday</span>
+      <span class="row__edit">Edit <svg width="14" height="9" viewBox="0 0 16 10" fill="none"><path d="M1 5h13M10 1l4 4-4 4" stroke="currentColor" stroke-width="1.6"/></svg></span>
+    </a>
+
+    <a class="row" href="#" data-go="editor">
+      <span class="row__mark" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7" stroke="currentColor" stroke-width="2.2"/><path d="M15 3v6M15 21v6M3 15h6M21 15h6" stroke="currentColor" stroke-width="2.2"/></svg></span>
+      <span>
+        <span class="row__title">Notes from the foundry</span>
+        <span class="row__slug">/notes-from-the-foundry</span>
+      </span>
+      <span class="stamp stamp--private">Private</span>
+      <span class="row__time">3d ago</span>
+      <span class="row__edit">Edit <svg width="14" height="9" viewBox="0 0 16 10" fill="none"><path d="M1 5h13M10 1l4 4-4 4" stroke="currentColor" stroke-width="1.6"/></svg></span>
+    </a>
+  </div>
+</section>
+
+<!-- =================== EDITOR (THE SHEET) =================== -->
+<section class="view" id="view-editor">
+  <header class="masthead">
+    <div class="ruler"></div>
+    <div class="masthead__bar">
+      <button class="btn btn--quiet btn--back" type="button" data-go="list">
+        <svg width="14" height="9" viewBox="0 0 16 10" fill="none"><path d="M15 5H2M6 1L2 5l4 4" stroke="currentColor" stroke-width="1.6"/></svg>
+        Posts
+      </button>
+      <span class="masthead__sep">·</span>
+      <span class="masthead__here">Welcome to Ferropress</span>
+      <span class="masthead__spacer"></span>
+      <button class="btn btn--primary save" id="save-btn" type="button" style="width:auto">
+        <span class="save__dot" aria-hidden="true"></span>
+        <span class="save__label">Save</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="editor__meta">
+      <div class="metaitem">
+        <label for="slug">Slug</label>
+        <span class="slugbox"><span class="slugbox__host">/</span><input id="slug" value="welcome" spellcheck="false" /></span>
+      </div>
+      <div class="metaitem">
+        <label for="status">Status</label>
+        <select class="select" id="status">
+          <option>Published</option>
+          <option>Draft</option>
+          <option>Private</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="toolbar" role="toolbar" aria-label="Formatting">
+      <button class="tool tool--i is-on" title="Bold"><b>B</b></button>
+      <button class="tool tool--i" title="Italic"><i>I</i></button>
+      <button class="tool" title="Link"><span class="tool__i">🔗</span></button>
+      <span class="toolbar__sep"></span>
+      <button class="tool tool--label" title="Heading 2">H2</button>
+      <button class="tool tool--label" title="Heading 3">H3</button>
+      <span class="toolbar__sep"></span>
+      <button class="tool" title="Quote"><span class="tool__i">"</span></button>
+      <button class="tool" title="Bulleted list"><span class="tool__i">•</span></button>
+      <button class="tool tool--label" title="Code">&lt;/&gt;</button>
+      <span class="toolbar__spacer"></span>
+      <span class="toolbar__measure">
+        <span class="regmark"><svg width="12" height="12" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7" stroke="currentColor" stroke-width="2.4"/><path d="M15 4v5M15 21v5M4 15h5M21 15h5" stroke="currentColor" stroke-width="2.4"/></svg></span>
+        measure
+      </span>
+    </div>
+
+    <div class="sheet">
+      <div class="sheet__inner">
+        <!-- In the real app this is the rinch-editor-view mount (data-pm-editor). -->
+        <div class="doc" contenteditable="false" aria-label="Editor preview">
+          <h1>Welcome to Ferropress</h1>
+          <p>Ferropress keeps WordPress's authoring soul and modernizes the delivery: pages are
+          pre-rendered to static HTML and regenerated only when the content that feeds them changes.</p>
+          <h2>How it presses</h2>
+          <p>You compose here, on the sheet. When you <a href="#">save</a>, the block tree is written to
+          the store and the affected pages regenerate off the change feed — no full rebuild.</p>
+          <blockquote>Keep the soul. Modernize the press.</blockquote>
+          <p>The dynamic parts — search, live comments — mount as <code>rinch</code> islands on the otherwise
+          static page<span data-caret></span></p>
+          <ul>
+            <li>Static-first, regenerated on change</li>
+            <li>Rust all the way down</li>
+            <li>Capability-sandboxed plugins</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="toast" id="toast">
+  <span class="regmark" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7" stroke="currentColor" stroke-width="2.4"/><path d="M15 4v5M15 21v5M4 15h5M21 15h5" stroke="currentColor" stroke-width="2.4"/></svg></span>
+  <span id="toast-msg">Saved</span>
+</div>
+
+<!-- dev-only view switcher (removed in the real SPA) -->
+<nav class="devswitch" aria-label="Preview views">
+  <button data-go="login" class="is-on">Login</button>
+  <button data-go="list">Galley</button>
+  <button data-go="editor">Sheet</button>
+</nav>
+
+<script>
+  const views = { login: 'view-login', list: 'view-list', editor: 'view-editor' };
+  function show(name) {
+    for (const [n, id] of Object.entries(views)) {
+      document.getElementById(id).classList.toggle('is-active', n === name);
+    }
+    document.querySelectorAll('.devswitch button').forEach(b =>
+      b.classList.toggle('is-on', b.dataset.go === name));
+    window.scrollTo(0, 0);
+  }
+  document.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-go]');
+    if (!t) return;
+    e.preventDefault();
+    show(t.dataset.go);
+  });
+  document.getElementById('login-form').addEventListener('submit', (e) => {
+    e.preventDefault(); show('list');
+  });
+
+  // Editor: mark dirty on edit, "save" clears it + stamps a toast.
+  const saveBtn = document.getElementById('save-btn');
+  const toast = document.getElementById('toast');
+  document.querySelectorAll('.toolbar .tool, #slug, #status').forEach(el => {
+    el.addEventListener('input', () => saveBtn.classList.add('is-dirty'));
+    el.addEventListener('click', () => { if (el.classList.contains('tool')) saveBtn.classList.add('is-dirty'); });
+  });
+  saveBtn.addEventListener('click', () => {
+    saveBtn.classList.remove('is-dirty');
+    document.getElementById('toast-msg').textContent = 'Saved';
+    toast.classList.add('is-shown');
+    setTimeout(() => toast.classList.remove('is-shown'), 1600);
+  });
+</script>
+</body>
+</html>
