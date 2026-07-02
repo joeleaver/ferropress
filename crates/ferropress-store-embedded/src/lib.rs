@@ -19,6 +19,7 @@
 // through this crate's public API — that is the whole point of the membrane.
 // The only public escape hatch is `AdapterError`, re-exported below.
 mod content_reader;
+mod content_writer;
 mod convert;
 mod error;
 mod store_impl;

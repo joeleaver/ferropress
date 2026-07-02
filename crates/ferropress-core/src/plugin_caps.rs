@@ -10,8 +10,9 @@
 //! it in `spawn_blocking`), so no async bridge is needed. The adapter implements
 //! the sync read directly over the engine.
 //!
-//! Capabilities ship incrementally: [`ContentReader`] (read published content) is
-//! first; content-write and plugin-settings backends are later increments.
+//! Capabilities ship incrementally: [`ContentReader`] (read published content)
+//! and [`ContentWriter`] (a tight, typed write surface) exist; a plugin-settings
+//! backend is a later increment.
 
 use crate::error::Result;
 
@@ -42,4 +43,44 @@ pub trait ContentReader: Send + Sync {
     /// entity answers that slug. Used e.g. by a wiki plugin to decide whether a
     /// `[[link]]` target exists.
     fn lookup_published_slug(&self, slug: &str) -> Result<Option<PublishedRef>>;
+}
+
+/// The `content:write` capability backend: a DELIBERATELY TIGHT, typed write
+/// surface. Backs the `fp_create_page_stub` / `fp_set_meta` host functions the
+/// plugin host exposes to plugins granted `write_store`.
+///
+/// Security posture: this is NOT "create any type with any fields." A plugin can
+/// only (a) create a *stub Page* (a draft placeholder — never published, so it
+/// can't be used to publish arbitrary content), and (b) set ONE key inside an
+/// object's `meta` JSON (never a core/indexed field like `slug`/`status`, so a
+/// plugin can't corrupt the content model or escalate). This keeps the blast
+/// radius of a write grant small and reviewable.
+///
+/// Synchronous (see the module docs): implemented by the embedded store adapter
+/// directly over the engine; injected at the composition root.
+///
+/// FEED-LOOP NOTE: a write here commits and therefore emits a `ChangeEvent`,
+/// which the action-hook bridge would otherwise re-dispatch — enabling a
+/// write→change→action→write loop. Breaking that loop requires correlating a
+/// write with its own `ChangeEvent`, which needs a token the engine does not yet
+/// surface at write time (see rhypedb#13). Until that lands, the composition root
+/// does NOT wire a `ContentWriter` in production (deny-by-default: an ungranted /
+/// un-backed `write_store` plugin fails to instantiate), so this surface is
+/// exercised only in isolation.
+pub trait ContentWriter: Send + Sync {
+    /// Create a **draft** stub `Page` at `slug` with `title` and an empty body,
+    /// returning its new object id. Used e.g. to auto-create a placeholder for a
+    /// red `[[wiki link]]` target so an author can fill it in later. A draft is
+    /// deliberate: the stub is not publicly served until a human publishes it.
+    /// If a page already occupies `slug`, the implementation may return the
+    /// existing id rather than create a duplicate.
+    fn create_page_stub(&self, slug: &str, title: &str) -> Result<u64>;
+
+    /// Set a single `key` inside object `(type_name, id)`'s `meta` JSON object to
+    /// `value` (read-modify-write on the `meta` field only). Every other field is
+    /// untouched. Used e.g. by a backlink indexer to record "pages that link
+    /// here" on a target page. The host namespaces `key` under the calling
+    /// plugin's id so plugins can't clobber each other's (or core) meta.
+    fn set_meta(&self, type_name: &str, id: u64, key: &str, value: serde_json::Value)
+    -> Result<()>;
 }

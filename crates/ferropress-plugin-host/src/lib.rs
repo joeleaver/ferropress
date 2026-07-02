@@ -35,7 +35,7 @@ use serde::Deserialize;
 
 use ferropress_core::error::{CoreError, Result as CoreResult};
 use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
-use ferropress_core::plugin_caps::ContentReader;
+use ferropress_core::plugin_caps::{ContentReader, ContentWriter};
 use ferropress_render::{CustomBlockRenderer, Html};
 
 /// The guest export a plugin must provide to render a custom block: it receives
@@ -228,6 +228,12 @@ pub struct PluginHost {
     /// `read_store` grant has no effect (the `fp_lookup_slug` host function is not
     /// wired, so deny-by-default holds).
     content: Option<Arc<dyn ContentReader>>,
+    /// The `content:write` capability backend. `None` until injected via
+    /// [`with_content_writer`](Self::with_content_writer); when absent, a plugin's
+    /// `write_store` grant has no effect (the `fp_create_page_stub` / `fp_set_meta`
+    /// host functions are not wired, so deny-by-default holds). Production leaves
+    /// this unset until the change-feed loop guard lands (rhypedb#13).
+    writer: Option<Arc<dyn ContentWriter>>,
 }
 
 impl PluginHost {
@@ -238,6 +244,7 @@ impl PluginHost {
             plugins: HashMap::new(),
             bus: HookBus::new(),
             content: None,
+            writer: None,
         }
     }
 
@@ -248,6 +255,21 @@ impl PluginHost {
     /// host function is wired at plugin-build time.
     pub fn with_content_reader(mut self, content: Arc<dyn ContentReader>) -> Self {
         self.content = Some(content);
+        self
+    }
+
+    /// Inject the `content:write` capability backend (the embedded store's
+    /// synchronous [`ContentWriter`]). Plugins granted `write_store` then get the
+    /// `fp_create_page_stub` / `fp_set_meta` host functions backed by it. MUST be
+    /// set before [`load_dir`](Self::load_dir) / [`load_plugin`](Self::load_plugin).
+    ///
+    /// ⚠️ A write from a plugin commits and emits a `ChangeEvent`, which the
+    /// action-hook bridge would re-dispatch — a `write→change→action→write` loop.
+    /// Do NOT wire this in a deployment that also runs the action-hook bridge until
+    /// the feed-loop guard exists (needs a write-origin token on the feed —
+    /// rhypedb#13). It is safe to wire in isolation (e.g. tests) where no bridge runs.
+    pub fn with_content_writer(mut self, writer: Arc<dyn ContentWriter>) -> Self {
+        self.writer = Some(writer);
         self
     }
 
@@ -367,6 +389,46 @@ impl PluginHost {
                         plugin = id,
                         "plugin requests `read_store` but no ContentReader is wired; \
                          `fp_lookup_slug` will be unresolved and the plugin will fail to load"
+                    );
+                }
+            }
+        }
+
+        // `content:write` (`write_store`): expose `fp_create_page_stub` + `fp_set_meta`,
+        // backed by the injected `ContentWriter`. Same deny-by-default posture as
+        // read_store: if the backend is unwired, the host functions are absent and a
+        // `write_store` plugin fails to instantiate (rather than silently granting
+        // nothing). Production leaves the writer unwired until the feed-loop guard
+        // lands (rhypedb#13), so this branch is a no-op there by design.
+        if capabilities.write_store {
+            match &self.writer {
+                Some(writer) => {
+                    builder = builder.with_function(
+                        "fp_create_page_stub",
+                        [ValType::I64],
+                        [ValType::I64],
+                        UserData::new(WriteBackend {
+                            writer: Arc::clone(writer),
+                            plugin_id: id.to_owned(),
+                        }),
+                        fp_create_page_stub,
+                    );
+                    builder = builder.with_function(
+                        "fp_set_meta",
+                        [ValType::I64],
+                        [ValType::I64],
+                        UserData::new(WriteBackend {
+                            writer: Arc::clone(writer),
+                            plugin_id: id.to_owned(),
+                        }),
+                        fp_set_meta,
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        plugin = id,
+                        "plugin requests `write_store` but no ContentWriter is wired; \
+                         write host functions will be unresolved and the plugin will fail to load"
                     );
                 }
             }
@@ -535,6 +597,71 @@ host_fn!(fp_lookup_slug(user_data: Arc<dyn ContentReader>; slug: String) -> Stri
         Err(e) => {
             tracing::error!(error = %e, "fp_lookup_slug failed");
             "null".to_owned()
+        }
+    };
+    Ok(json)
+});
+
+// The `content:write` capability's UserData: the injected [`ContentWriter`] plus
+// the CALLING plugin's id, so the host can namespace every `meta` key under the
+// plugin (a plugin can't clobber another plugin's — or core — meta).
+struct WriteBackend {
+    writer: Arc<dyn ContentWriter>,
+    plugin_id: String,
+}
+
+// `fp_create_page_stub` (the `content:write` capability). The guest passes a JSON
+// request `{"slug","title"}`; it returns `{"id": <u64>}` for the new (or existing,
+// on a slug collision) DRAFT page, or the literal `null` on any failure (a
+// capability call never aborts the guest). Wired only when a plugin is granted
+// `write_store` AND a `ContentWriter` backend is present.
+host_fn!(fp_create_page_stub(user_data: WriteBackend; req: String) -> String {
+    let cell = user_data.get()?;
+    let guard = match cell.lock() {
+        Ok(g) => g,
+        Err(_) => return Ok("null".to_owned()),
+    };
+    let v: serde_json::Value = serde_json::from_str(&req).unwrap_or(serde_json::Value::Null);
+    let slug = v.get("slug").and_then(|x| x.as_str()).unwrap_or("");
+    let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
+    let json = match guard.writer.create_page_stub(slug, title) {
+        Ok(id) => serde_json::json!({ "id": id }).to_string(),
+        Err(e) => {
+            tracing::error!(error = %e, "fp_create_page_stub failed");
+            "null".to_owned()
+        }
+    };
+    Ok(json)
+});
+
+// `fp_set_meta` (the `content:write` capability). The guest passes a JSON request
+// `{"type","id","key","value"}`; the host namespaces `key` under the calling
+// plugin's id and sets that one key inside the object's `meta` JSON. Returns the
+// JSON literal `true` on success, `false` on any failure/denial (malformed
+// request, non-Post/Page type, engine error). Wired only under `write_store` with
+// a backend present.
+host_fn!(fp_set_meta(user_data: WriteBackend; req: String) -> String {
+    let cell = user_data.get()?;
+    let guard = match cell.lock() {
+        Ok(g) => g,
+        Err(_) => return Ok("false".to_owned()),
+    };
+    let v: serde_json::Value = serde_json::from_str(&req).unwrap_or(serde_json::Value::Null);
+    let ty = v.get("type").and_then(|x| x.as_str());
+    let id = v.get("id").and_then(|x| x.as_u64());
+    let key = v.get("key").and_then(|x| x.as_str());
+    let value = v.get("value").cloned();
+    let (ty, id, key, value) = match (ty, id, key, value) {
+        (Some(t), Some(i), Some(k), Some(val)) => (t, i, k, val),
+        _ => return Ok("false".to_owned()),
+    };
+    // Namespace so a plugin can only ever write under its own key prefix.
+    let namespaced = format!("{}:{}", guard.plugin_id, key);
+    let json = match guard.writer.set_meta(ty, id, &namespaced, value) {
+        Ok(()) => "true".to_owned(),
+        Err(e) => {
+            tracing::error!(error = %e, "fp_set_meta failed");
+            "false".to_owned()
         }
     };
     Ok(json)
