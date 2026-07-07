@@ -47,10 +47,15 @@ pub fn render_block(block: &Block, mode: RenderMode, custom: &dyn CustomBlockRen
             // + the `ferropress-serve` rewrite). Both `media` and `alt` come from
             // author-controlled content → attribute-escaped so a hand-crafted token can
             // never inject markup (the rewrite additionally ignores non-token values).
+            // `loading="lazy"` is emitted here (pure, no DB) and rides through the
+            // serve-layer `src` rewrite untouched — the rewrite only reconstructs the
+            // `<img … data-media-id="TOKEN"` opener and copies the rest of the tag
+            // (`alt`, `loading`, …) through verbatim. `data-media-id` MUST stay the
+            // first attribute so the rewrite needle still matches.
             let attr = ferropress_core::MEDIA_ID_ATTR;
             let media = html_escape::encode_double_quoted_attribute(media);
             let alt = html_escape::encode_double_quoted_attribute(alt);
-            format!("<figure><img {attr}=\"{media}\" alt=\"{alt}\"></figure>")
+            format!("<figure><img {attr}=\"{media}\" alt=\"{alt}\" loading=\"lazy\"></figure>")
         }
 
         BlockKind::Code { language, source } => {
