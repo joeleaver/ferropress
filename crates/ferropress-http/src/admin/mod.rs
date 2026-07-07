@@ -96,6 +96,62 @@ impl AuthedUser {
             Err(AdminError::Forbidden)
         }
     }
+
+    /// Whether this user is the author of content whose `author` link is `author`.
+    /// An unattributed (null-author) post is owned by nobody.
+    pub(crate) fn owns(&self, author: Option<ObjectId>) -> bool {
+        author == Some(self.id)
+    }
+
+    /// Whether this user may act on OTHERS' content (Editor+). Used to widen the post
+    /// list to every author and to gate null-author backfill (only a user who can edit
+    /// others' content may claim an orphaned post).
+    pub(crate) fn can_edit_others(&self) -> bool {
+        self.role.has(Capability::EditOthersContent)
+    }
+
+    /// Authorize *editing* a post whose author link is `author`: allowed iff this user
+    /// can edit others' content (any post) OR can edit own content and owns this one.
+    /// A user with neither (e.g. a Subscriber) is forbidden. Ownership of a null-author
+    /// post is nobody's, so only an [`can_edit_others`](Self::can_edit_others) user may
+    /// touch one.
+    pub(crate) fn require_edit(&self, author: Option<ObjectId>) -> Result<(), AdminError> {
+        let allowed = self.role.has(Capability::EditOthersContent)
+            || (self.role.has(Capability::EditOwnContent) && self.owns(author));
+        if allowed {
+            Ok(())
+        } else {
+            Err(AdminError::Forbidden)
+        }
+    }
+
+    /// Authorize access to a SPECIFIC post (`get_one`/`save`), masking a denial as
+    /// **404 Not Found** instead of 403. Semantics are identical to
+    /// [`require_edit`](Self::require_edit) (Editor+ any post, lower role only their
+    /// own); only the *denial code* differs. Answering "not found" for an existent but
+    /// unowned post keeps the id-addressed endpoints from becoming an existence oracle
+    /// — a lower role can't distinguish another author's (unpublished) draft from a
+    /// nonexistent id, which is exactly what the scoped list view already hides. An
+    /// Editor is never denied here, so they still see a genuine 404 only for a truly
+    /// missing post.
+    pub(crate) fn require_post_access(&self, author: Option<ObjectId>) -> Result<(), AdminError> {
+        self.require_edit(author).map_err(|_| AdminError::NotFound)
+    }
+
+    /// Authorize a *publish* act (moving content into or out of a published state) on a
+    /// post whose author link is `author`: allowed iff this user can publish others'
+    /// content OR can publish own content and owns this one. This is what separates a
+    /// Contributor (may edit own drafts, may NOT publish) from an Author (may publish
+    /// own) and an Editor (may publish anyone's).
+    pub(crate) fn require_publish(&self, author: Option<ObjectId>) -> Result<(), AdminError> {
+        let allowed = self.role.has(Capability::PublishOthersContent)
+            || (self.role.has(Capability::PublishOwnContent) && self.owns(author));
+        if allowed {
+            Ok(())
+        } else {
+            Err(AdminError::Forbidden)
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for AuthedUser {

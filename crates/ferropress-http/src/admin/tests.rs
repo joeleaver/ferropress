@@ -1186,3 +1186,358 @@ async fn logout_clears_the_cookie() {
         "logout must clear the cookie: {cleared}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-author ownership scoping (EditOwnContent / Publish* gating / backfill)
+// ---------------------------------------------------------------------------
+
+/// Link `user_id` as the `author` of `post_id`. Posts made by `seed_post` are born
+/// null-author (like a CLI-seeded row); give one an author to exercise ownership.
+async fn set_author(store: &Arc<dyn RhypeStore>, post_id: ObjectId, user_id: ObjectId) {
+    store
+        .link(
+            &Edge {
+                type_name: TypeName::from(POST_TYPE),
+                id: post_id,
+                field: "author".to_owned(),
+            },
+            user_id,
+            FieldMap::new(),
+        )
+        .await
+        .expect("link author");
+}
+
+/// The single `author` link of `post_id`, or `None` if unattributed.
+async fn author_of(store: &Arc<dyn RhypeStore>, post_id: ObjectId) -> Option<ObjectId> {
+    store
+        .get_links(&Edge {
+            type_name: TypeName::from(POST_TYPE),
+            id: post_id,
+            field: "author".to_owned(),
+        })
+        .await
+        .expect("get author links")
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+}
+
+/// GET /admin/api/posts/{id} → (status, body).
+async fn do_get(state: &AppState, cookie: &str, id: u64) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri(format!("/admin/api/posts/{id}"))
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+/// PUT /admin/api/posts/{id} (save) → (status, body).
+async fn do_save(
+    state: &AppState,
+    cookie: &str,
+    id: u64,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/admin/api/posts/{id}"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+/// GET /admin/api/posts → (status, body).
+async fn do_list(state: &AppState, cookie: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri("/admin/api/posts")
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+/// A save/create JSON body with the given title/slug/status and a one-paragraph body.
+fn edit_body(title: &str, slug: &str, status: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "title": title,
+        "slug": slug,
+        "status": status,
+        "block_tree": one_paragraph(text),
+    })
+}
+
+/// Whether the listing contains a row for `id`.
+fn list_has(list: &serde_json::Value, id: u64) -> bool {
+    list.as_array()
+        .expect("list is an array")
+        .iter()
+        .any(|p| p["id"].as_u64() == Some(id))
+}
+
+#[tokio::test]
+async fn list_is_scoped_to_own_posts_for_a_lower_role() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let jane = seed_user(&store, "jane", "hunter2hunter2", "contributor").await;
+    let bob = seed_user(&store, "bob", "hunter2hunter2", "contributor").await;
+
+    let mine = seed_post(&store, "mine", Status::Draft).await;
+    set_author(&store, mine, jane).await;
+    let theirs = seed_post(&store, "theirs", Status::Draft).await;
+    set_author(&store, theirs, bob).await;
+    let orphan = seed_post(&store, "orphan", Status::Draft).await;
+
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let (status, list) = do_list(&state, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list_has(&list, mine.0), "own post must be listed: {list}");
+    assert!(
+        !list_has(&list, theirs.0),
+        "another author's post must NOT be listed: {list}"
+    );
+    assert!(
+        !list_has(&list, orphan.0),
+        "a null-author post must NOT be listed to a lower role: {list}"
+    );
+}
+
+#[tokio::test]
+async fn contributor_can_edit_and_submit_own_draft_but_not_publish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "contributor").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // A contributor may create a draft (attributed to them).
+    let (status, body) = do_create(
+        &state,
+        &cookie,
+        edit_body("Draft dispatch", "draft-dispatch", "draft", "rough notes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "contributor create draft: {body}");
+    let id = body["id"].as_u64().unwrap();
+
+    // Edit the body, still a draft → OK.
+    let (status, _) = do_save(
+        &state,
+        &cookie,
+        id,
+        edit_body("Draft dispatch", "draft-dispatch", "draft", "revised notes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "contributor edits own draft");
+
+    // Submit for review (draft → pending) → OK (no publish cap needed).
+    let (status, _) = do_save(
+        &state,
+        &cookie,
+        id,
+        edit_body("Draft dispatch", "draft-dispatch", "pending", "ready for review"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "contributor submits for review");
+
+    // But publishing own content is forbidden (lacks PublishOwnContent).
+    let (status, _) = do_save(
+        &state,
+        &cookie,
+        id,
+        edit_body("Draft dispatch", "draft-dispatch", "published", "trying to go live"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a contributor must not publish their own post"
+    );
+
+    // And creating a post directly in a published state is likewise forbidden.
+    let (status, _) = do_create(
+        &state,
+        &cookie,
+        edit_body("Instant", "instant", "published", "body"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a contributor must not create a published post"
+    );
+}
+
+#[tokio::test]
+async fn a_lower_role_cannot_read_or_edit_anothers_post() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "contributor").await;
+    let bob = seed_user(&store, "bob", "hunter2hunter2", "author").await;
+
+    let theirs = seed_post(&store, "bobs-post", Status::Draft).await;
+    set_author(&store, theirs, bob).await;
+
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // A denial on the id endpoints is 404, not 403, so it can't be told apart from a
+    // missing id — the id space of others' (unpublished) posts stays hidden.
+    let (status, _) = do_get(&state, &cookie, theirs.0).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "cannot open another's post");
+
+    let (status, _) = do_save(
+        &state,
+        &cookie,
+        theirs.0,
+        edit_body("Hijack", "bobs-post", "draft", "not mine"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "cannot save another's post");
+
+    // Existence oracle is closed: a genuinely nonexistent id returns the SAME 404, so
+    // the two cases are indistinguishable to a lower role.
+    let (missing, _) = do_get(&state, &cookie, 999_999).await;
+    assert_eq!(missing, StatusCode::NOT_FOUND, "a missing id is also 404");
+
+    // The post is untouched: still authored by bob, original slug.
+    assert_eq!(author_of(&store, theirs).await, Some(bob));
+}
+
+#[tokio::test]
+async fn an_author_may_publish_their_own_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "amy", "hunter2hunter2", "author").await;
+    let (_, cookie, _) = do_login(&state, "amy", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // Create a draft, then publish it → both OK (Author has PublishOwnContent).
+    let (status, body) = do_create(
+        &state,
+        &cookie,
+        edit_body("Amy's piece", "amys-piece", "draft", "draft body"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "author create draft: {body}");
+    let id = body["id"].as_u64().unwrap();
+
+    let (status, _) = do_save(
+        &state,
+        &cookie,
+        id,
+        edit_body("Amy's piece", "amys-piece", "published", "final body"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "author publishes own draft");
+
+    let (_, detail) = do_get(&state, &cookie, id).await;
+    assert_eq!(detail["status"], "published");
+
+    // Creating straight into a published state is also allowed for an author.
+    let (status, _) = do_create(
+        &state,
+        &cookie,
+        edit_body("Straight to press", "straight", "published", "body"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "author creates a published post");
+}
+
+#[tokio::test]
+async fn editor_backfills_a_null_author_on_open_and_on_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let ed = seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_user(&store, "jane", "hunter2hunter2", "contributor").await;
+
+    let opened = seed_post(&store, "legacy-opened", Status::Draft).await;
+    let saved = seed_post(&store, "legacy-saved", Status::Draft).await;
+    assert_eq!(author_of(&store, opened).await, None, "starts null-author");
+
+    // A contributor can neither see nor open a null-author post (a denial reads as 404,
+    // hiding the orphan's existence).
+    let (_, jcookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let jcookie = session_pair(&jcookie.unwrap());
+    let (status, _) = do_get(&state, &jcookie, opened.0).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a contributor cannot open an orphaned post"
+    );
+    assert_eq!(
+        author_of(&store, opened).await,
+        None,
+        "a denied open must NOT stamp an author"
+    );
+
+    // An editor opening it claims authorship (backfill-on-touch).
+    let (_, ecookie, _) = do_login(&state, "ed", "hunter2hunter2").await;
+    let ecookie = session_pair(&ecookie.unwrap());
+    let (status, _) = do_get(&state, &ecookie, opened.0).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        author_of(&store, opened).await,
+        Some(ed),
+        "opening a null-author post backfills the opener as author"
+    );
+
+    // Saving a (different) orphan the editor never opened also backfills.
+    let (status, _) = do_save(
+        &state,
+        &ecookie,
+        saved.0,
+        edit_body("Legacy saved", "legacy-saved", "draft", "edited by editor"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        author_of(&store, saved).await,
+        Some(ed),
+        "saving a null-author post backfills the editor as author"
+    );
+}
+
+#[tokio::test]
+async fn editor_edits_others_post_without_reassigning_the_author() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let bob = seed_user(&store, "bob", "hunter2hunter2", "contributor").await;
+
+    let post = seed_post(&store, "bobs-work", Status::Draft).await;
+    set_author(&store, post, bob).await;
+
+    let (_, cookie, _) = do_login(&state, "ed", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // The editor may open + publish another author's post (EditOthers + PublishOthers)...
+    let (status, _) = do_get(&state, &cookie, post.0).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = do_save(
+        &state,
+        &cookie,
+        post.0,
+        edit_body("Bob's work", "bobs-work", "published", "editor published it"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an editor may publish others' content");
+
+    // ...but the author link stays with bob (backfill only fills a NULL author).
+    assert_eq!(
+        author_of(&store, post).await,
+        Some(bob),
+        "editing an attributed post must not reassign its author"
+    );
+}

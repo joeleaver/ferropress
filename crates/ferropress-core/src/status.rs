@@ -44,6 +44,19 @@ impl Status {
         }
     }
 
+    /// Whether this status is a *published* state — the content is (or is set to
+    /// become) live: publicly [`Published`](Self::Published), [`Scheduled`](Self::Scheduled)
+    /// to auto-publish, or [`Private`](Self::Private) (published to authorized viewers).
+    ///
+    /// This is the authorization pivot for the `Publish*` capabilities: moving a post
+    /// INTO or OUT OF any published state is a "publishing" act and requires
+    /// publish rights, whereas `Draft`/`Pending` (a contributor's submit-for-review)
+    /// and `Trashed` do not. Distinct from [`can_transition_to`](Self::can_transition_to),
+    /// which governs *whether* a transition is legal at all, not *who* may make it.
+    pub fn is_publish_state(self) -> bool {
+        matches!(self, Status::Published | Status::Scheduled | Status::Private)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Status::Draft => "draft",
@@ -74,5 +87,22 @@ impl CommentStatus {
             CommentStatus::Spam => "spam",
             CommentStatus::Trash => "trash",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Status;
+
+    #[test]
+    fn publish_states_are_exactly_published_scheduled_private() {
+        // The three states that mean "live" and thus gate on a Publish* capability.
+        assert!(Status::Published.is_publish_state());
+        assert!(Status::Scheduled.is_publish_state());
+        assert!(Status::Private.is_publish_state());
+        // Editorial / non-live states do NOT require publish rights.
+        assert!(!Status::Draft.is_publish_state());
+        assert!(!Status::Pending.is_publish_state());
+        assert!(!Status::Trashed.is_publish_state());
     }
 }

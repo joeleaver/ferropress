@@ -1,6 +1,11 @@
-//! Post read/list/save for the editor. Every handler requires a session with the
-//! `EditOthersContent` capability (Editor+); the MVP is a single trusted authoring
-//! surface, so per-author ownership scoping (`EditOwnContent`) is a later slice.
+//! Post read/list/save for the editor, scoped per author. A session with the
+//! `EditOthersContent` capability (Editor+) may act on ANY post; a Contributor/Author
+//! with only `EditOwnContent` is limited to posts they authored (the list is filtered,
+//! and get/save on someone else's post return 403). Moving a post INTO or OUT OF a
+//! published state additionally requires a `Publish*` capability — this is what lets a
+//! Contributor edit their own drafts yet not publish them. A CLI-seeded / legacy post
+//! with no `author` link is *backfilled* to whoever (with `EditOthersContent`) first
+//! opens or saves it, bringing it into the ownership model.
 //!
 //! The wire body is Ferropress's own `BlockTree` JSON (`block_tree`), never rinch's
 //! `DocNode` — the editor↔BlockTree conversion is client-side in the wasm SPA.
@@ -61,12 +66,17 @@ pub struct PostDetail {
     pub featured_media: Option<FeaturedMediaDto>,
 }
 
-/// `GET /admin/api/posts` — every non-trashed post, most-recently-touched first.
+/// `GET /admin/api/posts` — the non-trashed posts this user may edit, most-recently-
+/// touched first. Editor+ (`EditOthersContent`) sees every post; a Contributor/Author
+/// sees only the posts they authored.
 pub async fn list(
     State(state): State<AppState>,
     who: AuthedUser,
 ) -> Result<Json<Vec<PostSummary>>, AdminError> {
-    who.require(Capability::EditOthersContent)?;
+    // The minimum bar for any editing surface (a Subscriber → 403). `EditOthersContent`
+    // implies `EditOwnContent` (the ladder is cumulative), so this admits Contributor+
+    // and we branch on scope next.
+    who.require(Capability::EditOwnContent)?;
 
     let objs: Vec<Object> = state
         .store
@@ -75,6 +85,26 @@ pub async fn list(
         .into_iter()
         .filter(|o| str_field(o, "status").as_deref() != Some(Status::Trashed.as_str()))
         .collect();
+
+    // Scope to authorship. Editor+ sees everything; a lower role sees only their own.
+    // `author` has no `@inverse` reverse edge, so ownership is resolved by ONE batched
+    // link read over the scanned ids (the id-only `get_links_many` fast path — a single
+    // store round-trip, not N+1). A null-author (legacy) post belongs to no one, so it
+    // is invisible to the own-only view until an Editor backfills it.
+    let objs: Vec<Object> = if who.can_edit_others() {
+        objs
+    } else {
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id).collect();
+        let authors = state
+            .store
+            .get_links_many(&TypeName::from(POST_TYPE), &ids, "author")
+            .await?;
+        objs.into_iter()
+            .zip(authors)
+            .filter(|(_, authors)| authors.contains(&who.id))
+            .map(|(obj, _)| obj)
+            .collect()
+    };
 
     // Resolve each row's featured image (a to-one relation, so it's a per-row link
     // read — fine for the admin galley, which is small and not a hot path).
@@ -96,12 +126,19 @@ pub async fn get_one(
     who: AuthedUser,
     Path(id): Path<u64>,
 ) -> Result<Json<PostDetail>, AdminError> {
-    who.require(Capability::EditOthersContent)?;
-
+    // Load first (a missing post is 404 regardless of who asks), then authorize against
+    // its author: Editor+ may open any post, a lower role only their own.
     let obj = state
         .store
         .get(&TypeName::from(POST_TYPE), ObjectId(id))
         .await?;
+    let author = author_of(&state, ObjectId(id)).await?;
+    // 404 (not 403) when denied, so a lower role can't tell another author's post from
+    // a missing id — matching the scoped list, which hides those posts.
+    who.require_post_access(author)?;
+    // Opening a legacy null-author post in the editor claims authorship for the opener
+    // (backfill-on-touch). Best-effort: never fail the read on a link hiccup.
+    backfill_author(&state, ObjectId(id), &who, author).await;
 
     Ok(Json(PostDetail {
         id,
@@ -151,8 +188,7 @@ pub async fn save(
     Path(id): Path<u64>,
     AdminJson(body): AdminJson<SaveRequest>,
 ) -> Result<Json<SaveResponse>, AdminError> {
-    who.require(Capability::EditOthersContent)?;
-
+    // Validate the request shape (independent of the stored resource) first.
     let slug = body.slug.trim();
     if slug.is_empty() {
         return Err(AdminError::BadRequest("slug must not be empty".to_owned()));
@@ -161,6 +197,28 @@ pub async fn save(
         .ok_or_else(|| AdminError::BadRequest(format!("unknown status {:?}", body.status)))?;
     let tree = BlockTree::from_json_value(body.block_tree.clone())
         .map_err(|e| AdminError::BadRequest(format!("invalid block tree: {e}")))?;
+
+    // Load the target and AUTHORIZE before touching any other resource — so an
+    // unauthorized caller can't probe slug/media existence through the checks below.
+    // A missing post is 404; its current status gates the transition.
+    let current = state
+        .store
+        .get(&TypeName::from(POST_TYPE), ObjectId(id))
+        .await?;
+    let current_status =
+        parse_status(&str_field(&current, "status").unwrap_or_default()).unwrap_or(Status::Draft);
+    let author = author_of(&state, ObjectId(id)).await?;
+    // 404 (not 403) when denied — an unauthorized caller can't distinguish an existing
+    // post they may not edit from a missing id (and can't probe the slug/media checks
+    // below). See [`AuthedUser::require_post_access`].
+    who.require_post_access(author)?;
+    // Moving a post INTO or OUT OF a published state is a publish act — gate it on a
+    // Publish* capability. A Contributor may edit their own draft but not publish it,
+    // and (since a published post's current status is a publish state) may not edit a
+    // published post at all; an Author may publish their own, an Editor anyone's.
+    if current_status.is_publish_state() || new_status.is_publish_state() {
+        who.require_publish(author)?;
+    }
 
     // Validate the featured image up front so a bad id can't half-save (scalars
     // written, relation not) — the relation is reconciled after the scalar update.
@@ -175,13 +233,6 @@ pub async fn save(
         )));
     }
 
-    // The post must exist; its current status gates the transition.
-    let current = state
-        .store
-        .get(&TypeName::from(POST_TYPE), ObjectId(id))
-        .await?;
-    let current_status =
-        parse_status(&str_field(&current, "status").unwrap_or_default()).unwrap_or(Status::Draft);
     if !current_status.can_transition_to(new_status) {
         return Err(AdminError::BadRequest(format!(
             "cannot change status from {} to {}",
@@ -211,6 +262,10 @@ pub async fn save(
     // Reconcile the to-one `featured_media` relation to match the request (validated
     // above): drop whatever was featured, then link the new target if any.
     set_featured(&state, ObjectId(id), body.featured_media).await?;
+
+    // A legacy null-author post that was just successfully edited is now attributed to
+    // its editor (backfill-on-touch); best-effort so it never fails the save.
+    backfill_author(&state, ObjectId(id), &who, author).await;
 
     Ok(Json(SaveResponse {
         id,
@@ -251,13 +306,21 @@ pub async fn create(
     who: AuthedUser,
     AdminJson(body): AdminJson<CreateRequest>,
 ) -> Result<Json<CreateResponse>, AdminError> {
-    who.require(Capability::EditOthersContent)?;
+    // Anyone who can edit their own content may create (Contributor+); a Subscriber
+    // is forbidden.
+    who.require(Capability::EditOwnContent)?;
 
     let slug = body.slug.trim();
     if slug.is_empty() {
         return Err(AdminError::BadRequest("slug must not be empty".to_owned()));
     }
     let status = initial_status(body.status.as_deref())?;
+    // A new post born directly into a published state is a publish act — gate it. The
+    // creator is the post's author, so authorize as the owner: a Contributor may create
+    // a Draft/Pending but not a Published post; an Author (PublishOwnContent) may.
+    if status.is_publish_state() {
+        who.require_publish(Some(who.id))?;
+    }
     let tree = BlockTree::from_json_value(body.block_tree.clone())
         .map_err(|e| AdminError::BadRequest(format!("invalid block tree: {e}")))?;
 
@@ -405,6 +468,76 @@ fn featured_edge(post_id: ObjectId) -> Edge {
         type_name: TypeName::from(POST_TYPE),
         id: post_id,
         field: "featured_media".to_owned(),
+    }
+}
+
+/// The `Post.author` relation edge for `post_id` (a to-one link to a `User`).
+fn author_edge(post_id: ObjectId) -> Edge {
+    Edge {
+        type_name: TypeName::from(POST_TYPE),
+        id: post_id,
+        field: "author".to_owned(),
+    }
+}
+
+/// Read a post's author id (the single `author` to-one link), or `None` when the post
+/// is unattributed — a CLI-seeded or pre-attribution legacy row. This is the ownership
+/// signal every per-author gate reads.
+async fn author_of(state: &AppState, post_id: ObjectId) -> Result<Option<ObjectId>, AdminError> {
+    Ok(state
+        .store
+        .get_links(&author_edge(post_id))
+        .await?
+        .into_iter()
+        .next()
+        .map(|(author_id, _)| author_id))
+}
+
+/// Backfill-on-touch: stamp `who` as the author of `post_id` when it currently has
+/// none. Guarded two ways up front — it no-ops when the caller already saw an author
+/// (`current_author.is_some()`) and when the toucher may only edit their OWN content
+/// (`!who.can_edit_others()`), so a lower role can never claim an orphaned post (they
+/// are already denied by `require_post_access` before reaching here; this is
+/// belt-and-suspenders).
+///
+/// Before writing, it RE-READS the author link, for two reasons: the `current_author`
+/// snapshot can be stale (in `save` a whole update runs between that read and here),
+/// and the to-one `author` link is NOT cardinality-enforced by the store — `link`
+/// appends a second edge rather than replacing one (the reason [`set_featured`] must
+/// unlink the old target). Skipping when an edge already exists therefore avoids
+/// stacking a second author on a post another concurrent touch just attributed, and
+/// never overwrites a real author. The only residual is a truly simultaneous
+/// double-backfill of the SAME orphan (the same narrow race `set_featured` accepts);
+/// it self-limits because a post is backfilled at most once in its life.
+///
+/// Best-effort throughout: any store error is logged, never surfaced. The read or save
+/// it rides on still succeeds, and the next touch retries.
+async fn backfill_author(
+    state: &AppState,
+    post_id: ObjectId,
+    who: &AuthedUser,
+    current_author: Option<ObjectId>,
+) {
+    if current_author.is_some() || !who.can_edit_others() {
+        return;
+    }
+    let edge = author_edge(post_id);
+    match state.store.get_links(&edge).await {
+        // Attributed since the caller's read (a real author, or a concurrent backfill):
+        // do NOT add a second edge to the to-one relation.
+        Ok(links) if !links.is_empty() => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, post_id = post_id.0, "backfill precheck failed (skipping)");
+            return;
+        }
+    }
+    if let Err(e) = state.store.link(&edge, who.id, FieldMap::new()).await {
+        tracing::warn!(
+            error = %e,
+            post_id = post_id.0,
+            "failed to backfill null author (will retry on next touch)"
+        );
     }
 }
 
