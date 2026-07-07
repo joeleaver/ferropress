@@ -32,6 +32,7 @@ pub mod role;
 pub mod seo;
 pub mod status;
 pub mod store;
+pub mod url;
 pub mod value;
 
 pub use block::{BLOCK_SCHEMA_VERSION, Block, BlockKind, BlockTree, InlineRun};
@@ -51,4 +52,5 @@ pub use role::{Capability, Role};
 pub use seo::{Robots, Seo};
 pub use status::{CommentStatus, Status};
 pub use store::RhypeStore;
+pub use url::is_safe_href;
 pub use value::{FieldMap, Object, ObjectId, TypeName, Value};

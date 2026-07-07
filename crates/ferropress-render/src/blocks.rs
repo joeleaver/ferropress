@@ -69,15 +69,21 @@ pub fn render_block(block: &Block, mode: RenderMode, custom: &dyn CustomBlockRen
 
         BlockKind::Embed { provider, url } => {
             // Click-to-load link on publish, static placeholder in preview; both
-            // keep the raw embed out of the static HTML until hydrated.
+            // keep the raw embed out of the static HTML until hydrated. The embed
+            // `url` is author/plugin/import-controlled, so it routes through the SAME
+            // gate as an inline link (`is_renderable_href`): a `javascript:` (or other
+            // unsafe / empty) URL renders as inert text, never a clickable anchor —
+            // attribute-escaping alone does NOT neutralize a script scheme.
             let _ = mode;
             let provider = html_escape::encode_double_quoted_attribute(provider);
-            let href = html_escape::encode_double_quoted_attribute(url);
-            format!(
-                "<div class=\"fp-embed\" data-provider=\"{provider}\">\
-                 <a href=\"{href}\" rel=\"noopener\">{}</a></div>",
-                html_escape::encode_text(url)
-            )
+            let label = html_escape::encode_text(url);
+            let inner = if is_renderable_href(url) {
+                let href = html_escape::encode_double_quoted_attribute(url);
+                format!("<a href=\"{href}\" rel=\"noopener\">{label}</a>")
+            } else {
+                format!("<span>{label}</span>")
+            };
+            format!("<div class=\"fp-embed\" data-provider=\"{provider}\">{inner}</div>")
         }
 
         BlockKind::Custom { plugin, name, data } => {
@@ -100,6 +106,19 @@ pub fn render_block(block: &Block, mode: RenderMode, custom: &dyn CustomBlockRen
     Html(html)
 }
 
+/// Whether `href` should be emitted as a live `<a href>` target: it must be
+/// present (non-empty) AND carry a script-safe scheme (see
+/// [`ferropress_core::is_safe_href`]). A failing href — empty, or a `javascript:` /
+/// `data:` / `vbscript:` scheme — renders as inert escaped text with no anchor.
+///
+/// This is the SINGLE place author/plugin/import URLs are gated before becoming
+/// links: both inline link marks and embed blocks route through here, so no content
+/// producer can route around the policy (attribute-escaping alone does not
+/// neutralize a script scheme).
+fn is_renderable_href(href: &str) -> bool {
+    !href.is_empty() && ferropress_core::is_safe_href(href)
+}
+
 /// Render a sequence of inline runs (escaping text, applying marks and links).
 ///
 /// Unknown marks are dropped rather than emitted, so a hostile or unrecognized
@@ -119,8 +138,14 @@ fn render_runs(runs: &[InlineRun]) -> String {
             };
         }
         if let Some(href) = &run.href {
-            let href = html_escape::encode_double_quoted_attribute(href);
-            piece = format!("<a href=\"{href}\">{piece}</a>");
+            // Only a present, script-safe URL becomes a live link (see
+            // `is_renderable_href`). A rejected href — empty, or a `javascript:` /
+            // `data:` scheme — renders as the plain escaped text with no `<a>` wrap,
+            // losing nothing and leaking nothing.
+            if is_renderable_href(href) {
+                let href = html_escape::encode_double_quoted_attribute(href);
+                piece = format!("<a href=\"{href}\">{piece}</a>");
+            }
         }
         out.push_str(&piece);
     }
