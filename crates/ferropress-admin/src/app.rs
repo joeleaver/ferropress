@@ -84,6 +84,9 @@ pub fn app() -> NodeHandle {
     let title = Signal::new(String::new());
     let slug = Signal::new(String::new());
     let status = Signal::new(String::new());
+    // The post's featured image (Media id + thumbnail url), or None. Set on open,
+    // cleared on new, echoed back on save to reconcile the `featured_media` relation.
+    let featured = Signal::new(Option::<api::FeaturedMedia>::None);
     let saving = Signal::new(false);
     let notice = Signal::new(String::new());
     let toast = Signal::new(false);
@@ -197,7 +200,7 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || new_post(
-                                    editor, title, slug, status, current_id, editor_session, notice, auth,
+                                    editor, title, slug, status, featured, current_id, editor_session, notice, auth,
                                 ),
                                 "\u{002B} New post"
                             }
@@ -253,9 +256,12 @@ pub fn app() -> NodeHandle {
                                 class: "row",
                                 onclick: {
                                     let id = row.id;
-                                    move || open_post(id, editor, title, slug, status, current_id, editor_session, notice, auth)
+                                    move || open_post(id, editor, title, slug, status, featured, current_id, editor_session, notice, auth)
                                 },
-                                span { class: "row__mark", "\u{2295}" }
+                                // A one-shot component (built once per row) so the
+                                // thumbnail-or-crosshair choice isn't a reactive `if`,
+                                // which can't move a non-Copy String out of the row.
+                                RowLead { url: row.featured_url.clone().unwrap_or_default() }
                                 span {
                                     span { class: "row__title", {row.title} }
                                     span { class: "row__slug", {row.slug_path} }
@@ -292,7 +298,7 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || save_post(
-                                    editor, current_id, editor_session, title, slug, status, saving, notice, toast, auth,
+                                    editor, current_id, editor_session, title, slug, status, featured, saving, notice, toast, auth,
                                 ),
                                 {move || if saving.get() { "Saving\u{2026}" } else { "Save" }}
                             }
@@ -326,6 +332,28 @@ pub fn app() -> NodeHandle {
                                     }
                                 }
                             }
+                            div { class: "metaitem",
+                                label { "Featured image" }
+                                // Native `if let`/`else` is reactive (tracks `featured`):
+                                // show the thumbnail + Remove when set, else the picker
+                                // button. No public display yet (no theme) — stored for it.
+                                if let Some(f) = featured.get() {
+                                    div { class: "featured",
+                                        img { class: "featured__thumb", src: f.url, alt: "" }
+                                        button {
+                                            class: "btn btn--quiet", style: "width:auto",
+                                            onclick: move || featured.set(None),
+                                            "Remove"
+                                        }
+                                    }
+                                } else {
+                                    button {
+                                        class: "btn btn--quiet", style: "width:auto",
+                                        onclick: move || set_featured_via_picker(featured, editor_session, notice, auth),
+                                        "Set featured image"
+                                    }
+                                }
+                            }
                         }
                         if !notice.get().is_empty() {
                             div { class: "editor__error", {move || notice.get()} }
@@ -345,7 +373,7 @@ pub fn app() -> NodeHandle {
                             button { class: "tool", title: "Bulleted list", onclick: move || { editor.get().command("toggleBulletList"); }, "\u{2022}" }
                             button { class: "tool tool--label", title: "Code block", onclick: move || { editor.get().command("setCodeBlock"); }, "{ }" }
                             span { class: "toolbar__sep" }
-                            button { class: "tool", title: "Insert image", onclick: move || insert_image_via_picker(editor, notice, auth), "\u{25A6}" }
+                            button { class: "tool", title: "Insert image", onclick: move || insert_image_via_picker(editor, editor_session, notice, auth), "\u{25A6}" }
                             span { class: "toolbar__spacer" }
                             span { class: "toolbar__measure",
                                 span { class: "regmark", style: "font-size:.75rem", "\u{2295}" }
@@ -393,6 +421,8 @@ struct RowVm {
     stamp_class: &'static str,
     stamp_label: String,
     time: String,
+    /// Featured-image thumbnail URL, if the post has one.
+    featured_url: Option<String>,
 }
 
 fn row_vms(posts: &[PostSummary]) -> Vec<RowVm> {
@@ -405,8 +435,22 @@ fn row_vms(posts: &[PostSummary]) -> Vec<RowVm> {
             stamp_class: api::status_stamp_class(&p.status),
             stamp_label: api::status_label(&p.status),
             time: api::fmt_relative(p.updated_at),
+            featured_url: p.featured_media.as_ref().map(|f| f.url.clone()),
         })
         .collect()
+}
+
+/// The galley-row leading cell: the post's featured-image thumbnail when `url` is
+/// non-empty, else the registration crosshair. A component so the choice is a
+/// one-shot `if` (a `#[component]` body runs once) instead of a reactive rsx `if`,
+/// which would try to move the non-`Copy` url out of the captured row.
+#[component]
+fn RowLead(url: String) -> NodeHandle {
+    if url.is_empty() {
+        rsx! { span { class: "row__mark", "\u{2295}" } }
+    } else {
+        rsx! { img { class: "row__thumb", src: url, alt: "" } }
+    }
 }
 
 /// Fetch the post list into `posts`, tracking `state`. A 401 routes back to login
@@ -435,6 +479,7 @@ fn open_post(
     title: Signal<String>,
     slug: Signal<String>,
     status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
     current_id: Signal<Option<u64>>,
     editor_session: Signal<u64>,
     notice: Signal<String>,
@@ -450,6 +495,7 @@ fn open_post(
                 title.set(detail.title);
                 slug.set(detail.slug);
                 status.set(detail.status);
+                featured.set(detail.featured_media);
                 current_id.set(Some(detail.id));
 
                 let schema = Schema::starter_kit();
@@ -485,6 +531,7 @@ fn save_post(
     title: Signal<String>,
     slug: Signal<String>,
     status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
     saving: Signal<bool>,
     notice: Signal<String>,
     toast: Signal<bool>,
@@ -512,6 +559,7 @@ fn save_post(
     saving.set(true);
     let title_val = title.get();
     let status_val = status.get();
+    let featured_val = featured.get().map(|f| f.id);
     // The document this save belongs to. If the editor loads a different document
     // before the request returns, the result is stale and must NOT write back its
     // id / toast / error into what is now a different editing context.
@@ -527,6 +575,7 @@ fn save_post(
                     slug: slug_val,
                     status: status_val,
                     block_tree,
+                    featured_media: featured_val,
                 },
             )
             .await
@@ -536,6 +585,7 @@ fn save_post(
                 slug: slug_val,
                 status: status_val,
                 block_tree,
+                featured_media: featured_val,
             })
             .await
             .map(Some),
@@ -580,6 +630,7 @@ fn new_post(
     title: Signal<String>,
     slug: Signal<String>,
     status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
     current_id: Signal<Option<u64>>,
     editor_session: Signal<u64>,
     notice: Signal<String>,
@@ -592,6 +643,7 @@ fn new_post(
     title.set(String::new());
     slug.set(String::new());
     status.set("draft".to_owned());
+    featured.set(None);
     current_id.set(None);
 
     // Clear whatever the shared editor held from a previously opened post.
@@ -672,6 +724,80 @@ fn edit_link_via_prompt(editor: Signal<EditorHandle>, notice: Signal<String>) {
     }
 }
 
+/// Upload an image and set it as the post's featured image (no editor insert).
+///
+/// Mirrors [`insert_image_via_picker`] — a hidden `<input type=file>` `.click()`ed
+/// synchronously in this trusted handler — but the chosen file becomes
+/// `featured_media` (the `featured` signal, echoed back on save) rather than an
+/// inline image, and there's no alt prompt (the featured control isn't inline text).
+///
+/// The upload runs async: if the editor has moved to a DIFFERENT document by the time
+/// it resolves (tracked via `editor_session`, like [`save_post`]'s stale guard), the
+/// result is dropped rather than featured on whatever post is now open.
+fn set_featured_via_picker(
+    featured: Signal<Option<api::FeaturedMedia>>,
+    editor_session: Signal<u64>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(input) = document
+        .create_element("input")
+        .ok()
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    input.set_type("file");
+    let _ = input.set_attribute("accept", "image/*");
+
+    // The document this pick belongs to. If the editor loads another before the
+    // upload resolves, its result must not land on the now-current post.
+    let pick_gen = editor_session.get();
+    let picker = input.clone();
+    let on_change = Closure::<dyn FnMut()>::new(move || {
+        let Some(file) = picker.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        spawn_local(async move {
+            let Ok(form) = web_sys::FormData::new() else {
+                notice.set("Your browser blocked the upload form.".to_owned());
+                return;
+            };
+            let _ = form.append_with_blob_and_filename("file", &file, &file.name());
+            let _ = form.append_with_str("alt", "");
+
+            let result = api::upload_media(form).await;
+            // The editor moved on while we were uploading: drop the result (a 401 is
+            // auth-wide, so it still routes to login).
+            if editor_session.get() != pick_gen {
+                if let Err(api::ApiError::Unauthorized) = result {
+                    auth.session_expired();
+                }
+                return;
+            }
+            match result {
+                Ok(resp) => featured.set(Some(api::FeaturedMedia {
+                    id: resp.id,
+                    url: resp.url,
+                })),
+                Err(api::ApiError::Unauthorized) => auth.session_expired(),
+                Err(api::ApiError::Message(e)) => {
+                    notice.set(format!("Featured image upload failed: {e}"))
+                }
+            }
+        });
+    });
+    input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
+    on_change.forget();
+    input.click();
+}
+
 /// Open the OS image picker, upload the chosen file, and insert it at the caret.
 ///
 /// The `<input type=file>` is created and `.click()`ed SYNCHRONOUSLY inside this
@@ -681,7 +807,16 @@ fn edit_link_via_prompt(editor: Signal<EditorHandle>, notice: Signal<String>) {
 /// node whose `src` is the server-issued `/media/{id}` URL — the SAME URL the bridge
 /// reverses to a `media_id` on save and the public page renders, so the in-editor
 /// image matches the published page.
-fn insert_image_via_picker(editor: Signal<EditorHandle>, notice: Signal<String>, auth: AuthCtx) {
+///
+/// The upload runs async: if the editor has loaded a DIFFERENT document by the time it
+/// resolves (tracked via `editor_session`, like [`save_post`]'s stale guard), the
+/// image is NOT inserted — it was picked for a post that is no longer open.
+fn insert_image_via_picker(
+    editor: Signal<EditorHandle>,
+    editor_session: Signal<u64>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
 
@@ -702,6 +837,7 @@ fn insert_image_via_picker(editor: Signal<EditorHandle>, notice: Signal<String>,
     // one-shot handler (a few hundred bytes) so it outlives this function and is alive
     // when the dialog resolves — the standard wasm-bindgen idiom for a detached DOM
     // callback; image inserts are infrequent, so the leak is immaterial.
+    let pick_gen = editor_session.get();
     let picker = input.clone();
     let on_change = Closure::<dyn FnMut()>::new(move || {
         let Some(file) = picker.files().and_then(|files| files.get(0)) else {
@@ -725,7 +861,16 @@ fn insert_image_via_picker(editor: Signal<EditorHandle>, notice: Signal<String>,
             let _ = form.append_with_blob_and_filename("file", &file, &file.name());
             let _ = form.append_with_str("alt", &alt);
 
-            match api::upload_media(form).await {
+            let result = api::upload_media(form).await;
+            // The editor moved to another document while we were uploading: don't
+            // insert into it (a 401 is auth-wide, so it still routes to login).
+            if editor_session.get() != pick_gen {
+                if let Err(api::ApiError::Unauthorized) = result {
+                    auth.session_expired();
+                }
+                return;
+            }
+            match result {
                 Ok(resp) => {
                     if !editor.get().insert_image(&resp.url, &alt) {
                         notice.set(

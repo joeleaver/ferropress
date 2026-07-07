@@ -16,7 +16,7 @@ use ferropress_auth::{SigningKey, hash_password};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, now_millis};
 use ferropress_core::{
-    Block, BlockKind, BlockTree, InlineRun, MEDIA_TYPE, POST_TYPE, Status, USER_TYPE,
+    Block, BlockKind, BlockTree, Edge, InlineRun, MEDIA_TYPE, POST_TYPE, Status, USER_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
@@ -163,6 +163,35 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> O
         .create(&TypeName::from(POST_TYPE), f)
         .await
         .expect("seed post")
+}
+
+/// Seed a `Media` row (mirrors the scalar fields the upload handler writes, minus
+/// the `meta` Json field this test doesn't read) so a test can feature it. Returns
+/// the created row's `ObjectId` (`uuid` is an input, echoed in the served URL).
+async fn seed_media(store: &Arc<dyn RhypeStore>, uuid: &str) -> ObjectId {
+    let mut f: FieldMap = HashMap::new();
+    f.insert("uuid".to_owned(), Value::String(uuid.to_owned()));
+    f.insert("slug".to_owned(), Value::String(uuid.to_owned()));
+    f.insert("filename".to_owned(), Value::String(format!("{uuid}.png")));
+    f.insert("mime_type".to_owned(), Value::String("image/png".to_owned()));
+    f.insert("byte_size".to_owned(), Value::U64(68));
+    f.insert("width".to_owned(), Value::U32(1));
+    f.insert("height".to_owned(), Value::U32(1));
+    f.insert("alt_text".to_owned(), Value::String(String::new()));
+    f.insert("caption".to_owned(), Value::String(String::new()));
+    f.insert("description".to_owned(), Value::String(String::new()));
+    f.insert(
+        "blob_key".to_owned(),
+        Value::String(format!("media/{uuid}.png")),
+    );
+    f.insert("plaintext".to_owned(), Value::String(String::new()));
+    f.insert("focal_x".to_owned(), Value::F32(0.5));
+    f.insert("focal_y".to_owned(), Value::F32(0.5));
+    f.insert("created_at".to_owned(), Value::DateTime(now_millis()));
+    store
+        .create(&TypeName::from(MEDIA_TYPE), f)
+        .await
+        .expect("seed media")
 }
 
 /// POST /admin/api/posts (create) with the given cookie + JSON body; return
@@ -419,6 +448,181 @@ async fn list_get_save_roundtrip_updates_body_and_plaintext() {
         obj.get("plaintext")
     );
     assert!(matches!(obj.get("updated_at"), Some(Value::DateTime(_))));
+}
+
+#[tokio::test]
+async fn featured_media_set_read_and_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let post_id = seed_post(&store, "featured", Status::Published).await;
+    let uuid = "0191aaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let media_id = seed_media(&store, uuid).await;
+
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let save_body = |featured: serde_json::Value| {
+        serde_json::json!({
+            "title": "Featured",
+            "slug": "featured",
+            "status": "published",
+            "block_tree": one_paragraph("body"),
+            "featured_media": featured,
+        })
+        .to_string()
+    };
+    let put = |body: String| {
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/admin/api/posts/{}", post_id.0))
+            .header(header::COOKIE, &cookie)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let get = || {
+        Request::builder()
+            .uri(format!("/admin/api/posts/{}", post_id.0))
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // Save WITH a featured image → get_one returns {id, url} keyed by the uuid.
+    let resp = router(state.clone())
+        .oneshot(put(save_body(serde_json::json!(media_id.0))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "save with featured should succeed");
+    let detail = to_json(router(state.clone()).oneshot(get()).await.unwrap()).await;
+    assert_eq!(detail["featured_media"]["id"], media_id.0);
+    assert_eq!(detail["featured_media"]["url"], format!("/media/{uuid}"));
+
+    // The list row carries the same thumbnail URL.
+    let list = to_json(
+        router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/posts")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        list.as_array().unwrap().iter().any(|p| p["id"] == post_id.0
+            && p["featured_media"]["url"] == format!("/media/{uuid}")),
+        "list row must carry featured_media: {list}"
+    );
+
+    // Save with null clears the relation.
+    let resp = router(state.clone())
+        .oneshot(put(save_body(serde_json::Value::Null)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = to_json(router(state.clone()).oneshot(get()).await.unwrap()).await;
+    assert!(
+        detail["featured_media"].is_null(),
+        "featured should be cleared: {detail}"
+    );
+
+    // A nonexistent featured id is rejected up front (no half-save).
+    let resp = router(state.clone())
+        .oneshot(put(save_body(serde_json::json!(9_999_999))))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a bogus featured_media id must 400"
+    );
+}
+
+#[tokio::test]
+async fn create_with_featured_then_replace_keeps_it_to_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let a = seed_media(&store, "0191aaaa-0000-7000-8000-000000000001").await;
+    let b = seed_media(&store, "0191bbbb-0000-7000-8000-000000000002").await;
+
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // Create a post WITH a featured image (the create path + its link).
+    let (status, body) = do_create(
+        &state,
+        &cookie,
+        serde_json::json!({
+            "title": "New", "slug": "new-featured",
+            "block_tree": one_paragraph("body"), "featured_media": a.0,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create body: {body}");
+    let post_id = body["id"].as_u64().expect("new id");
+
+    let get = |cookie: &str| {
+        Request::builder()
+            .uri(format!("/admin/api/posts/{post_id}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let detail = to_json(router(state.clone()).oneshot(get(&cookie)).await.unwrap()).await;
+    assert_eq!(detail["featured_media"]["id"], a.0, "create must attach A");
+
+    // Replace A -> B on save.
+    let resp = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/admin/api/posts/{post_id}"))
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "title": "New", "slug": "new-featured", "status": "draft",
+                        "block_tree": one_paragraph("body"), "featured_media": b.0,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = to_json(router(state.clone()).oneshot(get(&cookie)).await.unwrap()).await;
+    assert_eq!(detail["featured_media"]["id"], b.0, "A must be replaced by B");
+
+    // The to-one invariant: exactly ONE featured link remains (no A+B accumulation).
+    let links = store
+        .get_links(&Edge {
+            type_name: TypeName::from(POST_TYPE),
+            id: ObjectId(post_id),
+            field: "featured_media".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(links.len(), 1, "exactly one featured link");
+    assert_eq!(links[0].0, b, "the single link is B");
+
+    // Create with a nonexistent featured id is rejected (create's up-front guard).
+    let (status, _) = do_create(
+        &state,
+        &cookie,
+        serde_json::json!({
+            "title": "Bad", "slug": "bad-featured",
+            "block_tree": one_paragraph("x"), "featured_media": 9_999_999,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "bogus featured id must 400 on create");
 }
 
 #[tokio::test]

@@ -182,7 +182,7 @@ const ADMIN_CSS: &str = r#"
 .galley__state.err { color: var(--minium-deep); }
 
 .row {
-  display: grid; grid-template-columns: 22px 1fr auto auto auto; align-items: center; gap: 1rem;
+  display: grid; grid-template-columns: 36px 1fr auto auto auto; align-items: center; gap: 1rem;
   padding: .85rem .5rem .85rem .25rem; border-bottom: 1px solid var(--rule);
   text-decoration: none; color: inherit; width: 100%; background: transparent; border-left: 0; border-right: 0; border-top: 0;
   text-align: left; font: inherit; transition: background .12s;
@@ -190,6 +190,7 @@ const ADMIN_CSS: &str = r#"
 .row:hover { background: var(--paper-raise); }
 .row__mark { color: var(--minium); opacity: 0; transition: opacity .12s; }
 .row:hover .row__mark { opacity: 1; }
+.row__thumb { width: 32px; height: 32px; object-fit: cover; display: block; border: 1px solid var(--rule); border-radius: 2px; }
 .row__title { font-family: var(--ff-display); font-weight: 500; font-size: 1.12rem; color: var(--ink); line-height: 1.25; }
 .row__slug { display: block; font-family: var(--ff-mono); font-size: .78rem; color: var(--steel); margin-top: .1rem; }
 .row__time { font-family: var(--ff-mono); font-size: .78rem; color: var(--steel); white-space: nowrap; }
@@ -211,6 +212,8 @@ const ADMIN_CSS: &str = r#"
 }
 .metaitem { display: flex; align-items: center; gap: .55rem; }
 .metaitem > label { font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--steel); }
+.featured { display: inline-flex; align-items: center; gap: .5rem; }
+.featured__thumb { width: 56px; height: 56px; object-fit: cover; display: block; border: 1px solid var(--rule); border-radius: 2px; }
 .slugbox {
   display: inline-flex; align-items: center; background: var(--paper-sink);
   border: 1px solid var(--rule); border-radius: var(--radius); padding: .3rem .5rem;
@@ -296,7 +299,7 @@ const ADMIN_CSS: &str = r#"
 .toast .regmark { color: var(--minium-hi); }
 
 @media (max-width: 640px) {
-  .row { grid-template-columns: 18px 1fr auto; }
+  .row { grid-template-columns: 36px 1fr auto; }
   .row__time, .row__edit { display: none; }
   .sheet { padding: 1.5rem; }
   .sheet__title { font-size: 1.7rem; }

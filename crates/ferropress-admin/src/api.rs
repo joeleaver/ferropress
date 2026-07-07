@@ -35,6 +35,15 @@ struct SessionResponse {
     user: UserDto,
 }
 
+/// A post's featured image: the Media `id` (echoed back on save to set the relation)
+/// and its public `url` (for the thumbnail).
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct FeaturedMedia {
+    pub id: u64,
+    #[serde(default)]
+    pub url: String,
+}
+
 /// One row of `GET /admin/api/posts`.
 #[derive(Clone, PartialEq, Deserialize)]
 pub struct PostSummary {
@@ -48,6 +57,9 @@ pub struct PostSummary {
     /// Last-touched instant, epoch millis (or `None`).
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// The featured image, for the galley-row thumbnail.
+    #[serde(default)]
+    pub featured_media: Option<FeaturedMedia>,
 }
 
 /// `GET /admin/api/posts/{id}` — a post with its body, for the editor to load.
@@ -63,6 +75,9 @@ pub struct PostDetail {
     /// The canonical Ferropress `BlockTree` JSON (the bridge converts it editor-side).
     #[serde(default)]
     pub block_tree: serde_json::Value,
+    /// The featured image, shown in the editor's featured-image control.
+    #[serde(default)]
+    pub featured_media: Option<FeaturedMedia>,
 }
 
 #[derive(Serialize)]
@@ -78,6 +93,8 @@ pub struct SaveRequest {
     pub slug: String,
     pub status: String,
     pub block_tree: serde_json::Value,
+    /// The featured image's Media id, or `None` to clear it.
+    pub featured_media: Option<u64>,
 }
 
 /// `POST /admin/api/posts` body — create a new post. Same shape as [`SaveRequest`]
@@ -88,6 +105,8 @@ pub struct CreateRequest {
     pub slug: String,
     pub status: String,
     pub block_tree: serde_json::Value,
+    /// An optional featured image (Media id) for the new post.
+    pub featured_media: Option<u64>,
 }
 
 /// `{ id }` from a successful create (the rest of the response is ignored).
@@ -255,12 +274,14 @@ pub async fn create_post(body: &CreateRequest) -> Result<u64, ApiError> {
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
-/// `POST /admin/api/media` response. Only `url` (`/media/{id}`) is read — it's what
-/// the editor inserts as the image `src`; the bridge reverses it to the `media_id` on
-/// save and the public page renders the same URL. (The server also returns `id` +
-/// dimensions; serde ignores the fields we don't render.)
+/// `POST /admin/api/media` response. `url` (`/media/{uuid}`) is what the editor
+/// inserts as the image `src`; `id` is the Media's handle, echoed back as
+/// `featured_media` to set the relation. (The server also returns dimensions +
+/// mime; serde ignores the fields we don't use.)
 #[derive(Deserialize)]
 pub struct UploadResponse {
+    #[serde(default)]
+    pub id: u64,
     #[serde(default)]
     pub url: String,
 }
