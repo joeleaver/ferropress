@@ -95,6 +95,7 @@ name = "ferropress-admin"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "ferropress-core",
  "ferropress-editor-bridge",
  "gloo-net",
  "gloo-timers",

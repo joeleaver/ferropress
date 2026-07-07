@@ -37,6 +37,12 @@ rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", rev = "9e1
 # only for the rinch/rhypedb/jkbase upstreams).
 ferropress-editor-bridge = { path = "../ferropress-editor-bridge" }
 
+# Core shares the link-URL safety policy (`is_safe_href`) with the renderer, so the
+# editor rejects a script-bearing link URL before it is ever stored — the same
+# check the renderer enforces authoritatively. (Already in the wasm graph via the
+# bridge; this makes the direct import explicit.)
+ferropress-core = { path = "../ferropress-core" }
+
 # WASM glue.
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

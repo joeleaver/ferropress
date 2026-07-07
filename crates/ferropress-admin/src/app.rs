@@ -334,6 +334,7 @@ pub fn app() -> NodeHandle {
                             button { class: "tool tool--i", title: "Bold", onclick: move || { editor.get().command("toggleBold"); }, b { "B" } }
                             button { class: "tool tool--i", title: "Italic", onclick: move || { editor.get().command("toggleItalic"); }, i { "I" } }
                             button { class: "tool tool--label", title: "Inline code", onclick: move || { editor.get().command("toggleCode"); }, "</>" }
+                            button { class: "tool", title: "Link", onclick: move || edit_link_via_prompt(editor, notice), "\u{1F517}" }
                             span { class: "toolbar__sep" }
                             button { class: "tool tool--label", title: "Heading 2", onclick: move || { editor.get().command("setHeading2"); }, "H2" }
                             button { class: "tool tool--label", title: "Heading 3", onclick: move || { editor.get().command("setHeading3"); }, "H3" }
@@ -598,6 +599,75 @@ fn new_post(
         handle.load_doc(node);
     }
     auth.view.set(View::Editor);
+}
+
+/// Add, replace, or remove a hyperlink on the current selection.
+///
+/// A link spans a text RANGE, so this needs a non-empty selection (unlike image
+/// insert, which drops an atom at the caret). rinch registers no string command to
+/// *add* a link — only `removeLink` — because a link carries an `href` and the
+/// arg-less `command(&str)` facade can't pass one; so the mark is built and
+/// dispatched through the general `update` path using the upstream
+/// `commands::toggle_link(href)` builder.
+///
+/// Flow: prompt for the URL, clear any link already on the selection (so re-linking
+/// *replaces* the target rather than layering a second `link` mark), and — for a
+/// non-empty, script-safe URL — apply the new link. Clearing the field and
+/// confirming removes the link; cancelling (Esc) changes nothing. The URL is checked
+/// with the SAME `ferropress_core::is_safe_href` policy the renderer enforces, so a
+/// rejected scheme (e.g. `javascript:`) is never stored — and the author is told why.
+fn edit_link_via_prompt(editor: Signal<EditorHandle>, notice: Signal<String>) {
+    let handle = editor.get();
+
+    if handle.selection().is_empty() {
+        notice.set("Select the text you want to link first.".to_owned());
+        return;
+    }
+
+    // Cancelling the prompt (Esc / no window) leaves the selection untouched.
+    let Some(input) = web_sys::window().and_then(|w| w.prompt_with_message("Link URL:").ok().flatten())
+    else {
+        return;
+    };
+    let href = input.trim().to_owned();
+
+    // Validate BEFORE mutating anything, so a rejected URL never disturbs a link
+    // already on the selection. An empty URL is allowed here — it means "unlink".
+    // Report a whitespace/control fault distinctly from a bad scheme, so the author
+    // isn't told an otherwise-valid http(s) URL has the "wrong scheme" when the real
+    // problem is an embedded space.
+    if !href.is_empty() {
+        if href.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            notice.set("Link URL can't contain spaces or control characters.".to_owned());
+            return;
+        }
+        if !ferropress_core::is_safe_href(&href) {
+            notice.set("Links must be http(s), mailto, or a site-relative path.".to_owned());
+            return;
+        }
+    }
+
+    // Clear any existing link on the range so a new URL replaces it cleanly (rather
+    // than stacking marks); an empty URL then simply leaves the text unlinked.
+    if handle.is_mark_active("link") {
+        handle.command("removeLink");
+    }
+    if href.is_empty() {
+        return;
+    }
+
+    // No named command carries an href, so run the `toggle_link` builder through the
+    // general dispatch path (which re-projects the DOM). The selection now has no
+    // link (cleared above), so `toggle_link` adds one.
+    let applied = handle.update(move |state| {
+        let command = rinch_editor_core::commands::toggle_link(href);
+        let mut tx = None;
+        command(state, Some(&mut |t| tx = Some(t)));
+        tx
+    });
+    if !applied {
+        notice.set("Couldn't add the link \u{2014} try selecting the text again.".to_owned());
+    }
 }
 
 /// Open the OS image picker, upload the chosen file, and insert it at the caret.
