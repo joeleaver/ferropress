@@ -298,12 +298,75 @@ const ADMIN_CSS: &str = r#"
 .toast.is-shown { transform: translateX(-50%) translateY(0); }
 .toast .regmark { color: var(--minium-hi); }
 
+/* ── SETTINGS ("the forms drawer") — the schema-driven edit UI ─────── */
+/* A schema section = a titled proof panel. */
+.panel {
+  background: var(--paper-raise); border: 1px solid var(--rule);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 1.4rem 1.6rem .4rem; margin-bottom: 1.5rem;
+}
+.panel__title {
+  font-family: var(--ff-display); font-weight: 600; font-size: 1.2rem;
+  color: var(--ink); margin: 0 0 .2rem; padding-bottom: .7rem;
+  border-bottom: 2px solid var(--ink);
+}
+.panel__note { margin: .6rem 0 0; font-size: .85rem; color: var(--steel); }
+
+/* One field = a two-column set line: label/help left, control right. */
+.setrow {
+  display: grid; grid-template-columns: 13rem 1fr; gap: .4rem 1.6rem;
+  align-items: start; padding: 1rem 0; border-bottom: 1px solid var(--rule);
+}
+.setrow:last-child { border-bottom: 0; }
+.setrow.is-hidden { display: none; }
+.setrow__label {
+  font-size: .78rem; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--steel); padding-top: .5rem;
+}
+.setrow__control { min-width: 0; }
+.setrow__control .input, .setrow__control .select { max-width: 28rem; }
+.setrow__help {
+  grid-column: 2; margin: .45rem 0 0; font-size: .82rem; line-height: 1.4;
+  color: var(--steel); max-width: 34rem;
+}
+
+/* number + unit suffix */
+.numfield { display: inline-flex; align-items: baseline; gap: .5rem; }
+.input--number { width: 5.5rem; text-align: right; font-family: var(--ff-mono); }
+.numfield__unit { font-family: var(--ff-mono); font-size: .82rem; letter-spacing: .06em; color: var(--steel); }
+
+/* toggle — a composing-stick lever */
+.switch { display: inline-flex; align-items: center; gap: .7rem; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch__track {
+  position: relative; flex: none; width: 42px; height: 23px;
+  background: var(--paper-sink); border: 1px solid #C6C7C0; border-radius: 999px;
+  transition: background .15s, border-color .15s;
+}
+.switch__knob {
+  position: absolute; top: 2px; left: 2px; width: 17px; height: 17px;
+  border-radius: 50%; background: #FCFCF9; box-shadow: 0 1px 2px rgba(23,25,28,.35);
+  transition: transform .18s cubic-bezier(.3,.7,.3,1);
+}
+.switch__track.is-on { background: var(--minium); border-color: var(--minium-deep); }
+.switch__track.is-on .switch__knob { transform: translateX(19px); }
+.switch input:focus-visible + .switch__track { outline: 2px solid var(--minium); outline-offset: 2px; }
+.switch__text { font-size: .92rem; color: var(--ink-2); }
+
+/* radio group */
+.radiogroup { display: flex; flex-direction: column; gap: .55rem; }
+.radio { display: inline-flex; align-items: center; gap: .6rem; cursor: pointer; font-size: .95rem; color: var(--ink-2); }
+.radio input { accent-color: var(--minium); width: 1rem; height: 1rem; margin: 0; }
+
 @media (max-width: 640px) {
   .row { grid-template-columns: 36px 1fr auto; }
   .row__time, .row__edit { display: none; }
   .sheet { padding: 1.5rem; }
   .sheet__title { font-size: 1.7rem; }
   .sheet [data-pm-editor] h1 { font-size: 1.7rem; }
+  .setrow { grid-template-columns: 1fr; gap: .3rem; }
+  .setrow__label { padding-top: 0; }
+  .setrow__help { grid-column: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
   .fp-admin *, .toast { transition: none !important; }

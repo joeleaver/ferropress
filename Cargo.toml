@@ -45,6 +45,10 @@ exclude = [
     "crates/ferropress-islands",
     "crates/ferropress-admin",
     "crates/ferropress-editor-bridge",
+    #   * crates/ferropress-form-view — the FormSchema → rinch edit-UI renderer used
+    #     by the admin SPA. Excluded because it deps the `rinch` facade (banned from
+    #     workspace members); a wasm-consumed library path-dep'd by ferropress-admin.
+    "crates/ferropress-form-view",
     "plugins",
 ]
 

@@ -307,6 +307,62 @@ pub async fn upload_media(form: FormData) -> Result<UploadResponse, ApiError> {
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
+/// `GET`/`PUT /admin/api/settings` response: the declarative schema (rendered by
+/// `ferropress-form-view`) + the current `key -> value` map. `FormSchema` is the
+/// shared rinch-free type from `ferropress-render-form`.
+#[derive(Deserialize)]
+pub struct SettingsDto {
+    #[serde(default)]
+    pub schema: ferropress_render_form::FormSchema,
+    #[serde(default)]
+    pub values: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `PUT /admin/api/settings` body — a sparse map of edits (the server whitelists to
+/// the schema's keys).
+#[derive(Serialize)]
+struct PutSettingsBody {
+    values: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `GET /admin/api/settings` — the settings schema + current values (Administrator
+/// only; a 401 routes back to login, a 403 surfaces as a message).
+pub async fn get_settings() -> Result<SettingsDto, ApiError> {
+    let resp = Request::get("/admin/api/settings")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<SettingsDto>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `PUT /admin/api/settings` — persist edited values; returns the fresh schema +
+/// values. On a validation failure the server's `{ error }` message is surfaced
+/// verbatim; a 401 routes back to login.
+pub async fn put_settings(
+    values: serde_json::Map<String, serde_json::Value>,
+) -> Result<SettingsDto, ApiError> {
+    let built = Request::put("/admin/api/settings")
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&PutSettingsBody { values });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<SettingsDto>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
 /// Read a failed response's `{ error }` body, falling back to the status code.
 async fn error_message(resp: Response) -> String {
     let status = resp.status();

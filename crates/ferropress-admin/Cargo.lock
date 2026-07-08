@@ -97,6 +97,8 @@ dependencies = [
  "console_error_panic_hook",
  "ferropress-core",
  "ferropress-editor-bridge",
+ "ferropress-form-view",
+ "ferropress-render-form",
  "gloo-net",
  "gloo-timers",
  "js-sys",
@@ -132,6 +134,24 @@ dependencies = [
  "rinch-editor-core",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "ferropress-form-view"
+version = "0.1.0"
+dependencies = [
+ "ferropress-render-form",
+ "rinch",
+ "serde_json",
+]
+
+[[package]]
+name = "ferropress-render-form"
+version = "0.1.0"
+dependencies = [
+ "ferropress-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -36,6 +36,7 @@ use crate::AppState;
 pub mod auth;
 pub mod media;
 pub mod posts;
+pub mod settings;
 
 #[cfg(test)]
 mod tests;
@@ -277,6 +278,9 @@ pub fn api_routes() -> Router<AppState> {
             "/admin/api/posts/{id}",
             get(posts::get_one).put(posts::save),
         )
+        // Site settings: read the schema + values, write a validated submission.
+        // Both gated on `ManageSettings` (Administrator).
+        .route("/admin/api/settings", get(settings::get).put(settings::put))
         // Media upload (multipart). axum's default 2 MiB body limit would reject a
         // real image, so this route carries its own limit sized to the handler's
         // per-file cap plus multipart-framing headroom.

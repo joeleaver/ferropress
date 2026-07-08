@@ -1580,6 +1580,7 @@ dependencies = [
  "ferropress-core",
  "ferropress-plugin-host",
  "ferropress-render",
+ "ferropress-render-form",
  "ferropress-serve",
  "ferropress-store-embedded",
  "ferropress-theme",
@@ -1624,7 +1625,8 @@ name = "ferropress-render-form"
 version = "0.1.0"
 dependencies = [
  "ferropress-core",
- "ferropress-render",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

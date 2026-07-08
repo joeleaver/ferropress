@@ -37,6 +37,13 @@ rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", rev = "9e1
 # only for the rinch/rhypedb/jkbase upstreams).
 ferropress-editor-bridge = { path = "../ferropress-editor-bridge" }
 
+# The FormSchema → rinch edit-UI renderer (site settings; plugin config later). Its
+# own excluded crate so the SINGLE widget dispatch lives in one place; it pins the
+# SAME rinch rev as above so `SchemaForm` returns the same `NodeHandle` type this SPA
+# mounts. It re-exports the schema DATA types from `ferropress-render-form`.
+ferropress-form-view = { path = "../ferropress-form-view" }
+ferropress-render-form = { path = "../ferropress-render-form" }
+
 # Core shares the link-URL safety policy (`is_safe_href`) with the renderer, so the
 # editor rejects a script-bearing link URL before it is ever stored — the same
 # check the renderer enforces authoritatively. (Already in the wasm graph via the

@@ -3,15 +3,16 @@ name = "ferropress-render-form"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "THE single form-schema (JSON) -> edit-UI renderer (mirror of ferropress-render). rinch implementation pending upstream; rinch-free placeholder for now."
+description = "The declarative form-schema DATA + validation layer (site settings; plugin config later). rinch-free by design — the single WidgetKind→edit-UI dispatch lives in the excluded ferropress-form-view crate."
 
 [lints]
 workspace = true
 
 [dependencies]
-# NOTE: rinch is DEFERRED. This crate will gain a `rinch` git dependency and a
-# wasm target once the upstream rinch features land (rinch #50 CE serde, #51 CE
-# in WASM-DOM). For now it is a rinch-FREE placeholder so the whole workspace
-# keeps compiling on the host. Deps are exactly what the stub lib.rs uses.
+# rinch-free by design: this crate holds only the serde schema DATA + the
+# untrusted-input validation. The one WidgetKind→rinch dispatch lives in the
+# EXCLUDED `ferropress-form-view` crate (rinch is banned from workspace members).
+# ferropress-core supplies `is_safe_href` for URL-format validation.
 ferropress-core = { workspace = true }
-ferropress-render = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

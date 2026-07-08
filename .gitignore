@@ -26,6 +26,10 @@
 /crates/ferropress-admin/target/
 /crates/ferropress-admin/dist/
 /crates/ferropress-editor-bridge/target/
+/crates/ferropress-form-view/target/
+# ferropress-form-view is a wasm-only LIBRARY built only through ferropress-admin
+# (its deps are pinned by the admin's Cargo.lock), so it has no standalone lock.
+/crates/ferropress-form-view/Cargo.lock
 
 # plugins/ are wasm cdylibs OUTSIDE the workspace (Extism PDK). Each has its own
 # target dir; `cargo xtask build-plugins` assembles the loadable bundles into

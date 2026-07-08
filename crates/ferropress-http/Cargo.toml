@@ -13,6 +13,11 @@ ferropress-core = { workspace = true }
 ferropress-serve = { workspace = true }
 ferropress-theme = { workspace = true }
 ferropress-render = { workspace = true }
+# The declarative site-settings schema + untrusted-input validation. The admin
+# Settings endpoints ship this schema to the wasm SPA and validate a submission
+# against it. rinch-free (the schema→rinch dispatch lives in the excluded
+# ferropress-form-view crate), so it enters the host graph cleanly.
+ferropress-render-form = { workspace = true }
 # Admin auth: Argon2 password verify + HMAC signed session tokens (the admin API
 # guards /admin/api/* with a signed-cookie session).
 ferropress-auth = { workspace = true }

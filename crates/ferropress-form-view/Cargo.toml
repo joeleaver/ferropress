@@ -1,0 +1,28 @@
+# ferropress-form-view — THE FormSchema → rinch edit-UI renderer for the admin SPA.
+#
+# EXCLUDED from the workspace (like ferropress-admin / ferropress-islands /
+# ferropress-editor-bridge): it depends on the `rinch` facade, which the dep-graph
+# lint bans from every workspace member. It is a LIBRARY (no cdylib) consumed by
+# ferropress-admin via a path dep, so the admin build compiles it for wasm32 and CI
+# checks it under the admin-wasm job. rinch is pinned to the EXACT SAME rev the admin
+# + editor-bridge use — a mismatch would make `NodeHandle` two different types and the
+# cross-crate component call would not type-check.
+[package]
+name = "ferropress-form-view"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The single FormSchema → rinch edit-UI dispatch (FERROPRESS-FORM-DISPATCH) for the Ferropress admin SPA."
+publish = false
+
+[dependencies]
+# The schema DATA + validation (rinch-free, workspace). A path dep to a sibling is
+# fine — the no-path rule is only for the rinch/rhypedb/jkbase UPSTREAMS.
+ferropress-render-form = { path = "../ferropress-render-form" }
+
+# rinch — UPSTREAM, pinned git rev. MUST equal ferropress-admin / ferropress-editor-bridge
+# (NodeHandle identity across the cross-crate component call). Same feature set the admin
+# uses so the facade resolves identically.
+rinch = { git = "https://github.com/joeleaver/rinch.git", rev = "9e142ae3e485ce05ab1e84a88f1533712efb98d6", default-features = false, features = ["components", "theme"] }
+
+serde_json = "1"

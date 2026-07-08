@@ -480,6 +480,114 @@
   .toast.is-shown { transform: translateX(-50%) translateY(0); }
   .toast .regmark { color: var(--minium-hi); }
 
+  /* ------------------------------------------------------------------ *
+   *  SETTINGS — "the forms drawer" (declarative schema → edit UI)
+   *  Rendered by ferropress-render-form's single widget dispatch.
+   * ------------------------------------------------------------------ */
+  /* A schema section = an imposition panel: a titled proof card. */
+  .panel {
+    background: var(--paper-raise);
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1.4rem 1.6rem .4rem;
+    margin-bottom: 1.5rem;
+  }
+  .panel__title {
+    display: flex; align-items: baseline; gap: .6rem;
+    font-family: var(--ff-display);
+    font-weight: 600;
+    font-size: 1.2rem;
+    color: var(--ink);
+    margin: 0 0 .2rem;
+    padding-bottom: .7rem;
+    border-bottom: 2px solid var(--ink);
+  }
+  .panel__idx {
+    font-family: var(--ff-mono); font-size: .72rem; font-weight: 500;
+    letter-spacing: .12em; color: var(--steel-2);
+  }
+  .panel__note { margin: .6rem 0 0; font-size: .85rem; color: var(--steel); }
+
+  /* One field = a two-column set line: label/help left, control right. */
+  .setrow {
+    display: grid;
+    grid-template-columns: 13rem 1fr;
+    gap: .4rem 1.6rem;
+    align-items: start;
+    padding: 1rem 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .setrow:last-child { border-bottom: 0; }
+  .setrow__label {
+    font-size: .78rem; font-weight: 600; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--steel);
+    padding-top: .5rem;
+  }
+  .setrow__control { min-width: 0; }
+  .setrow__help {
+    grid-column: 2;
+    margin: .45rem 0 0;
+    font-size: .82rem; line-height: 1.4; color: var(--steel);
+    max-width: 34rem;
+  }
+  /* text/email/url controls reuse .input, held to a readable measure */
+  .setrow__control .input { max-width: 28rem; }
+  .setrow__control .select { max-width: 28rem; }
+
+  /* number + unit suffix */
+  .numfield { display: inline-flex; align-items: baseline; gap: .5rem; }
+  .input--number {
+    width: 5.5rem; text-align: right;
+    font-family: var(--ff-mono);
+  }
+  .numfield__unit {
+    font-family: var(--ff-mono); font-size: .82rem;
+    letter-spacing: .06em; color: var(--steel);
+  }
+
+  /* toggle — a composing-stick lever */
+  .switch { display: inline-flex; align-items: center; gap: .7rem; cursor: pointer; }
+  .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .switch__track {
+    position: relative; flex: none;
+    width: 42px; height: 23px;
+    background: var(--paper-sink);
+    border: 1px solid #C6C7C0;
+    border-radius: 999px;
+    transition: background .15s, border-color .15s;
+  }
+  .switch__knob {
+    position: absolute; top: 2px; left: 2px;
+    width: 17px; height: 17px; border-radius: 50%;
+    background: #FCFCF9;
+    box-shadow: 0 1px 2px rgba(23,25,28,.35);
+    transition: transform .18s cubic-bezier(.3,.7,.3,1);
+  }
+  .switch input:checked + .switch__track { background: var(--minium); border-color: var(--minium-deep); }
+  .switch input:checked + .switch__track .switch__knob { transform: translateX(19px); }
+  .switch input:focus-visible + .switch__track { outline: 2px solid var(--minium); outline-offset: 2px; }
+  .switch__text { font-size: .92rem; color: var(--ink-2); }
+
+  /* radio group — set of registration choices */
+  .radiogroup { display: flex; flex-direction: column; gap: .55rem; }
+  .radio { display: inline-flex; align-items: center; gap: .6rem; cursor: pointer; font-size: .95rem; color: var(--ink-2); }
+  .radio input { accent-color: var(--minium); width: 1rem; height: 1rem; margin: 0; }
+
+  /* a conditionally-revealed field (visible_when) — nested, ruled to the left */
+  .setrow--nested {
+    grid-template-columns: 13rem 1fr;
+    padding-top: .3rem;
+  }
+  .subfield { border-left: 2px solid var(--minium); padding-left: .9rem; }
+  .is-hidden { display: none; }
+
+  @media (max-width: 640px) {
+    .setrow, .setrow--nested { grid-template-columns: 1fr; gap: .3rem; }
+    .setrow__label { padding-top: 0; }
+    .setrow__help, .setrow--nested .subfield { grid-column: 1; }
+  }
+
   @media (max-width: 640px) {
     .row { grid-template-columns: 18px 1fr auto; }
     .row__time, .row__edit { display: none; }
@@ -556,6 +664,7 @@
       <span class="masthead__sep">·</span>
       <span class="masthead__here">Posts</span>
       <span class="masthead__spacer"></span>
+      <button class="btn btn--quiet" type="button" data-go="settings">Settings</button>
       <span class="masthead__user"><span class="masthead__avatar">J</span> jane</span>
       <button class="btn btn--quiet" type="button" data-go="login">Sign out</button>
     </div>
@@ -679,6 +788,142 @@
   </div>
 </section>
 
+<!-- =================== SETTINGS (THE FORMS DRAWER) =================== -->
+<section class="view" id="view-settings">
+  <header class="masthead">
+    <div class="ruler"></div>
+    <div class="masthead__bar">
+      <button class="btn btn--quiet btn--back" type="button" data-go="list">
+        <svg width="14" height="9" viewBox="0 0 16 10" fill="none"><path d="M15 5H2M6 1L2 5l4 4" stroke="currentColor" stroke-width="1.6"/></svg>
+        Posts
+      </button>
+      <span class="masthead__sep">·</span>
+      <span class="masthead__here">Settings</span>
+      <span class="masthead__spacer"></span>
+      <button class="btn btn--primary save" id="settings-save" type="button" style="width:auto">
+        <span class="save__label">Save changes</span>
+        <span class="regmark" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7" stroke="currentColor" stroke-width="2.4"/><path d="M15 4v5M15 21v5M4 15h5M21 15h5" stroke="currentColor" stroke-width="2.4"/></svg></span>
+      </button>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="galley__head">
+      <h2 class="galley__title">Settings</h2>
+      <span class="galley__count">site configuration</span>
+    </div>
+
+    <!-- SITE IDENTITY -->
+    <section class="panel">
+      <h3 class="panel__title">Site identity <span class="panel__idx">§ 01</span></h3>
+
+      <div class="setrow">
+        <div class="setrow__label">Site title</div>
+        <div class="setrow__control"><input class="input" value="Ferropress" /></div>
+        <p class="setrow__help">The name of your site — shown in the masthead and the browser tab.</p>
+      </div>
+
+      <div class="setrow">
+        <div class="setrow__label">Tagline</div>
+        <div class="setrow__control"><input class="input" value="Keep the soul. Modernize the press." /></div>
+        <p class="setrow__help">In a few words, what this site is about.</p>
+      </div>
+
+      <div class="setrow">
+        <div class="setrow__label">Administration email</div>
+        <div class="setrow__control"><input class="input input--mono" type="email" value="jane@example.com" /></div>
+        <p class="setrow__help">Used for administrative notices.</p>
+      </div>
+
+      <div class="setrow">
+        <div class="setrow__label">Site address</div>
+        <div class="setrow__control"><input class="input input--mono" type="url" value="https://example.com" /></div>
+        <p class="setrow__help">The public base URL of your site.</p>
+      </div>
+    </section>
+
+    <!-- READING -->
+    <section class="panel">
+      <h3 class="panel__title">Reading <span class="panel__idx">§ 02</span></h3>
+
+      <div class="setrow">
+        <div class="setrow__label">Posts per page</div>
+        <div class="setrow__control">
+          <span class="numfield">
+            <input class="input input--number" type="number" min="1" max="100" step="1" value="10" />
+            <span class="numfield__unit">posts</span>
+          </span>
+        </div>
+        <p class="setrow__help">How many posts a listing page shows before paginating.</p>
+      </div>
+
+      <div class="setrow">
+        <div class="setrow__label">Feed items</div>
+        <div class="setrow__control">
+          <span class="numfield">
+            <input class="input input--number" type="number" min="1" max="100" step="1" value="10" />
+            <span class="numfield__unit">items</span>
+          </span>
+        </div>
+        <p class="setrow__help">Most-recent items included in syndication feeds.</p>
+      </div>
+
+      <div class="setrow">
+        <div class="setrow__label">Search engines</div>
+        <div class="setrow__control">
+          <label class="switch">
+            <input type="checkbox" checked />
+            <span class="switch__track"><span class="switch__knob"></span></span>
+            <span class="switch__text">Allow search engines to index this site</span>
+          </label>
+        </div>
+        <p class="setrow__help">When off, Ferropress asks search engines not to index the site (an honour-system request).</p>
+      </div>
+    </section>
+
+    <!-- FORMATTING -->
+    <section class="panel">
+      <h3 class="panel__title">Formatting <span class="panel__idx">§ 03</span></h3>
+
+      <div class="setrow">
+        <div class="setrow__label">Timezone</div>
+        <div class="setrow__control">
+          <select class="select">
+            <option>UTC</option>
+            <option>America/New_York</option>
+            <option>America/Chicago</option>
+            <option>America/Los_Angeles</option>
+            <option>Europe/London</option>
+            <option>Europe/Berlin</option>
+            <option>Asia/Tokyo</option>
+          </select>
+        </div>
+        <p class="setrow__help">Choose a city or region that shares your local time.</p>
+      </div>
+
+      <div class="setrow">
+        <div class="setrow__label">Date format</div>
+        <div class="setrow__control">
+          <div class="radiogroup" id="dateformat">
+            <label class="radio"><input type="radio" name="df" value="F j, Y" checked /> January 8, 2026</label>
+            <label class="radio"><input type="radio" name="df" value="Y-m-d" /> 2026-01-08</label>
+            <label class="radio"><input type="radio" name="df" value="d/m/Y" /> 08/01/2026</label>
+            <label class="radio"><input type="radio" name="df" value="custom" /> Custom</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="setrow setrow--nested is-hidden" id="dateformat-custom">
+        <div class="setrow__label">Custom format</div>
+        <div class="setrow__control subfield">
+          <input class="input input--mono" placeholder="F j, Y" />
+          <p class="setrow__help" style="margin-top:.5rem">A strftime-style pattern used when “Custom” is selected.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+</section>
+
 <div class="toast" id="toast">
   <span class="regmark" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 30 30" fill="none"><circle cx="15" cy="15" r="7" stroke="currentColor" stroke-width="2.4"/><path d="M15 4v5M15 21v5M4 15h5M21 15h5" stroke="currentColor" stroke-width="2.4"/></svg></span>
   <span id="toast-msg">Saved</span>
@@ -689,10 +934,11 @@
   <button data-go="login" class="is-on">Login</button>
   <button data-go="list">Galley</button>
   <button data-go="editor">Sheet</button>
+  <button data-go="settings">Settings</button>
 </nav>
 
 <script>
-  const views = { login: 'view-login', list: 'view-list', editor: 'view-editor' };
+  const views = { login: 'view-login', list: 'view-list', editor: 'view-editor', settings: 'view-settings' };
   function show(name) {
     for (const [n, id] of Object.entries(views)) {
       document.getElementById(id).classList.toggle('is-active', n === name);
@@ -720,6 +966,21 @@
   });
   saveBtn.addEventListener('click', () => {
     saveBtn.classList.remove('is-dirty');
+    document.getElementById('toast-msg').textContent = 'Saved';
+    toast.classList.add('is-shown');
+    setTimeout(() => toast.classList.remove('is-shown'), 1600);
+  });
+
+  // Settings: reveal the custom date-format field when "Custom" is chosen
+  // (this is the visible_when conditional the renderer honours).
+  const dfGroup = document.getElementById('dateformat');
+  const dfCustom = document.getElementById('dateformat-custom');
+  dfGroup.addEventListener('change', () => {
+    const custom = dfGroup.querySelector('input[value="custom"]').checked;
+    dfCustom.classList.toggle('is-hidden', !custom);
+  });
+  // Settings: Save changes → toast.
+  document.getElementById('settings-save').addEventListener('click', () => {
     document.getElementById('toast-msg').textContent = 'Saved';
     toast.classList.add('is-shown');
     setTimeout(() => toast.classList.remove('is-shown'), 1600);

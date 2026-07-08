@@ -15,6 +15,8 @@ use rinch_web::{Editor, EditorHandle, create_editor};
 use wasm_bindgen_futures::spawn_local;
 
 use ferropress_editor_bridge as bridge;
+use ferropress_form_view::{FormValues, SchemaForm};
+use ferropress_render_form::FormSchema;
 
 use crate::api::{self, PostSummary, UserDto};
 
@@ -26,6 +28,7 @@ enum View {
     Login,
     List,
     Editor,
+    Settings,
 }
 
 /// Load state of the post list.
@@ -90,6 +93,14 @@ pub fn app() -> NodeHandle {
     let saving = Signal::new(false);
     let notice = Signal::new(String::new());
     let toast = Signal::new(false);
+
+    // Settings view (Administrator only). The loaded schema + a `FormValues` handle
+    // (the live map the form writes and Save reads) live in signals so the view arm
+    // mounts them and the Save handler reads the same `FormValues` back.
+    let settings_load = Signal::new(Load::Loading);
+    let settings_schema = Signal::new(Option::<FormSchema>::None);
+    let settings_values = Signal::new(Option::<FormValues>::None);
+    let settings_saving = Signal::new(false);
 
     // The re-auth routing bundle, shared by every guarded request.
     let auth = AuthCtx {
@@ -203,6 +214,17 @@ pub fn app() -> NodeHandle {
                                     editor, title, slug, status, featured, current_id, editor_session, notice, auth,
                                 ),
                                 "\u{002B} New post"
+                            }
+                            // Settings is Administrator-only; hide the nav for lower
+                            // roles (the server enforces `ManageSettings` regardless).
+                            if is_admin(&me_user.get()) {
+                                button {
+                                    class: "btn btn--quiet",
+                                    onclick: move || open_settings(
+                                        settings_load, settings_schema, settings_values, notice, view, auth,
+                                    ),
+                                    "Settings"
+                                }
                             }
                             span { class: "masthead__user",
                                 span { class: "masthead__avatar", {move || avatar_initial(&me_user.get())} }
@@ -400,6 +422,56 @@ pub fn app() -> NodeHandle {
                         }
                     }
                 },
+
+                // ── SETTINGS (THE FORMS DRAWER) ────────────────────────────────
+                View::Settings => div {
+                    header { class: "masthead",
+                        div { class: "ruler" }
+                        div { class: "masthead__bar",
+                            button {
+                                class: "btn btn--quiet",
+                                onclick: move || {
+                                    notice.set(String::new());
+                                    view.set(View::List);
+                                },
+                                "\u{2190} Posts"
+                            }
+                            span { class: "masthead__sep", "\u{00B7}" }
+                            span { class: "masthead__here", "Settings" }
+                            span { class: "masthead__spacer" }
+                            button {
+                                class: "btn btn--primary",
+                                style: "width:auto",
+                                onclick: move || save_settings(
+                                    settings_values, settings_saving, notice, toast, auth,
+                                ),
+                                {move || if settings_saving.get() { "Saving\u{2026}" } else { "Save changes" }}
+                            }
+                        }
+                    }
+                    div { class: "wrap",
+                        div { class: "galley__head",
+                            h2 { class: "galley__title", "Settings" }
+                            span { class: "galley__count", "site configuration" }
+                        }
+                        if !notice.get().is_empty() {
+                            div { class: "galley__state err", {move || notice.get()} }
+                        }
+                        if matches!(settings_load.get(), Load::Loading) {
+                            div { class: "galley__state", "Opening the forms drawer\u{2026}" }
+                        }
+                        if matches!(settings_load.get(), Load::Error) {
+                            div { class: "galley__state err", "Settings are unavailable right now." }
+                        }
+                        // Mount the schema-driven form once loaded. A bare reactive
+                        // `match` (Rule 14) so it builds when the async GET resolves; the
+                        // same `FormValues` handle is read back by Save.
+                        match (settings_load.get(), settings_schema.get(), settings_values.get()) {
+                            (Load::Ready, Some(schema), Some(values)) => SchemaForm { schema: schema, values: values },
+                            _ => span {},
+                        }
+                    }
+                },
             }
 
             div { class: {move || if toast.get() { "toast is-shown" } else { "toast" }},
@@ -465,6 +537,90 @@ fn load_posts(posts: Signal<Vec<PostSummary>>, state: Signal<Load>, auth: AuthCt
             }
             Err(api::ApiError::Unauthorized) => auth.session_expired(),
             Err(api::ApiError::Message(_)) => state.set(Load::Error),
+        }
+    });
+}
+
+/// Whether the signed-in user is an Administrator — the only role that manages
+/// settings. Decides whether to show the Settings nav; the server enforces
+/// `ManageSettings` on the endpoints regardless.
+fn is_admin(user: &Option<UserDto>) -> bool {
+    user.as_ref()
+        .map(|u| u.role == "administrator")
+        .unwrap_or(false)
+}
+
+/// Switch to the Settings view and (re)load its schema + values.
+fn open_settings(
+    load: Signal<Load>,
+    schema: Signal<Option<FormSchema>>,
+    values: Signal<Option<FormValues>>,
+    notice: Signal<String>,
+    view: Signal<View>,
+    auth: AuthCtx,
+) {
+    notice.set(String::new());
+    view.set(View::Settings);
+    load_settings(load, schema, values, auth);
+}
+
+/// Fetch the settings schema + current values. On success stores the schema + a fresh
+/// `FormValues` handle (the live map the form writes and Save reads). A 401 routes back
+/// to login; any other failure shows the error state.
+fn load_settings(
+    load: Signal<Load>,
+    schema: Signal<Option<FormSchema>>,
+    values: Signal<Option<FormValues>>,
+    auth: AuthCtx,
+) {
+    load.set(Load::Loading);
+    spawn_local(async move {
+        match api::get_settings().await {
+            Ok(dto) => {
+                schema.set(Some(dto.schema));
+                values.set(Some(FormValues::new(dto.values)));
+                load.set(Load::Ready);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(_)) => load.set(Load::Error),
+        }
+    });
+}
+
+/// Persist the settings form: snapshot the live `FormValues`, PUT it, and on success
+/// stamp the save toast and re-seed the form from the server's (validated + normalized,
+/// e.g. clamped) values. A 401 routes back to login; a validation error (400) surfaces
+/// its message.
+fn save_settings(
+    values: Signal<Option<FormValues>>,
+    saving: Signal<bool>,
+    notice: Signal<String>,
+    toast: Signal<bool>,
+    auth: AuthCtx,
+) {
+    if saving.get() {
+        return;
+    }
+    let Some(form) = values.get() else {
+        return;
+    };
+    let snapshot = form.snapshot();
+    notice.set(String::new());
+    saving.set(true);
+    spawn_local(async move {
+        let result = api::put_settings(snapshot).await;
+        saving.set(false);
+        match result {
+            Ok(dto) => {
+                // Re-seed from the server's normalized values so the form shows the
+                // authoritative result (a clamped number, a dropped unknown key).
+                values.set(Some(FormValues::new(dto.values)));
+                toast.set(true);
+                TimeoutFuture::new(1600).await;
+                toast.set(false);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(e)) => notice.set(e),
         }
     });
 }
@@ -679,7 +835,8 @@ fn edit_link_via_prompt(editor: Signal<EditorHandle>, notice: Signal<String>) {
     }
 
     // Cancelling the prompt (Esc / no window) leaves the selection untouched.
-    let Some(input) = web_sys::window().and_then(|w| w.prompt_with_message("Link URL:").ok().flatten())
+    let Some(input) =
+        web_sys::window().and_then(|w| w.prompt_with_message("Link URL:").ok().flatten())
     else {
         return;
     };

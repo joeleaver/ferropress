@@ -16,7 +16,8 @@ use ferropress_auth::{SigningKey, hash_password};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, now_millis};
 use ferropress_core::{
-    Block, BlockKind, BlockTree, Edge, InlineRun, MEDIA_TYPE, POST_TYPE, Status, USER_TYPE,
+    Block, BlockKind, BlockTree, Edge, InlineRun, MEDIA_TYPE, POST_TYPE, SETTING_TYPE, Status,
+    USER_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
@@ -173,7 +174,10 @@ async fn seed_media(store: &Arc<dyn RhypeStore>, uuid: &str) -> ObjectId {
     f.insert("uuid".to_owned(), Value::String(uuid.to_owned()));
     f.insert("slug".to_owned(), Value::String(uuid.to_owned()));
     f.insert("filename".to_owned(), Value::String(format!("{uuid}.png")));
-    f.insert("mime_type".to_owned(), Value::String("image/png".to_owned()));
+    f.insert(
+        "mime_type".to_owned(),
+        Value::String("image/png".to_owned()),
+    );
     f.insert("byte_size".to_owned(), Value::U64(68));
     f.insert("width".to_owned(), Value::U32(1));
     f.insert("height".to_owned(), Value::U32(1));
@@ -494,7 +498,11 @@ async fn featured_media_set_read_and_cleared() {
         .oneshot(put(save_body(serde_json::json!(media_id.0))))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "save with featured should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "save with featured should succeed"
+    );
     let detail = to_json(router(state.clone()).oneshot(get()).await.unwrap()).await;
     assert_eq!(detail["featured_media"]["id"], media_id.0);
     assert_eq!(detail["featured_media"]["url"], format!("/media/{uuid}"));
@@ -598,7 +606,10 @@ async fn create_with_featured_then_replace_keeps_it_to_one() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let detail = to_json(router(state.clone()).oneshot(get(&cookie)).await.unwrap()).await;
-    assert_eq!(detail["featured_media"]["id"], b.0, "A must be replaced by B");
+    assert_eq!(
+        detail["featured_media"]["id"], b.0,
+        "A must be replaced by B"
+    );
 
     // The to-one invariant: exactly ONE featured link remains (no A+B accumulation).
     let links = store
@@ -622,7 +633,11 @@ async fn create_with_featured_then_replace_keeps_it_to_one() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "bogus featured id must 400 on create");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "bogus featured id must 400 on create"
+    );
 }
 
 #[tokio::test]
@@ -1346,7 +1361,12 @@ async fn contributor_can_edit_and_submit_own_draft_but_not_publish() {
         &state,
         &cookie,
         id,
-        edit_body("Draft dispatch", "draft-dispatch", "pending", "ready for review"),
+        edit_body(
+            "Draft dispatch",
+            "draft-dispatch",
+            "pending",
+            "ready for review",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "contributor submits for review");
@@ -1356,7 +1376,12 @@ async fn contributor_can_edit_and_submit_own_draft_but_not_publish() {
         &state,
         &cookie,
         id,
-        edit_body("Draft dispatch", "draft-dispatch", "published", "trying to go live"),
+        edit_body(
+            "Draft dispatch",
+            "draft-dispatch",
+            "published",
+            "trying to go live",
+        ),
     )
     .await;
     assert_eq!(
@@ -1509,6 +1534,236 @@ async fn editor_backfills_a_null_author_on_open_and_on_save() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Site settings (GET/PUT /admin/api/settings — ManageSettings)
+// ---------------------------------------------------------------------------
+
+/// GET /admin/api/settings → (status, body).
+async fn do_get_settings(state: &AppState, cookie: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri("/admin/api/settings")
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+/// PUT /admin/api/settings with `{ "values": … }` → (status, body).
+async fn do_put_settings(
+    state: &AppState,
+    cookie: &str,
+    values: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/admin/api/settings")
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "values": values }).to_string(),
+        ))
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+#[tokio::test]
+async fn settings_get_returns_schema_and_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let (status, body) = do_get_settings(&state, &cookie).await;
+    assert_eq!(status, StatusCode::OK, "settings body: {body}");
+    // The declarative schema is shipped (sections with fields)...
+    assert!(body["schema"]["sections"].is_array());
+    assert!(
+        body["schema"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "identity"),
+        "schema must carry the identity section: {body}"
+    );
+    // ...and every key has a value seeded from its default (no rows stored yet).
+    assert_eq!(body["values"]["reading.posts_per_page"], 10);
+    assert_eq!(body["values"]["reading.search_engine_visible"], true);
+    assert_eq!(body["values"]["site.timezone"], "UTC");
+    assert_eq!(body["values"]["site.title"], "");
+}
+
+#[tokio::test]
+async fn settings_put_persists_and_get_reflects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let (status, body) = do_put_settings(
+        &state,
+        &cookie,
+        serde_json::json!({
+            "site.title": "The Foundry",
+            "site.url": "https://foundry.example",
+            "reading.posts_per_page": 25,
+            "reading.search_engine_visible": false,
+            "site.date_format": "Y-m-d",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "put body: {body}");
+    // The PUT response already reflects the new values (client re-syncs from it).
+    assert_eq!(body["values"]["site.title"], "The Foundry");
+    assert_eq!(body["values"]["reading.posts_per_page"], 25);
+    assert_eq!(body["values"]["reading.search_engine_visible"], false);
+
+    // A fresh GET reads them back from the store.
+    let (_, got) = do_get_settings(&state, &cookie).await;
+    assert_eq!(got["values"]["site.title"], "The Foundry");
+    assert_eq!(got["values"]["site.url"], "https://foundry.example");
+    assert_eq!(got["values"]["site.date_format"], "Y-m-d");
+
+    // Directly in the store: exactly ONE Setting row per key, value JSON-encoded as
+    // a String, autoload set (no duplicate rows accumulated across the two writes).
+    let rows = store
+        .filter(ferropress_core::query::FilterSpec {
+            type_name: TypeName::from(SETTING_TYPE),
+            field: "key".to_owned(),
+            op: ferropress_core::query::Compare::Eq,
+            value: Value::String("site.title".to_owned()),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one Setting row per key, not accumulating");
+    assert!(
+        matches!(rows[0].get("value"), Some(Value::String(s)) if s == "\"The Foundry\""),
+        "value is stored as a JSON-encoded String: {:?}",
+        rows[0].get("value")
+    );
+    assert!(matches!(rows[0].get("autoload"), Some(Value::Bool(true))));
+
+    // A second PUT of the same key updates in place (still one row).
+    let _ = do_put_settings(
+        &state,
+        &cookie,
+        serde_json::json!({ "site.title": "Reforged" }),
+    )
+    .await;
+    let rows = store
+        .filter(ferropress_core::query::FilterSpec {
+            type_name: TypeName::from(SETTING_TYPE),
+            field: "key".to_owned(),
+            op: ferropress_core::query::Compare::Eq,
+            value: Value::String("site.title".to_owned()),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "an update must not create a second row");
+}
+
+#[tokio::test]
+async fn settings_put_rejects_invalid_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // A javascript: URL is rejected by the shared href policy → 400, nothing stored.
+    let (status, _) = do_put_settings(
+        &state,
+        &cookie,
+        serde_json::json!({ "site.url": "javascript:alert(1)" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unsafe URL must 400");
+
+    // An out-of-vocabulary select value is rejected.
+    let (status, _) = do_put_settings(
+        &state,
+        &cookie,
+        serde_json::json!({ "site.timezone": "Mars/Olympus" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "bad option must 400");
+
+    // Nothing was persisted for the rejected keys (a fresh GET still shows defaults).
+    let (_, got) = do_get_settings(&state, &cookie).await;
+    assert_eq!(got["values"]["site.url"], "");
+    assert_eq!(got["values"]["site.timezone"], "UTC");
+}
+
+#[tokio::test]
+async fn settings_put_ignores_unknown_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // A key the schema doesn't declare is silently dropped, not persisted.
+    let (status, _) = do_put_settings(
+        &state,
+        &cookie,
+        serde_json::json!({ "site.title": "ok", "evil.injected": "payload" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = store
+        .filter(ferropress_core::query::FilterSpec {
+            type_name: TypeName::from(SETTING_TYPE),
+            field: "key".to_owned(),
+            op: ferropress_core::query::Compare::Eq,
+            value: Value::String("evil.injected".to_owned()),
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "an unknown key must never be persisted");
+}
+
+#[tokio::test]
+async fn settings_require_manage_settings_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    // An editor is high-privilege for content but LACKS ManageSettings (admin-only).
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let (_, cookie, _) = do_login(&state, "ed", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let (get_status, _) = do_get_settings(&state, &cookie).await;
+    assert_eq!(
+        get_status,
+        StatusCode::FORBIDDEN,
+        "editor cannot read settings"
+    );
+    let (put_status, _) =
+        do_put_settings(&state, &cookie, serde_json::json!({ "site.title": "nope" })).await;
+    assert_eq!(
+        put_status,
+        StatusCode::FORBIDDEN,
+        "editor cannot write settings"
+    );
+
+    // No session at all → 401.
+    let req = Request::builder()
+        .uri("/admin/api/settings")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router(state).oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 #[tokio::test]
 async fn editor_edits_others_post_without_reassigning_the_author() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1529,10 +1784,19 @@ async fn editor_edits_others_post_without_reassigning_the_author() {
         &state,
         &cookie,
         post.0,
-        edit_body("Bob's work", "bobs-work", "published", "editor published it"),
+        edit_body(
+            "Bob's work",
+            "bobs-work",
+            "published",
+            "editor published it",
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "an editor may publish others' content");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an editor may publish others' content"
+    );
 
     // ...but the author link stays with bob (backfill only fills a NULL author).
     assert_eq!(
