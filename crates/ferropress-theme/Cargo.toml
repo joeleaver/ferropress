@@ -12,4 +12,5 @@ workspace = true
 ferropress-core = { workspace = true }
 ferropress-render = { workspace = true }
 minijinja = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }

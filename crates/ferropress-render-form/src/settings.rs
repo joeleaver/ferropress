@@ -147,7 +147,9 @@ pub fn schema_for_settings() -> FormSchema {
                     Field {
                         key: "site.timezone".to_owned(),
                         label: "Timezone".to_owned(),
-                        help: Some("Choose a city or region that shares your local time.".to_owned()),
+                        help: Some(
+                            "Choose a city or region that shares your local time.".to_owned(),
+                        ),
                         default: Value::String("UTC".to_owned()),
                         widget: WidgetKind::Select {
                             options: timezones(),
@@ -173,7 +175,8 @@ pub fn schema_for_settings() -> FormSchema {
                         key: "site.date_format_custom".to_owned(),
                         label: "Custom format".to_owned(),
                         help: Some(
-                            "A strftime-style pattern used when \u{201c}Custom\u{201d} is selected."
+                            "A PHP date()-style pattern used when \u{201c}Custom\u{201d} is \
+                             selected — e.g. l, F jS Y."
                                 .to_owned(),
                         ),
                         default: Value::String(String::new()),

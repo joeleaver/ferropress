@@ -19,11 +19,13 @@
 
 mod schema;
 mod settings;
+mod site_settings;
 
 pub use schema::{
     Choice, Condition, Field, FieldError, FormSchema, FormSection, TextFormat, WidgetKind,
 };
 pub use settings::schema_for_settings;
+pub use site_settings::SiteSettings;
 
 #[cfg(test)]
 mod tests {

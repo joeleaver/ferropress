@@ -38,7 +38,9 @@ use ferropress_http::{AdminConfig, AppState};
 use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
-use ferropress_serve::{HookBridge, ServeEngine, default_theme};
+use ferropress_serve::{
+    HookBridge, ServeEngine, SettingsHandle, default_theme, load_site_settings,
+};
 use ferropress_store_embedded::EmbeddedStore;
 
 use crate::config::{Cli, Command, CreateUserArgs, PostArgs, ServerConfig, TlsMode};
@@ -84,11 +86,21 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let content_writer: Arc<dyn ContentWriter> = store.clone();
     let store: Arc<dyn RhypeStore> = store;
 
+    // Seed the live site-settings snapshot from the store ONCE at boot. The SAME
+    // handle is shared with the HTTP read path (`AppState`) and the regen loop
+    // (`ServeEngine`), which refreshes it on a `Setting` change — so a settings
+    // edit is reflected on the public site with NO page regeneration (global
+    // chrome + date formatting are composed live at request time).
+    let settings = SettingsHandle::new(
+        load_site_settings(&store)
+            .await
+            .context("loading site settings")?,
+    );
+
     // 2. Build the owned subsystems over the ports.
-    // Build the page-chrome theme once (its template registered) and share it
-    // across BOTH the HTTP read path (`AppState`) and the regen loop
-    // (`ServeEngine`) so a prerendered page is byte-for-byte what an on-demand
-    // render would produce.
+    // Build the page-chrome theme once (its templates registered) for the HTTP read
+    // path (`AppState`). The regen loop does NOT need it: it caches per-object
+    // envelopes, and chrome is composed live at request time.
     let theme = Arc::new(default_theme().context("building the page-chrome theme")?);
 
     // The embedded plugin host: load installed plugins from the plugins dir, then
@@ -116,18 +128,15 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // `plugins.clone()` yields `Arc<PluginHost>`, which coerces to
     // `Arc<dyn CustomBlockRenderer>` at each call site (the `PluginHost` is the
     // renderer for both the regen loop and the read path).
-    let serve = ServeEngine::new(
-        Arc::clone(&store),
-        Arc::clone(&blobs),
-        Arc::clone(&theme),
-        plugins.clone(),
-    );
+    let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), plugins.clone())
+        .with_settings(settings.clone());
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
     // The same plugin host is the custom-block renderer AND the hook dispatcher
     // (the `comment.create` moderation filter runs through it); `plugins.clone()`
     // coerces `Arc<PluginHost>` to each trait object at the call site.
     let mut app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
+        .with_settings(settings.clone())
         .with_islands_dir(cfg.islands_dir.clone())
         .with_custom_renderer(plugins.clone())
         .with_hook_dispatcher(plugins.clone());

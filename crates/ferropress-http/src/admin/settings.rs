@@ -26,7 +26,7 @@ use ferropress_core::role::Capability;
 use ferropress_core::value::{FieldMap, Object, ObjectId, TypeName, Value};
 use ferropress_render_form::{FormSchema, schema_for_settings};
 
-use super::{AdminError, AdminJson, AuthedUser, str_field};
+use super::{AdminError, AdminJson, AuthedUser};
 use crate::AppState;
 
 /// `GET`/`PUT` response: the declarative schema plus the current value for every
@@ -53,7 +53,7 @@ pub async fn get(
 ) -> Result<Json<SettingsDto>, AdminError> {
     who.require(Capability::ManageSettings)?;
     let schema = schema_for_settings();
-    let values = read_values(&state, &schema).await?;
+    let values = read_values(&state).await?;
     Ok(Json(SettingsDto { schema, values }))
 }
 
@@ -83,41 +83,17 @@ pub async fn put(
         upsert_setting(&state, key, value).await?;
     }
 
-    let values = read_values(&state, &schema).await?;
+    let values = read_values(&state).await?;
     Ok(Json(SettingsDto { schema, values }))
 }
 
-/// The current value for every schema key: start from the schema defaults, overlay
-/// any stored `Setting` (its JSON-encoded `value` parsed back). A stored value that
-/// fails to parse is ignored (the default stands) rather than failing the request.
-///
-/// One `scan` of the small `Setting` table (mirrors `posts::list`) rather than a
-/// per-key `filter` — the table is a handful of singletons, so a single round-trip
-/// beats N sequential lookups.
-async fn read_values(
-    state: &AppState,
-    schema: &FormSchema,
-) -> Result<serde_json::Map<String, JsonValue>, AdminError> {
-    let stored: HashMap<String, JsonValue> = state
-        .store
-        .scan(&TypeName::from(SETTING_TYPE))
-        .await?
-        .into_iter()
-        .filter_map(|obj| {
-            let key = str_field(&obj, "key")?;
-            let raw = str_field(&obj, "value")?;
-            let parsed = serde_json::from_str::<JsonValue>(&raw).ok()?;
-            Some((key, parsed))
-        })
-        .collect();
-
-    let mut values = schema.defaults();
-    for field in schema.fields() {
-        if let Some(parsed) = stored.get(&field.key) {
-            values.insert(field.key.clone(), parsed.clone());
-        }
-    }
-    Ok(values)
+/// The current value for every schema key: the schema defaults overlaid with any
+/// stored `Setting`. Delegates to the shared serve-side loader
+/// ([`ferropress_serve::load_values`]) so the admin form and the public read path
+/// resolve a stored setting by exactly ONE overlay rule — the form and the served
+/// page can never disagree about what a setting means.
+async fn read_values(state: &AppState) -> Result<serde_json::Map<String, JsonValue>, AdminError> {
+    Ok(ferropress_serve::load_values(&state.store).await?)
 }
 
 /// Fetch the `Setting` row for `key` (`@unique`, so at most one). There is no

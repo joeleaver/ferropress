@@ -15,8 +15,10 @@ use ferropress_core::query::{Change, ChangeKind};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
-    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, PAGE_TYPE, POST_TYPE, Status,
+    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, PAGE_TYPE, POST_TYPE, SETTING_TYPE,
+    Status,
 };
+use ferropress_render_form::SiteSettings;
 
 use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_store_embedded::EmbeddedStore;
@@ -24,7 +26,7 @@ use ferropress_theme::ThemeEngine;
 
 use ferropress_render::NoCustomBlocks;
 
-use crate::{OutputPage, ServeEngine, cache_key, content, serve_path};
+use crate::{OutputPage, ServeEngine, SettingsHandle, cache_key, content, serve_path};
 
 const PARAGRAPH_TEXT: &str = "Hello from the Ferropress cache test.";
 const SLUG: &str = "hello-world";
@@ -93,6 +95,85 @@ fn change(kind: ChangeKind, id: ObjectId) -> Change {
     }
 }
 
+/// Seed one `Setting` row, matching how the admin API stores them: `value` is a
+/// JSON-encoded String (so a string setting is passed here quoted, e.g. `"\"x\""`).
+async fn seed_setting(store: &Arc<dyn RhypeStore>, key: &str, json_encoded_value: &str) {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("key".to_owned(), Value::String(key.to_owned()));
+    fields.insert(
+        "value".to_owned(),
+        Value::String(json_encoded_value.to_owned()),
+    );
+    fields.insert("autoload".to_owned(), Value::Bool(true));
+    store
+        .create(&TypeName::from(SETTING_TYPE), fields)
+        .await
+        .expect("seeding a setting must succeed");
+}
+
+/// A `Setting`-typed change, as the loop sees it on the feed.
+fn settings_change(kind: ChangeKind) -> Change {
+    Change {
+        version: 1,
+        kind,
+        type_name: TypeName::from(SETTING_TYPE),
+        object_id: ObjectId(0),
+        fields: None,
+        origin: None,
+    }
+}
+
+/// `load_site_settings` overlays stored `Setting`s onto the schema defaults and
+/// projects the typed view the theme consumes.
+#[tokio::test]
+async fn load_site_settings_overlays_stored_on_defaults() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, _theme) = boot(tmp.path());
+
+    // Before any Setting exists, every field is the schema default.
+    let defaults = crate::settings::load_site_settings(&store).await.unwrap();
+    assert_eq!(defaults.title, "");
+    assert_eq!(defaults.posts_per_page, 10);
+    assert_eq!(defaults.timezone, "UTC");
+
+    seed_setting(&store, "site.title", "\"The Composing Room\"").await;
+    seed_setting(&store, "reading.posts_per_page", "5").await;
+    seed_setting(&store, "reading.search_engine_visible", "false").await;
+
+    let loaded = crate::settings::load_site_settings(&store).await.unwrap();
+    assert_eq!(loaded.title, "The Composing Room");
+    assert_eq!(loaded.posts_per_page, 5);
+    assert!(!loaded.search_engine_visible);
+}
+
+/// A `Setting` change on the feed refreshes the live snapshot the read path
+/// holds — and does NOT touch the page cache (settings are composed live).
+#[tokio::test]
+async fn regen_loop_refreshes_settings_snapshot_on_setting_change() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    let handle = SettingsHandle::new(SiteSettings::defaults());
+    assert_eq!(handle.current().title_or_default(), "Ferropress");
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(handle.clone());
+
+    // A settings edit lands in the store, then the change arrives on the feed.
+    seed_setting(&store, "site.title", "\"Live Title\"").await;
+    engine
+        .apply_change(&settings_change(ChangeKind::Update))
+        .await
+        .expect("a Setting change must refresh cleanly");
+
+    // The read path's handle now sees the new value — no cache regeneration.
+    assert_eq!(handle.current().title, "Live Title");
+}
+
 /// On a cache MISS, `serve_path` renders the published post AND populates the
 /// cache (read-through / write-on-miss): afterwards the cache holds the rendered
 /// HTML and it equals the served body.
@@ -112,7 +193,16 @@ async fn serve_path_read_through_populates_cache() {
     );
 
     // MISS -> render-on-demand -> populate.
-    let served = match serve_path(&store, &blobs, &theme, &NoCustomBlocks, &path).await {
+    let served = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &path,
+    )
+    .await
+    {
         crate::Resolved::Found(html) => html,
         other => panic!("expected Found on a published post, got {other:?}"),
     };
@@ -121,23 +211,31 @@ async fn serve_path_read_through_populates_cache() {
         "served body must contain the rendered paragraph; was:\n{served}",
     );
 
-    // The cache is now populated AND equals exactly what was served.
+    // The cache holds the ENVELOPE (not the composed page): chrome is applied live
+    // at request time, so the cache stores only the per-object body + metadata.
     let cached = blobs
         .get(&key)
         .await
         .expect("cache must be populated after a read-through miss");
-    assert_eq!(
-        String::from_utf8(cached).unwrap(),
-        served,
-        "cached bytes must equal the served HTML",
+    let envelope: crate::content::CachedPage =
+        serde_json::from_slice(&cached).expect("cache holds a page envelope, not raw HTML");
+    assert!(
+        envelope.body.contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
+        "the cached envelope's body must hold the rendered paragraph; was:\n{}",
+        envelope.body,
+    );
+    assert!(
+        served.contains(&envelope.body),
+        "the served page must embed the cached envelope's body",
     );
 }
 
-/// A pre-populated cache entry is served VERBATIM — proving the hot path reads
-/// from the cache and does NOT re-render. The sentinel is deliberately NOT the
-/// real render, so its presence in the response can only come from the cache.
+/// A cache HIT composes chrome around the STORED ENVELOPE — proving the hot path
+/// reads the envelope from the cache and does NOT re-render the block body. The
+/// sentinel body is deliberately NOT the real render, so its presence in the
+/// response can only come from the cached envelope.
 #[tokio::test]
-async fn serve_path_cache_hit_serves_stored_bytes() {
+async fn serve_path_cache_hit_composes_from_stored_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (store, blobs, theme) = boot(tmp.path());
     // Publish a post too, so a cache MISS would have rendered the real body —
@@ -146,21 +244,51 @@ async fn serve_path_cache_hit_serves_stored_bytes() {
 
     let path = format!("/{SLUG}");
     let key = cache_key(&path);
-    const SENTINEL: &str = "<!-- SENTINEL: served straight from the prerender cache -->";
+    const SENTINEL_BODY: &str = "<p>SENTINEL BODY STRAIGHT FROM THE ENVELOPE</p>";
 
-    // Pre-put the sentinel at the page's cache key.
+    // Pre-put a page ENVELOPE whose body is the sentinel.
+    let envelope = crate::content::CachedPage {
+        title: "Cached Title".to_owned(),
+        excerpt: String::new(),
+        published_at: None,
+        author: None,
+        featured_image: None,
+        is_post: true,
+        seo: None,
+        body: SENTINEL_BODY.to_owned(),
+    };
     blobs
-        .put(&key, SENTINEL.as_bytes().to_vec())
+        .put(&key, serde_json::to_vec(&envelope).unwrap())
         .await
         .expect("seeding the cache entry");
 
-    // serve_path must return the sentinel, not a fresh render.
-    match serve_path(&store, &blobs, &theme, &NoCustomBlocks, &path).await {
+    // serve_path must compose from the cached envelope, not re-render the post.
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &path,
+    )
+    .await
+    {
         crate::Resolved::Found(html) => {
-            assert_eq!(html, SENTINEL, "must serve the cached bytes verbatim");
+            assert!(
+                html.contains(SENTINEL_BODY),
+                "served body must come from the cached envelope:\n{html}",
+            );
             assert!(
                 !html.contains(PARAGRAPH_TEXT),
-                "a cache hit must NOT re-render the post body",
+                "a cache hit must NOT re-render the real post body",
+            );
+            assert!(
+                html.contains("<!doctype html>"),
+                "chrome must be composed live around the cached body",
+            );
+            assert!(
+                html.contains("Cached Title"),
+                "the cached envelope's title appears in the composed page",
             );
         }
         other => panic!("expected Found (cache hit), got {other:?}"),
@@ -173,13 +301,12 @@ async fn serve_path_cache_hit_serves_stored_bytes() {
 #[tokio::test]
 async fn regen_write_through_then_eviction() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, blobs, theme) = boot(tmp.path());
+    let (store, blobs, _) = boot(tmp.path());
     let id = seed_post(&store, SLUG, Status::Published).await;
 
     let engine = ServeEngine::new(
         Arc::clone(&store),
         Arc::clone(&blobs),
-        Arc::clone(&theme),
         Arc::new(NoCustomBlocks),
     );
     let path = format!("/{SLUG}");
@@ -197,21 +324,23 @@ async fn regen_write_through_then_eviction() {
     let cached = blobs
         .get(&key)
         .await
-        .expect("regen must write the rendered HTML through to the cache");
-    let cached = String::from_utf8(cached).unwrap();
+        .expect("regen must write the envelope through to the cache");
+    let envelope: crate::content::CachedPage =
+        serde_json::from_slice(&cached).expect("regen cache entry is a page envelope");
     assert!(
-        cached.contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
-        "regenerated cache entry must hold the rendered body; was:\n{cached}",
+        envelope.body.contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
+        "regenerated envelope must hold the rendered body; was:\n{}",
+        envelope.body,
     );
-    // It matches a direct render of the same page (regen == on-demand render).
-    let rendered = engine
-        .render_page(&OutputPage { path: path.clone() })
+    // It matches a direct build of the same page (regen == on-demand build).
+    let built = engine
+        .build_page(&OutputPage { path: path.clone() })
         .await
-        .expect("render_page ok")
-        .expect("published page renders to Some");
+        .expect("build_page ok")
+        .expect("published page builds to Some");
     assert_eq!(
-        cached, rendered,
-        "regen output must equal an on-demand render"
+        envelope, built,
+        "regen envelope must equal an on-demand build"
     );
 
     // --- EVICTION: flip to a draft; the next regen step deletes the entry. ---
@@ -243,7 +372,7 @@ async fn regen_write_through_then_eviction() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_regen_loop_regenerates_on_change() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, blobs, theme) = boot(tmp.path());
+    let (store, blobs, _) = boot(tmp.path());
     let id = seed_post(&store, SLUG, Status::Published).await;
 
     let path = format!("/{SLUG}");
@@ -255,7 +384,6 @@ async fn live_regen_loop_regenerates_on_change() {
     let engine = Arc::new(ServeEngine::new(
         Arc::clone(&store),
         Arc::clone(&blobs),
-        theme,
         Arc::new(NoCustomBlocks),
     ));
     let regen = Arc::clone(&engine);
@@ -287,10 +415,13 @@ async fn live_regen_loop_regenerates_on_change() {
         regenerated,
         "the live regen loop must regenerate the page's cache entry after a change",
     );
-    let cached = String::from_utf8(blobs.get(&key).await.expect("cache populated")).unwrap();
+    let cached = blobs.get(&key).await.expect("cache populated");
+    let envelope: crate::content::CachedPage =
+        serde_json::from_slice(&cached).expect("regenerated cache entry is a page envelope");
     assert!(
-        cached.contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
-        "regenerated cache entry must hold the rendered body; was:\n{cached}",
+        envelope.body.contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
+        "regenerated envelope must hold the rendered body; was:\n{}",
+        envelope.body,
     );
 }
 
@@ -299,13 +430,12 @@ async fn live_regen_loop_regenerates_on_change() {
 #[tokio::test]
 async fn regen_evicts_cache_on_delete() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, blobs, theme) = boot(tmp.path());
+    let (store, blobs, _) = boot(tmp.path());
     let id = seed_post(&store, SLUG, Status::Published).await;
 
     let engine = ServeEngine::new(
         Arc::clone(&store),
         Arc::clone(&blobs),
-        Arc::clone(&theme),
         Arc::new(NoCustomBlocks),
     );
     let key = cache_key(&format!("/{SLUG}"));
@@ -342,14 +472,13 @@ async fn regen_evicts_cache_on_delete() {
 #[tokio::test]
 async fn regen_uses_slug_from_change_feed_without_reget() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, blobs, theme) = boot(tmp.path());
+    let (store, blobs, _) = boot(tmp.path());
     // The published entity lives at SLUG (resolved by slug, not by object id).
     seed_post(&store, SLUG, Status::Published).await;
 
     let engine = ServeEngine::new(
         Arc::clone(&store),
         Arc::clone(&blobs),
-        theme,
         Arc::new(NoCustomBlocks),
     );
     let key = cache_key(&format!("/{SLUG}"));
@@ -382,14 +511,13 @@ async fn regen_uses_slug_from_change_feed_without_reget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_regen_evicts_on_delete() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (store, blobs, theme) = boot(tmp.path());
+    let (store, blobs, _) = boot(tmp.path());
     let id = seed_post(&store, SLUG, Status::Published).await;
     let key = cache_key(&format!("/{SLUG}"));
 
     let engine = Arc::new(ServeEngine::new(
         Arc::clone(&store),
         Arc::clone(&blobs),
-        theme,
         Arc::new(NoCustomBlocks),
     ));
     let regen = Arc::clone(&engine);

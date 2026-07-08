@@ -15,14 +15,26 @@ ferropress-core = { workspace = true }
 # render_page get real bodies.
 ferropress-render = { workspace = true }
 ferropress-theme = { workspace = true }
+# The typed SiteSettings projection + the settings schema (defaults overlay).
+ferropress-render-form = { workspace = true }
 # The change stream is awaited via tokio-stream's StreamExt; tokio drives the loop.
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-# The hook bridge builds each change's action-hook JSON payload.
+# Public-theme date formatting (site.date_format / site.timezone): stored dates
+# are epoch millis, formatted live at request time. `time` for the calendar math,
+# `time-tz` for DST-correct named-zone resolution.
+time = { workspace = true }
+time-tz = { workspace = true }
+# The hook bridge builds each change's action-hook JSON payload; the page-cache
+# envelope + theme contexts derive Serialize/Deserialize.
+serde = { workspace = true }
 serde_json = { workspace = true }
 # Best-effort cache + regen log their swallowed faults (never fail the request /
 # tear down the loop).
 tracing = { workspace = true }
+# The live SiteSettings snapshot is swapped under a short write lock when the
+# regen loop sees a Setting change; the read path clones the current Arc.
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 # The cache + regen tests drive a REAL embedded store and local-FS blobs (no

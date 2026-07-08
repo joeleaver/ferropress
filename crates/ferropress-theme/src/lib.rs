@@ -19,9 +19,8 @@
 
 use std::time::Duration;
 
-use ferropress_core::Seo;
-use ferropress_render::Html;
-use minijinja::{Environment, context};
+use minijinja::Environment;
+use serde::Serialize;
 use thiserror::Error;
 
 /// Limits the theme sandbox enforces on untrusted templates.
@@ -30,7 +29,7 @@ pub struct SandboxLimits {
     /// Hard cap on template include/macro recursion (MiniJinja in-engine guard).
     pub recursion_limit: usize,
     /// Wall-clock budget for a single render (enforced by the worker-thread
-    /// harness — see the TODO in [`ThemeEngine::render_page`]).
+    /// harness — see the TODO in [`ThemeEngine::render`]).
     pub render_timeout: Duration,
     /// Maximum size of a rendered page, in bytes. Larger output is rejected.
     pub max_output_bytes: usize,
@@ -61,19 +60,6 @@ pub enum ThemeError {
 /// Convenience result alias for this crate.
 pub type Result<T> = std::result::Result<T, ThemeError>;
 
-/// The data a chrome template is allowed to see. The block content arrives
-/// already rendered as [`PageContext::content`]; the template only frames it.
-pub struct PageContext {
-    /// Page `<title>` / heading text.
-    pub title: String,
-    /// Optional SEO metadata (canonical URL, robots, og tags, …).
-    pub seo: Option<Seo>,
-    /// Pre-rendered, already-escaped HTML body from [`ferropress_render`].
-    pub content: Html,
-    // TODO: nav menus, site settings, breadcrumbs, etc. — drawn from
-    // ferropress-core domain types as the admin/theme surface grows.
-}
-
 /// A sandboxed MiniJinja host that owns a set of theme templates and renders
 /// page chrome around pre-rendered content.
 pub struct ThemeEngine {
@@ -98,21 +84,20 @@ impl ThemeEngine {
         Ok(())
     }
 
-    /// Render the named chrome template around `ctx`, enforcing the output cap.
+    /// Render the named template with a serializable context, enforcing the
+    /// output cap.
     ///
-    /// The block content in `ctx.content` is injected as an opaque, already-
-    /// escaped string; the template must mark it safe (`| safe`) to emit it.
-    pub fn render_page(&self, template: &str, ctx: &PageContext) -> Result<String> {
+    /// The caller shapes the context (site settings, page fields, and the
+    /// already-rendered block body from `ferropress-render`); the template frames
+    /// it. Any pre-rendered HTML in the context is emitted through the `| safe`
+    /// filter — everything else auto-escapes, since the templates are `.html`.
+    pub fn render<C: Serialize>(&self, template: &str, ctx: &C) -> Result<String> {
         // TODO: run this render on a worker thread and abort it if it exceeds
         // `self.limits.render_timeout` (MiniJinja has no internal time guard).
         let _budget = self.limits.render_timeout;
 
         let tmpl = self.env.get_template(template)?;
-        let rendered = tmpl.render(context! {
-            title => ctx.title,
-            has_seo => ctx.seo.is_some(),
-            content => ctx.content.as_str(),
-        })?;
+        let rendered = tmpl.render(ctx)?;
 
         if rendered.len() > self.limits.max_output_bytes {
             return Err(ThemeError::OutputTooLarge {

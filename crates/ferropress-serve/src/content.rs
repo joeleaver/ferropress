@@ -1,20 +1,26 @@
 //! Content resolution + on-demand SSR (Ferropress v1 serving path).
 //!
 //! Given a request *path*, this resolves the published entity behind it, renders
-//! its block tree to HTML via [`ferropress_render`], and wraps that body in page
-//! chrome via [`ferropress_theme`]. It is the read-side counterpart to the (still
-//! deferred) [`ServeEngine`](crate::ServeEngine) prerender loop: v1 serves every
-//! page on demand; the prerender-cache + change-driven regen is a later
-//! increment (see the TODO on `ServeEngine::regen_loop`).
+//! its block tree to HTML via [`ferropress_render`], and frames that body in page
+//! chrome via [`ferropress_theme`], consuming **live** site settings.
+//!
+//! ## The cache holds an *envelope*, chrome is composed live
+//!
+//! The expensive, per-object work — block tree -> HTML plus the media `src`
+//! rewrite — is cached as a [`CachedPage`] envelope (body + the object's own
+//! metadata). The **chrome** (masthead title/tagline, robots meta, the dateline's
+//! formatting) is composed at *request time* from the current [`SiteSettings`], so
+//! a settings change is reflected on the next request with **no page
+//! regeneration** — the serving model's "don't couple a global setting to every
+//! cached page" guardrail. [`serve_path`] deserializes the envelope and composes;
+//! the regen loop caches the envelope.
 //!
 //! ## Permalinks (v1)
 //!
 //! Flat, published-only: a path `"/<slug>"` resolves to a **published** `Post`
-//! with that slug, falling back to a **published** `Page`. There is no nested
-//! hierarchy, date prefix, or custom permalink structure yet — that is a
-//! deliberate v1 simplification, documented here and in
-//! [`slug_from_path`]. Everything else (404 / 500) flows from the absence of a
-//! match or a backend/render fault.
+//! with that slug, falling back to a **published** `Page`. The site root `"/"`
+//! (empty slug) is the front-page galley (see [`render_home`]); nested paths are a
+//! later increment.
 //!
 //! ## No block -> HTML logic here
 //!
@@ -26,51 +32,34 @@ use std::sync::{Arc, LazyLock};
 
 use ferropress_core::error::CoreError;
 use ferropress_core::ports::BlobStore;
+use ferropress_core::query::Edge;
 use ferropress_core::store::RhypeStore;
-use ferropress_core::value::{TypeName, Value};
-use ferropress_core::{BlockTree, Compare, FilterSpec, Object, PAGE_TYPE, POST_TYPE, Status};
-use ferropress_render::{CustomBlockRenderer, Html, RenderMode, render_with};
-use ferropress_theme::{PageContext, SandboxLimits, ThemeEngine, ThemeError};
+use ferropress_core::value::{ObjectId, TypeName, Value};
+use ferropress_core::{
+    BlockTree, Compare, FilterSpec, MEDIA_TYPE, Object, PAGE_TYPE, POST_TYPE, Seo, Status,
+    USER_TYPE, is_media_token, media_url,
+};
+use ferropress_render::{CustomBlockRenderer, RenderMode, render_with};
+use ferropress_render_form::SiteSettings;
+use ferropress_theme::{SandboxLimits, ThemeEngine, ThemeError};
+use serde::{Deserialize, Serialize};
 
 use crate::cache_key;
+use crate::datefmt;
+use crate::templates::{
+    BASE_SRC, BASE_TEMPLATE, HOME_SRC, HOME_TEMPLATE, SINGLE_SRC, SINGLE_TEMPLATE,
+};
 
-/// The name of the built-in chrome template the content service renders into.
-/// Named `.html` so the MiniJinja host auto-escapes interpolations like
-/// `{{ title }}`; the already-rendered block body is injected via the `safe`
-/// filter (`{{ content | safe }}`).
-pub const PAGE_TEMPLATE: &str = "page.html";
-
-/// Source of the single built-in page-chrome template. Kept here so the
-/// composition root and the integration test share ONE source of truth (through
-/// [`default_theme`]); a real theme system will later load author templates.
-///
-/// Besides the page title + pre-rendered content, the chrome emits the public-site
-/// **island** mount points (`#fp-search`, `#fp-comments`) and the ESM `<script>`
-/// that boots the wasm bundle served at `/_fp/islands`. The islands hydrate into
-/// those placeholders client-side; a page that never loads the bundle (or has the
-/// islands disabled) just shows empty placeholders. The comments island derives
-/// its slug from `window.location.pathname` (permalinks v1 are flat `/<slug>`).
-pub const PAGE_TEMPLATE_SRC: &str = r#"<!doctype html>
-<html>
-<head><title>{{ title }}</title></head>
-<body>
-<div id="fp-search"></div>
-{{ content | safe }}
-<div id="fp-comments"></div>
-<script type="module">
-import init from '/_fp/islands/ferropress_islands.js';
-init({ module_or_path: '/_fp/islands/ferropress_islands_bg.wasm' });
-</script>
-</body>
-</html>
-"#;
-
-/// Build the v1 [`ThemeEngine`] with [`PAGE_TEMPLATE`] registered. Both the
-/// composition root (`ferropress-server`) and the end-to-end test call this, so
-/// the page chrome they exercise is byte-for-byte identical.
+/// Build the v1 [`ThemeEngine`] with the built-in public theme registered (shared
+/// chrome + single-page + front-page templates). Both the composition root
+/// (`ferropress-server`) and the integration tests call this, so the chrome they
+/// exercise is byte-for-byte identical. A real theme system will later load author
+/// templates in place of these built-ins.
 pub fn default_theme() -> Result<ThemeEngine, ThemeError> {
     let mut theme = ThemeEngine::new(SandboxLimits::default());
-    theme.add_template(PAGE_TEMPLATE.to_owned(), PAGE_TEMPLATE_SRC.to_owned())?;
+    theme.add_template(BASE_TEMPLATE.to_owned(), BASE_SRC.to_owned())?;
+    theme.add_template(SINGLE_TEMPLATE.to_owned(), SINGLE_SRC.to_owned())?;
+    theme.add_template(HOME_TEMPLATE.to_owned(), HOME_SRC.to_owned())?;
     Ok(theme)
 }
 
@@ -92,34 +81,74 @@ pub enum Resolved {
     Error(CoreError),
 }
 
+/// The cached, per-object render of a page: the expensive block-tree -> HTML body
+/// (with media `src`s already rewritten) plus the object's own metadata. This is
+/// what the prerender cache stores (serialized as JSON). The chrome is NOT baked
+/// in — it is composed live from the current [`SiteSettings`] on each request, so
+/// the envelope only ever needs regenerating when the *content* changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CachedPage {
+    /// The entry's own title (the `<h1>` and part of the `<title>`).
+    pub title: String,
+    /// A short summary for the meta description / listing excerpt.
+    pub excerpt: String,
+    /// Publish instant (epoch millis, UTC) for the live-formatted dateline.
+    pub published_at: Option<i64>,
+    /// Author display name for the byline (posts only; resolved once here).
+    ///
+    /// NB this is a *cross-entity* value cached in the envelope: if the author
+    /// later renames their `User.display_name`, this post's cached byline stays
+    /// stale until the POST itself is re-rendered (the regen loop reacts to
+    /// Post/Page/Setting changes, not User changes), while the live front-page
+    /// galley shows the new name. This is the same cross-entity-invalidation gap
+    /// documented on [`ServeEngine::affected_pages`](crate::ServeEngine::affected_pages)
+    /// (term/archive/feed dependencies), and closing it there closes it here.
+    pub author: Option<String>,
+    /// Featured image URL (`/media/{uuid}`) for the hero, if set.
+    pub featured_image: Option<String>,
+    /// Whether this is a `Post` (shows a byline) vs a `Page` (does not).
+    pub is_post: bool,
+    /// Stored SEO metadata (canonical/description), if present.
+    pub seo: Option<Seo>,
+    /// The rendered, media-rewritten block body (emitted `| safe`).
+    pub body: String,
+}
+
 /// Derive the lookup slug from a request path (permalinks v1: flat `/<slug>`).
 ///
 /// Strips a single leading `'/'` and any trailing `'/'`; the remainder is the
-/// slug. `"/"` (the site root) yields an empty slug — no published entity has an
-/// empty slug, so the root currently resolves to [`Resolved::NotFound`] until a
-/// home page is wired. Nested paths (`"/a/b"`) are passed through verbatim as the
-/// slug, so they simply will not match a flat slug today; nested permalinks are
-/// a later increment.
+/// slug. `"/"` (the site root) yields an empty slug, which the read paths route to
+/// the front-page galley. Nested paths (`"/a/b"`) are passed through verbatim as
+/// the slug, so they simply will not match a flat slug today; nested permalinks
+/// are a later increment.
 pub fn slug_from_path(path: &str) -> &str {
     path.trim_start_matches('/').trim_end_matches('/')
 }
 
-/// Resolve a request path to a rendered HTML document (v1 SSR-on-demand).
+/// Resolve a request path to a rendered HTML document (v1 SSR-on-demand, uncached).
 ///
-/// Resolution order (published-only): `Post` by slug, then `Page` by slug. On a
-/// hit, the stored `block_tree` JSON string is parsed, rendered in
-/// [`RenderMode::Publish`], and wrapped in the `PAGE_TEMPLATE` chrome.
-///
-/// This is the *uncached* render. The cache-first hot path is [`serve_path`],
-/// which consults the prerender [`BlobStore`] before falling through to here.
+/// The site root renders the front-page galley; any other path resolves the
+/// published `Post` then `Page` behind its slug, builds the [`CachedPage`]
+/// envelope, and composes chrome around it. The cache-first hot path is
+/// [`serve_path`]; this is the uncached form used by tests + `resolve` callers.
 pub async fn resolve_path(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
+    settings: &SiteSettings,
     path: &str,
 ) -> Resolved {
-    match render_path(store, theme, custom, path).await {
-        Ok(Some(html)) => Resolved::Found(html),
+    if slug_from_path(path).is_empty() {
+        return match render_home(store, theme, settings).await {
+            Ok(html) => Resolved::Found(html),
+            Err(e) => Resolved::Error(e),
+        };
+    }
+    match build_page(store, custom, path).await {
+        Ok(Some(page)) => match compose_single(theme, settings, &page) {
+            Ok(html) => Resolved::Found(html),
+            Err(e) => Resolved::Error(e),
+        },
         Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
     }
@@ -127,42 +156,56 @@ pub async fn resolve_path(
 
 /// Cache-first resolution: the static-first hot path the HTTP fallback calls.
 ///
-/// 1. Try the prerender cache (`blobs.get(cache_key(path))`). On a hit, return
-///    the stored UTF-8 HTML verbatim — **no store lookup, no re-render**. This is
-///    what makes serving "static-first": once a page is prerendered (on first
-///    request here, or by the regen loop), it is served straight from blob bytes.
-/// 2. On a miss, fall through to the uncached [`render_path`]. If it produces
-///    HTML, write it *through* to the cache (`blobs.put`) so the next request
-///    hits, then return `Found`. `NotFound` / `Error` pass through unchanged (we
-///    never cache a 404 or a fault).
+/// The site root is rendered live (the galley depends on the whole post set +
+/// `posts_per_page`, so it is not blob-cached in v1). For a permalink:
+///
+/// 1. Try the prerender cache (`blobs.get(cache_key(path))`). On a hit, deserialize
+///    the [`CachedPage`] envelope and compose chrome around it with the current
+///    settings — **no store lookup, no block re-render**. A corrupt/legacy entry
+///    that fails to deserialize is treated as a miss.
+/// 2. On a miss, build the envelope (block tree -> HTML + metadata), write it
+///    *through* to the cache, and compose. `NotFound` / `Error` are never cached.
 ///
 /// The cache is **best-effort**: a blob read or write failure never fails the
-/// request. A read error is treated as a miss (we just render), and a
-/// write-through error is logged and swallowed (we still return the freshly
-/// rendered HTML). Cache I/O faults degrade us to v1 SSR-on-demand, never to a
-/// 500. The change-driven regen loop
-/// ([`ServeEngine::regen_loop`](crate::ServeEngine::regen_loop)) keeps populated
-/// entries fresh.
+/// request — it degrades to render-on-demand, never a 500. The change-driven regen
+/// loop ([`ServeEngine::regen_loop`](crate::ServeEngine::regen_loop)) keeps
+/// populated envelopes fresh.
 pub async fn serve_path(
     store: &Arc<dyn RhypeStore>,
     blobs: &Arc<dyn BlobStore>,
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
+    settings: &SiteSettings,
     path: &str,
 ) -> Resolved {
+    if slug_from_path(path).is_empty() {
+        // The front page is composed live from the current post set + settings;
+        // it is not blob-cached in v1 (a later increment can cache + invalidate it
+        // on the same change feed).
+        return match render_home(store, theme, settings).await {
+            Ok(html) => Resolved::Found(html),
+            Err(e) => Resolved::Error(e),
+        };
+    }
+
     let key = cache_key(path);
 
-    // 1. Cache read. A hit short-circuits; a `NotFound` is an ordinary miss; any
-    //    other error means the cache is degraded — log and treat it as a miss so
-    //    the request still succeeds via a fresh render.
+    // 1. Cache read. A hit -> compose chrome around the stored envelope. A
+    //    `NotFound` is an ordinary miss; any other error (or a non-envelope entry)
+    //    degrades to a fresh render.
     match blobs.get(&key).await {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(html) => return Resolved::Found(html),
+        Ok(bytes) => match serde_json::from_slice::<CachedPage>(&bytes) {
+            Ok(page) => {
+                return match compose_single(theme, settings, &page) {
+                    Ok(html) => Resolved::Found(html),
+                    Err(e) => Resolved::Error(e),
+                };
+            }
             Err(e) => {
-                // A non-UTF-8 cache entry should never happen (we only ever put
-                // rendered HTML), but if it does, don't serve garbage — log and
-                // re-render below.
-                tracing::warn!(%path, error = %e, "prerender cache held non-UTF-8 bytes; re-rendering");
+                // A non-envelope cache entry should never happen (we only ever put
+                // serialized `CachedPage`s), but if it does, don't serve garbage —
+                // log and re-render below.
+                tracing::warn!(%path, error = %e, "prerender cache held a non-envelope entry; re-rendering");
             }
         },
         Err(CoreError::NotFound { .. }) => {
@@ -173,43 +216,248 @@ pub async fn serve_path(
         }
     }
 
-    // 2. Miss: render on demand, then populate the cache (write-through).
-    match render_path(store, theme, custom, path).await {
-        Ok(Some(html)) => {
-            if let Err(e) = blobs.put(&key, html.clone().into_bytes()).await {
-                // Populate-on-miss is best-effort: a write failure must not fail
-                // the request — log it and serve the rendered HTML anyway.
-                tracing::warn!(%path, error = %e, "prerender cache write-through failed; serving uncached render");
+    // 2. Miss: build the envelope, populate the cache (write-through), compose.
+    match build_page(store, custom, path).await {
+        Ok(Some(page)) => {
+            match serde_json::to_vec(&page) {
+                Ok(bytes) => {
+                    if let Err(e) = blobs.put(&key, bytes).await {
+                        // Populate-on-miss is best-effort: a write failure must not
+                        // fail the request — log it and serve the render anyway.
+                        tracing::warn!(%path, error = %e, "prerender cache write-through failed; serving uncached render");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%path, error = %e, "could not serialize page envelope for the cache; serving uncached render");
+                }
             }
-            Resolved::Found(html)
+            match compose_single(theme, settings, &page) {
+                Ok(html) => Resolved::Found(html),
+                Err(e) => Resolved::Error(e),
+            }
         }
         Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
     }
 }
 
-/// Uncached resolution returning `Result<Option<html>>` so the `?` operator can
-/// carry `CoreError`s and `Ok(None)` cleanly distinguishes "not found" from
-/// "rendered". [`resolve_path`] folds this into [`Resolved`]; [`serve_path`] and
-/// the regen loop call it on a cache miss / regeneration.
-pub(crate) async fn render_path(
+/// Build the [`CachedPage`] envelope for a permalink, or `None` if no PUBLISHED
+/// entity backs its slug. Resolves the entity, renders + media-rewrites its body,
+/// and gathers its metadata (author, featured image, SEO). `pub(crate)` so the
+/// regen loop caches the envelope it produces.
+pub(crate) async fn build_page(
     store: &Arc<dyn RhypeStore>,
-    theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     path: &str,
-) -> Result<Option<String>, CoreError> {
+) -> Result<Option<CachedPage>, CoreError> {
     let slug = slug_from_path(path);
-
-    // Permalinks v1: the published Post, then the published Page, behind this
-    // slug. The shared resolver is the single definition of "published at this
-    // slug" (also used by the island comment API).
-    let object = match resolve_published_entity(store, slug).await? {
-        Some((_type_name, obj)) => obj,
+    let (type_name, object) = match resolve_published_entity(store, slug).await? {
+        Some(pair) => pair,
         None => return Ok(None),
     };
+    Ok(Some(
+        cached_page_from_object(store, custom, type_name, &object).await?,
+    ))
+}
 
-    let html = render_object(theme, custom, &object)?;
-    Ok(Some(html))
+/// Render `object` into a [`CachedPage`] envelope: the block body (media-rewritten)
+/// plus the metadata the chrome needs. The block dispatch is solely
+/// `ferropress_render::render_with` (the one-shared-renderer invariant); `custom`
+/// resolves plugin blocks.
+pub(crate) async fn cached_page_from_object(
+    store: &Arc<dyn RhypeStore>,
+    custom: &dyn CustomBlockRenderer,
+    type_name: &'static str,
+    obj: &Object,
+) -> Result<CachedPage, CoreError> {
+    // `block_tree` is persisted as a native `Value::Json` (rhypedb Json scalar).
+    let tree = match obj.get("block_tree") {
+        Some(Value::Json(j)) => BlockTree::from_json_value(j.clone())?,
+        other => {
+            return Err(CoreError::TypeMismatch {
+                type_name: obj.type_name.as_str().to_owned(),
+                field: "block_tree".to_owned(),
+                detail: format!("expected JSON, got {other:?}"),
+            });
+        }
+    };
+
+    // Render the block body, then rewrite `data-media-id` placeholders into real
+    // media `src`s — the serve layer's job, not the pure renderer's. This runs
+    // pre-cache so cached envelopes always carry final URLs.
+    let body = rewrite_media_srcs(render_with(&tree, RenderMode::Publish, custom).as_str());
+
+    let is_post = type_name == POST_TYPE;
+
+    Ok(CachedPage {
+        title: str_field(obj, "title"),
+        excerpt: str_field(obj, "excerpt"),
+        published_at: obj.get("published_at").and_then(Value::as_datetime),
+        // A byline only makes sense on posts; pages have no author line (WP parity).
+        author: if is_post {
+            author_display_name(store, type_name, obj.id).await
+        } else {
+            None
+        },
+        featured_image: featured_image_url(store, type_name, obj.id).await,
+        is_post,
+        seo: obj
+            .get("seo")
+            .and_then(Value::as_json)
+            .and_then(|j| serde_json::from_value::<Seo>(j.clone()).ok()),
+        body,
+    })
+}
+
+/// Compose the final single-page HTML: frame the cached envelope in chrome, with
+/// the dateline formatted live per `settings.date_format` + `settings.timezone`.
+fn compose_single(
+    theme: &ThemeEngine,
+    settings: &SiteSettings,
+    page: &CachedPage,
+) -> Result<String, CoreError> {
+    let dateline = page
+        .published_at
+        .map(|ms| datefmt::format_datetime(ms, &settings.date_format, &settings.timezone));
+
+    let author = if page.is_post {
+        page.author.as_deref()
+    } else {
+        None
+    };
+
+    let ctx = SingleCtx {
+        page_title: page_title(&page.title, settings),
+        page_description: meta_description(page),
+        canonical: page.seo.as_ref().and_then(|s| s.canonical_url.as_deref()),
+        site: SiteCtx::from(settings),
+        is_home: false,
+        title: &page.title,
+        dateline,
+        kicker: None,
+        author,
+        author_initials: author.map(initials).unwrap_or_default(),
+        featured_image: page.featured_image.as_deref(),
+        body: &page.body,
+    };
+
+    theme
+        .render(SINGLE_TEMPLATE, &ctx)
+        // ThemeError does not convert to CoreError; carry its message so the HTTP
+        // layer can log it and return a generic 500.
+        .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
+}
+
+/// Render the front-page galley: the most-recent published posts (up to
+/// `settings.posts_per_page`), newest first, composed live. Not blob-cached in v1.
+async fn render_home(
+    store: &Arc<dyn RhypeStore>,
+    theme: &ThemeEngine,
+    settings: &SiteSettings,
+) -> Result<String, CoreError> {
+    let posts = recent_published_posts(store, settings).await?;
+
+    let ctx = HomeCtx {
+        page_title: settings.title_or_default().to_owned(),
+        page_description: if settings.tagline.is_empty() {
+            None
+        } else {
+            Some(&settings.tagline)
+        },
+        site: SiteCtx::from(settings),
+        is_home: true,
+        posts,
+    };
+
+    theme
+        .render(HOME_TEMPLATE, &ctx)
+        .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
+}
+
+/// The most-recent published posts for the galley, newest first, capped at `limit`.
+///
+/// Scans posts and filters/sorts in Rust: v1 has no compound "status == published
+/// ORDER BY published_at DESC LIMIT n" query primitive, and the post table is
+/// small. Posts with no `published_at` sort last (keyed as `i64::MIN`). Each row's
+/// author byline is resolved with ONE batched link read (no N+1).
+async fn recent_published_posts(
+    store: &Arc<dyn RhypeStore>,
+    settings: &SiteSettings,
+) -> Result<Vec<PostSummary>, CoreError> {
+    let mut published: Vec<Object> = store
+        .scan(&TypeName::from(POST_TYPE))
+        .await?
+        .into_iter()
+        .filter(is_published)
+        .collect();
+
+    // Newest first by publish instant (missing dates sort last).
+    published.sort_by(|a, b| {
+        let key = |o: &Object| {
+            o.get("published_at")
+                .and_then(Value::as_datetime)
+                .unwrap_or(i64::MIN)
+        };
+        key(b).cmp(&key(a))
+    });
+    published.truncate(settings.posts_per_page as usize);
+
+    // Resolve every row's author in ONE batched link read, then one `get_many`
+    // over the distinct author ids — no N+1.
+    let ids: Vec<ObjectId> = published.iter().map(|o| o.id).collect();
+    let author_links = store
+        .get_links_many(&TypeName::from(POST_TYPE), &ids, "author")
+        .await?;
+    let names = resolve_author_names(store, &author_links).await;
+
+    Ok(published
+        .iter()
+        .zip(author_links.iter())
+        .map(|(obj, authors)| {
+            let author = authors
+                .first()
+                .and_then(|id| names.get(id).cloned())
+                .filter(|n| !n.is_empty());
+            PostSummary {
+                title: str_field(obj, "title"),
+                url: format!("/{}", str_field(obj, "slug")),
+                excerpt: str_field(obj, "excerpt"),
+                dateline: obj
+                    .get("published_at")
+                    .and_then(Value::as_datetime)
+                    .map(|ms| {
+                        datefmt::format_datetime(ms, &settings.date_format, &settings.timezone)
+                    }),
+                author,
+            }
+        })
+        .collect())
+}
+
+/// Map the distinct author ids from a batch of link reads to their display names
+/// (one `get_many`). Missing/blank names are simply absent from the map.
+async fn resolve_author_names(
+    store: &Arc<dyn RhypeStore>,
+    author_links: &[Vec<ObjectId>],
+) -> std::collections::HashMap<ObjectId, String> {
+    let mut ids: Vec<ObjectId> = author_links
+        .iter()
+        .filter_map(|a| a.first().copied())
+        .collect();
+    ids.sort_by_key(|i| i.0);
+    ids.dedup();
+
+    let mut names = std::collections::HashMap::new();
+    if let Ok(users) = store.get_many(&TypeName::from(USER_TYPE), &ids).await {
+        for user in users {
+            if let Some(Value::String(name)) = user.get("display_name")
+                && !name.trim().is_empty()
+            {
+                names.insert(user.id, name.clone());
+            }
+        }
+    }
+    names
 }
 
 /// Resolve a request slug to the PUBLISHED entity behind it, returning its store
@@ -218,13 +466,11 @@ pub(crate) async fn render_path(
 /// This is the single definition of the v1 permalink rule: a published `Post` by
 /// slug takes precedence, then a published `Page`. `Ok(None)` means no published
 /// entity matched (callers map that to a 404). An empty slug never matches (no
-/// flat entity has an empty slug; the site root is not yet a home page).
+/// flat entity has an empty slug; the site root is the front page, not a permalink).
 ///
-/// Shared by [`render_path`] (page rendering) and the island comment API, so a
+/// Shared by [`build_page`] (page rendering) and the island comment API, so a
 /// comment can only ever attach to — and be listed for — content that is actually
-/// publicly served, under ONE definition of "published at this slug". Returning
-/// the type-name lets the comment API pick the correct `Post.comments` /
-/// `Page.comments` relation to traverse.
+/// publicly served, under ONE definition of "published at this slug".
 pub async fn resolve_published_entity(
     store: &Arc<dyn RhypeStore>,
     slug: &str,
@@ -279,59 +525,162 @@ pub(crate) fn is_published(obj: &Object) -> bool {
     matches!(obj.get("status"), Some(Value::String(s)) if s == Status::Published.as_str())
 }
 
-/// Turn a resolved object into a full HTML document: parse its `block_tree` JSON
-/// string, render the body, and wrap it in the page-chrome template.
-///
-/// No `BlockKind` is inspected here — block markup is produced solely by
-/// `ferropress_render::render_with` (the one-shared-renderer invariant), with
-/// `custom` resolving plugin (`BlockKind::Custom`) blocks. The `title` is read off
-/// the object's `title` field (empty if absent).
-///
-/// `pub(crate)` so the regen loop's `render_page` can render an object it has
-/// already `get`-fetched (by id, off a change) without going back through the
-/// slug-based [`render_path`] lookup.
-pub(crate) fn render_object(
-    theme: &ThemeEngine,
-    custom: &dyn CustomBlockRenderer,
-    obj: &Object,
-) -> Result<String, CoreError> {
-    // `block_tree` is persisted as a native `Value::Json` (rhypedb Json scalar).
-    let tree = match obj.get("block_tree") {
-        Some(Value::Json(j)) => BlockTree::from_json_value(j.clone())?,
-        other => {
-            return Err(CoreError::TypeMismatch {
-                type_name: obj.type_name.as_str().to_owned(),
-                field: "block_tree".to_owned(),
-                detail: format!("expected JSON, got {other:?}"),
-            });
-        }
-    };
-
-    // Render the block body, then rewrite `data-media-id` placeholders into real
-    // media `src`s (see [`rewrite_media_srcs`]) — the serve layer's job, not the
-    // pure renderer's. This runs pre-cache in the one shared render path.
-    let body = Html(rewrite_media_srcs(
-        render_with(&tree, RenderMode::Publish, custom).as_str(),
-    ));
-
-    let title = match obj.get("title") {
+/// A single field read as a `String` (empty when absent or not a string).
+fn str_field(obj: &Object, field: &str) -> String {
+    match obj.get(field) {
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
-    };
+    }
+}
 
-    let ctx = PageContext {
-        title,
-        // TODO: hydrate SEO from the stored `seo` JSON String once the chrome
-        // template consumes canonical/robots/og tags.
-        seo: None,
-        content: body,
-    };
+/// Resolve an object's `author` relation to a `User.display_name`, if any.
+async fn author_display_name(
+    store: &Arc<dyn RhypeStore>,
+    type_name: &str,
+    id: ObjectId,
+) -> Option<String> {
+    let author_id = single_link(store, type_name, id, "author").await?;
+    let user = store
+        .get(&TypeName::from(USER_TYPE), author_id)
+        .await
+        .ok()?;
+    match user.get("display_name") {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
 
-    theme
-        .render_page(PAGE_TEMPLATE, &ctx)
-        // ThemeError does not convert to CoreError; carry its message so the HTTP
-        // layer can log it and return a generic 500.
-        .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
+/// Resolve an object's `featured_media` relation to a public `/media/{uuid}` URL.
+async fn featured_image_url(
+    store: &Arc<dyn RhypeStore>,
+    type_name: &str,
+    id: ObjectId,
+) -> Option<String> {
+    let media_id = single_link(store, type_name, id, "featured_media").await?;
+    let media = store
+        .get(&TypeName::from(MEDIA_TYPE), media_id)
+        .await
+        .ok()?;
+    match media.get("uuid") {
+        Some(Value::String(uuid)) if is_media_token(uuid) => Some(media_url(uuid)),
+        _ => None,
+    }
+}
+
+/// The first target of a to-one relation `field` on `(type_name, id)`, if linked.
+async fn single_link(
+    store: &Arc<dyn RhypeStore>,
+    type_name: &str,
+    id: ObjectId,
+    field: &str,
+) -> Option<ObjectId> {
+    let edge = Edge {
+        type_name: TypeName::from(type_name),
+        id,
+        field: field.to_owned(),
+    };
+    store
+        .get_links(&edge)
+        .await
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|(target, _)| target)
+}
+
+/// The document `<title>`: `"Entry — Site"`, or just the site title when the entry
+/// has none.
+fn page_title(title: &str, settings: &SiteSettings) -> String {
+    let site = settings.title_or_default();
+    if title.trim().is_empty() {
+        site.to_owned()
+    } else {
+        format!("{title} — {site}")
+    }
+}
+
+/// The `<meta name="description">`: the stored SEO description, else the excerpt,
+/// else nothing.
+fn meta_description(page: &CachedPage) -> Option<&str> {
+    page.seo
+        .as_ref()
+        .and_then(|s| s.meta_description.as_deref())
+        .or_else(|| {
+            if page.excerpt.trim().is_empty() {
+                None
+            } else {
+                Some(&page.excerpt)
+            }
+        })
+}
+
+/// Up to two uppercased initials from a display name (the byline avatar).
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// The live site chrome the templates read (`site.*`). Derived from the current
+/// [`SiteSettings`] on every render.
+#[derive(Serialize)]
+struct SiteCtx<'a> {
+    title: &'a str,
+    tagline: &'a str,
+    url: &'a str,
+    /// `true` when search-engine indexing is off → the chrome emits a `noindex`
+    /// robots meta.
+    noindex: bool,
+}
+
+impl<'a> From<&'a SiteSettings> for SiteCtx<'a> {
+    fn from(s: &'a SiteSettings) -> Self {
+        SiteCtx {
+            title: s.title_or_default(),
+            tagline: &s.tagline,
+            url: &s.url,
+            noindex: !s.search_engine_visible,
+        }
+    }
+}
+
+/// The context for the single-page template.
+#[derive(Serialize)]
+struct SingleCtx<'a> {
+    page_title: String,
+    page_description: Option<&'a str>,
+    canonical: Option<&'a str>,
+    site: SiteCtx<'a>,
+    is_home: bool,
+    title: &'a str,
+    dateline: Option<String>,
+    kicker: Option<&'a str>,
+    author: Option<&'a str>,
+    author_initials: String,
+    featured_image: Option<&'a str>,
+    body: &'a str,
+}
+
+/// The context for the front-page galley template.
+#[derive(Serialize)]
+struct HomeCtx<'a> {
+    page_title: String,
+    page_description: Option<&'a str>,
+    site: SiteCtx<'a>,
+    is_home: bool,
+    posts: Vec<PostSummary>,
+}
+
+/// One row in the front-page galley.
+#[derive(Serialize)]
+struct PostSummary {
+    title: String,
+    url: String,
+    excerpt: String,
+    dateline: Option<String>,
+    author: Option<String>,
 }
 
 /// Rewrite the renderer's `src`-less media placeholder into a real media URL.

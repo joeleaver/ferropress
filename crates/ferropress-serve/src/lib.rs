@@ -28,16 +28,18 @@ use ferropress_core::store::RhypeStore;
 use ferropress_core::value::Value;
 use ferropress_core::{PAGE_TYPE, POST_TYPE};
 use ferropress_render::CustomBlockRenderer;
-use ferropress_theme::ThemeEngine;
 
 pub mod content;
+pub mod datefmt;
 pub mod hook_bridge;
+pub mod settings;
+pub mod templates;
 
 pub use content::{
-    PAGE_TEMPLATE, PAGE_TEMPLATE_SRC, Resolved, default_theme, resolve_path,
-    resolve_published_entity, serve_path, slug_from_path,
+    Resolved, default_theme, resolve_path, resolve_published_entity, serve_path, slug_from_path,
 };
 pub use hook_bridge::HookBridge;
+pub use settings::{SettingsHandle, load_site_settings, load_values};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it
@@ -104,34 +106,48 @@ fn slug_from_change(change: &Change) -> Option<String> {
 
 /// Drives prerender + incremental regeneration over the ports.
 ///
-/// Holds the same collaborators the read path uses: the store (to read the
-/// changed entity), the blob cache (to write-through / evict), the theme (to
-/// produce final chrome), and the custom-block renderer (to resolve plugin
-/// blocks) — so a regenerated page is byte-for-byte what a fresh [`serve_path`]
-/// render would have produced.
+/// Holds the collaborators the *envelope* build needs: the store (to read the
+/// changed entity + its metadata), the blob cache (to write-through / evict), and
+/// the custom-block renderer (to resolve plugin blocks) — so a regenerated
+/// envelope is byte-for-byte what a fresh [`serve_path`] render would cache. The
+/// chrome is NOT produced here: it is composed live at request time, so the regen
+/// loop needs no theme host (and a settings change never triggers regeneration).
 pub struct ServeEngine {
     store: Arc<dyn RhypeStore>,
     blobs: Arc<dyn BlobStore>,
-    theme: Arc<ThemeEngine>,
     custom: Arc<dyn CustomBlockRenderer>,
+    /// The live site-settings snapshot the read path composes chrome from. When
+    /// present, a `Setting` change on the feed refreshes it (see
+    /// [`apply_change`](Self::apply_change)); `None` (tests, a public-only boot
+    /// without settings wired) simply skips the refresh. This is the SAME handle
+    /// the HTTP read path holds, so a refresh here is visible there.
+    settings: Option<SettingsHandle>,
 }
 
 impl ServeEngine {
-    /// Build the engine over the injected ports + the shared theme host + the
-    /// custom-block renderer. The concrete adapters (theme, plugin host) are chosen
-    /// in `ferropress-server` (the composition root), never here.
+    /// Build the engine over the injected ports + the custom-block renderer. The
+    /// concrete adapters (plugin host) are chosen in `ferropress-server` (the
+    /// composition root), never here.
     pub fn new(
         store: Arc<dyn RhypeStore>,
         blobs: Arc<dyn BlobStore>,
-        theme: Arc<ThemeEngine>,
         custom: Arc<dyn CustomBlockRenderer>,
     ) -> Self {
         Self {
             store,
             blobs,
-            theme,
             custom,
+            settings: None,
         }
+    }
+
+    /// Wire the live [`SettingsHandle`] so the regen loop refreshes it whenever a
+    /// `Setting` changes on the feed. Pass the SAME handle the HTTP read path
+    /// holds (the composition root creates one and shares it), so a settings edit
+    /// is reflected on the public site without any page-cache regeneration.
+    pub fn with_settings(mut self, settings: SettingsHandle) -> Self {
+        self.settings = Some(settings);
+        self
     }
 
     /// Run the regeneration loop forever: subscribe to ALL changes and, for each
@@ -142,7 +158,7 @@ impl ServeEngine {
     /// publishes the changed scalar fields, so no extra read is needed; a re-`get`
     /// is only a fallback when the feed somehow carried no slug):
     ///   * **Create / Update** of a `Post`/`Page`: derive its `/<slug>` path and
-    ///     [`render_page`](Self::render_page) it. `Some(html)` -> `put`
+    ///     [`build_page`](Self::build_page) its envelope. `Some(_)` -> `put`
     ///     (regenerate); `None` (the entity is no longer published) -> `delete`
     ///     (evict). This makes an unpublish/trash a cache eviction, not a stale
     ///     page.
@@ -187,6 +203,25 @@ impl ServeEngine {
     /// Split out of [`regen_loop`](Self::regen_loop) so a per-change failure is a
     /// recoverable `Err` the loop logs, not a loop-killing `?` at the top level.
     async fn apply_change(&self, change: &Change) -> ferropress_core::error::Result<()> {
+        // A `Setting` change refreshes the live snapshot the read path composes
+        // chrome from — NOT a page-cache eviction. Global chrome (title, tagline,
+        // robots) and date formatting are applied live at request time, so a
+        // settings edit is reflected without regenerating a single cached page
+        // (the serving model's no-global-coupling guardrail). This is why the
+        // whole prerender cache does not need busting when settings change.
+        if change.type_name.as_str() == ferropress_core::SETTING_TYPE {
+            if let Some(handle) = &self.settings {
+                match settings::load_site_settings(&self.store).await {
+                    Ok(next) => {
+                        handle.set(next);
+                        tracing::debug!("refreshed live site settings from change feed");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to refresh site settings"),
+                }
+            }
+            return Ok(());
+        }
+
         match change.kind {
             ChangeKind::Create | ChangeKind::Update => {
                 // Only content types map to a page in permalinks v1.
@@ -212,15 +247,18 @@ impl ServeEngine {
                     path: format!("/{slug}"),
                 };
 
-                // `render_page` applies the publish gate: `Some` for a published
-                // entity, `None` once it is draft/trashed/etc.
-                match self.render_page(&page).await? {
-                    Some(html) => {
-                        // Write-through: the regenerated HTML replaces any cached
-                        // copy so the next request serves it straight from blobs.
-                        self.blobs
-                            .put(&page_blob_key(&page), html.into_bytes())
-                            .await?;
+                // `build_page` applies the publish gate: `Some` envelope for a
+                // published entity, `None` once it is draft/trashed/etc.
+                match self.build_page(&page).await? {
+                    Some(cached) => {
+                        // Write-through: the regenerated envelope replaces any cached
+                        // copy so the next request composes it straight from blobs.
+                        let bytes = serde_json::to_vec(&cached).map_err(|e| {
+                            ferropress_core::error::CoreError::Store(format!(
+                                "serializing page envelope for the cache: {e}"
+                            ))
+                        })?;
+                        self.blobs.put(&page_blob_key(&page), bytes).await?;
                         tracing::debug!(path = %page.path, "regenerated prerender cache entry");
                     }
                     None => {
@@ -292,20 +330,21 @@ impl ServeEngine {
         }]
     }
 
-    /// Render a single output page to its final HTML, or `None` if no PUBLISHED
-    /// entity backs it.
+    /// Build the cache envelope for a single output page, or `None` if no
+    /// PUBLISHED entity backs it.
     ///
-    /// Reuses the exact read-path resolution ([`content::render_path`]): block
-    /// tree -> HTML via `ferropress-render`, then page chrome via
-    /// `ferropress-theme`. Routing through the same code keeps a regenerated page
-    /// byte-for-byte identical to an on-demand [`serve_path`] render of the same
-    /// path. `Ok(None)` (unpublished/absent) is the signal `regen_loop` turns into
-    /// a cache eviction.
-    pub async fn render_page(
+    /// Reuses the exact read-path build ([`content::build_page`]): block tree ->
+    /// HTML via `ferropress-render` + the media rewrite + the object metadata, with
+    /// `custom` resolving plugin blocks. Routing through the same code keeps a
+    /// regenerated envelope byte-for-byte identical to an on-demand [`serve_path`]
+    /// render of the same path. `Ok(None)` (unpublished/absent) is the signal
+    /// `regen_loop` turns into a cache eviction. Chrome is composed later, live,
+    /// from the current settings — so the envelope is settings-independent.
+    pub(crate) async fn build_page(
         &self,
         page: &OutputPage,
-    ) -> ferropress_core::error::Result<Option<String>> {
-        content::render_path(&self.store, &self.theme, self.custom.as_ref(), &page.path).await
+    ) -> ferropress_core::error::Result<Option<content::CachedPage>> {
+        content::build_page(&self.store, self.custom.as_ref(), &page.path).await
     }
 }
 

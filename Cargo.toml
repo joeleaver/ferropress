@@ -158,6 +158,10 @@ anyhow = "1"
 bytes = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+# Named IANA timezone resolution (site.timezone) with DST, layered on `time`.
+# Bundled zone database (default `db` feature) — no reliance on the host's
+# /usr/share/zoneinfo, so the self-contained binary stays portable.
+time-tz = "2"
 parking_lot = "0.12"
 
 # --- Auth / crypto (ferropress-auth) -----------------------------------------

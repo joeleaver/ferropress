@@ -30,7 +30,7 @@ use ferropress_core::hook::{HookDispatcher, NoHooks};
 use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
-use ferropress_serve::Resolved;
+use ferropress_serve::{Resolved, SettingsHandle};
 use ferropress_theme::ThemeEngine;
 
 pub mod admin;
@@ -54,6 +54,12 @@ pub struct AppState {
     /// The sandboxed MiniJinja chrome host, with the built-in page template
     /// already registered. Shared read-only across handlers.
     pub theme: Arc<ThemeEngine>,
+    /// The live site-settings snapshot the public read path composes chrome from.
+    /// The SAME handle is given to the `ServeEngine` regen loop, which refreshes it
+    /// on a `Setting` change — so a settings edit is reflected on the public site
+    /// with no page regeneration. Defaults to the schema defaults until the
+    /// composition root seeds it via [`with_settings`](Self::with_settings).
+    pub settings: SettingsHandle,
     /// Directory holding the built wasm island bundle (the `wasm-bindgen` output
     /// of `ferropress-islands`). When set, it is served at `/_fp/islands`; `None`
     /// (e.g. in tests) simply omits that route.
@@ -85,11 +91,21 @@ impl AppState {
             store,
             blobs,
             theme,
+            settings: SettingsHandle::default(),
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
             hooks: Arc::new(NoHooks),
             admin: None,
         }
+    }
+
+    /// Share the live [`SettingsHandle`] the public read path composes chrome from.
+    /// The composition root creates ONE handle (seeded from the store) and gives
+    /// the same handle to both this state and the `ServeEngine` regen loop, so a
+    /// settings edit refreshed by the loop is immediately visible here.
+    pub fn with_settings(mut self, settings: SettingsHandle) -> Self {
+        self.settings = settings;
+        self
     }
 
     /// Serve the wasm island bundle from `dir` (the `dist/` output of
@@ -239,6 +255,7 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
         &state.blobs,
         &state.theme,
         state.custom.as_ref(),
+        &state.settings.current(),
         &path,
     )
     .await
