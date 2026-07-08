@@ -317,6 +317,15 @@ pub fn app() -> NodeHandle {
                             span { class: "masthead__here", {move || masthead_title(&title.get())} }
                             span { class: "masthead__spacer" }
                             button {
+                                class: "btn btn--quiet",
+                                style: "width:auto",
+                                title: "Save, then open this draft in the real theme (new tab)",
+                                onclick: move || preview_post(
+                                    editor, current_id, editor_session, title, slug, status, featured, saving, notice, auth,
+                                ),
+                                "Preview"
+                            }
+                            button {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || save_post(
@@ -675,10 +684,66 @@ fn open_post(
     });
 }
 
-/// Persist the current editor document: read it back, bridge to `BlockTree`, and
-/// send it. A post with no id yet (a fresh "New post") is CREATED (`POST`) and its
-/// assigned id captured into `current_id` so the next save UPDATES (`PUT`) it in
-/// place. Surfaces the server's 400/409 message; stamps a "Saved" toast on success.
+/// Read the editor document back, bridge it to `BlockTree` JSON, and validate the
+/// slug — everything a Save or Preview needs from the sheet before hitting the
+/// network. Returns `(block_tree, slug)` or a ready-to-show error message. Shared by
+/// [`save_post`] and [`preview_post`] so the two stay in lockstep.
+fn prepared_doc(
+    editor: Signal<EditorHandle>,
+    slug: Signal<String>,
+) -> Result<(serde_json::Value, String), String> {
+    let node = editor.get().doc();
+    let block_tree = bridge::node_to_block_tree_json(&node)
+        .map_err(|e| format!("Couldn't prepare the document to save: {e}"))?;
+    let slug_val = slug.get().trim().to_owned();
+    if slug_val.is_empty() {
+        return Err("The slug can't be empty.".to_owned());
+    }
+    Ok((block_tree, slug_val))
+}
+
+/// Persist the prepared document: CREATE (`POST`) when there is no id yet, else
+/// UPDATE (`PUT`) in place. Returns the effective post id (freshly assigned on
+/// create). The one create-vs-update decision, shared by [`save_post`] and
+/// [`preview_post`]; the stale-session guard + `current_id` writeback stay with the
+/// callers, which differ in what they do on success (toast vs. steer the tab).
+async fn persist_post(
+    existing: Option<u64>,
+    title: String,
+    slug: String,
+    status: String,
+    block_tree: serde_json::Value,
+    featured: Option<u64>,
+) -> Result<u64, api::ApiError> {
+    match existing {
+        Some(id) => api::save_post(
+            id,
+            &api::SaveRequest {
+                title,
+                slug,
+                status,
+                block_tree,
+                featured_media: featured,
+            },
+        )
+        .await
+        .map(|()| id),
+        None => {
+            api::create_post(&api::CreateRequest {
+                title,
+                slug,
+                status,
+                block_tree,
+                featured_media: featured,
+            })
+            .await
+        }
+    }
+}
+
+/// Persist the current editor document. A post with no id yet (a fresh "New post") is
+/// CREATED and its assigned id captured into `current_id` so the next save UPDATES it
+/// in place. Surfaces the server's 400/409 message; stamps a "Saved" toast on success.
 #[allow(clippy::too_many_arguments)]
 fn save_post(
     editor: Signal<EditorHandle>,
@@ -697,55 +762,34 @@ fn save_post(
         return;
     }
 
-    let node = editor.get().doc();
-    let block_tree = match bridge::node_to_block_tree_json(&node) {
+    let (block_tree, slug_val) = match prepared_doc(editor, slug) {
         Ok(v) => v,
-        Err(e) => {
-            notice.set(format!("Couldn't prepare the document to save: {e}"));
+        Err(msg) => {
+            notice.set(msg);
             return;
         }
     };
-    let slug_val = slug.get().trim().to_owned();
-    if slug_val.is_empty() {
-        notice.set("The slug can't be empty.".to_owned());
-        return;
-    }
 
     notice.set(String::new());
     saving.set(true);
     let title_val = title.get();
     let status_val = status.get();
     let featured_val = featured.get().map(|f| f.id);
+    let existing = current_id.get();
     // The document this save belongs to. If the editor loads a different document
     // before the request returns, the result is stale and must NOT write back its
     // id / toast / error into what is now a different editing context.
     let save_gen = editor_session.get();
     spawn_local(async move {
-        // Create when there's no id yet, else update in place. Both map to
-        // `Result<Option<u64>, _>` where `Some(id)` is a freshly assigned id.
-        let result = match current_id.get() {
-            Some(id) => api::save_post(
-                id,
-                &api::SaveRequest {
-                    title: title_val,
-                    slug: slug_val,
-                    status: status_val,
-                    block_tree,
-                    featured_media: featured_val,
-                },
-            )
-            .await
-            .map(|()| None),
-            None => api::create_post(&api::CreateRequest {
-                title: title_val,
-                slug: slug_val,
-                status: status_val,
-                block_tree,
-                featured_media: featured_val,
-            })
-            .await
-            .map(Some),
-        };
+        let result = persist_post(
+            existing,
+            title_val,
+            slug_val,
+            status_val,
+            block_tree,
+            featured_val,
+        )
+        .await;
         // The editor moved to another document while we were in flight: the save
         // still landed server-side, but adopting its id here would hijack the new
         // document. Free the save lock and drop the writeback. (A 401 is auth-wide,
@@ -753,13 +797,13 @@ fn save_post(
         let stale = editor_session.get() != save_gen;
         saving.set(false);
         match result {
-            Ok(new_id) => {
+            Ok(id) => {
                 if stale {
                     return;
                 }
-                // A create hands back the new id; record it so the next save updates.
-                if new_id.is_some() {
-                    current_id.set(new_id);
+                // A create hands back a new id; record it so the next save updates.
+                if existing.is_none() {
+                    current_id.set(Some(id));
                 }
                 toast.set(true);
                 TimeoutFuture::new(1600).await;
@@ -767,6 +811,101 @@ fn save_post(
             }
             Err(api::ApiError::Unauthorized) => auth.session_expired(),
             Err(api::ApiError::Message(e)) => {
+                if !stale {
+                    notice.set(e);
+                }
+            }
+        }
+    });
+}
+
+/// Preview the current draft in the real public theme (WordPress-style, new tab).
+///
+/// The preview route renders the STORED object, so the current sheet is persisted
+/// first (exactly like [`save_post`]) — a preview must reflect what the author sees,
+/// never a stale copy. To dodge the pop-up blocker (an `open()` from an async
+/// continuation is not treated as user-initiated), the tab is opened **synchronously**
+/// in this click gesture and left blank, then steered to `/admin/preview/{id}` once
+/// the save lands. On a stale save (the editor moved on) or an error, the blank tab is
+/// closed and the editor shows the message.
+#[allow(clippy::too_many_arguments)]
+fn preview_post(
+    editor: Signal<EditorHandle>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
+    saving: Signal<bool>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    if saving.get() {
+        return;
+    }
+
+    let (block_tree, slug_val) = match prepared_doc(editor, slug) {
+        Ok(v) => v,
+        Err(msg) => {
+            notice.set(msg);
+            return;
+        }
+    };
+
+    // Open the tab NOW, in the trusted click, so it isn't blocked as a non-user
+    // pop-up. It starts blank; we point it at the rendered draft after the save below.
+    let Some(win) =
+        web_sys::window().and_then(|w| w.open_with_url_and_target("", "_blank").ok().flatten())
+    else {
+        notice.set("Couldn't open a preview tab — allow pop-ups for this site.".to_owned());
+        return;
+    };
+
+    notice.set(String::new());
+    saving.set(true);
+    let title_val = title.get();
+    let status_val = status.get();
+    let featured_val = featured.get().map(|f| f.id);
+    let existing = current_id.get();
+    let save_gen = editor_session.get();
+    spawn_local(async move {
+        let result = persist_post(
+            existing,
+            title_val,
+            slug_val,
+            status_val,
+            block_tree,
+            featured_val,
+        )
+        .await;
+        let stale = editor_session.get() != save_gen;
+        saving.set(false);
+        match result {
+            Ok(id) => {
+                if stale {
+                    // The editor switched documents mid-flight: the save landed, but
+                    // steering the tab into what is now a different post would mislead.
+                    let _ = win.close();
+                    return;
+                }
+                if existing.is_none() {
+                    current_id.set(Some(id));
+                }
+                if win
+                    .location()
+                    .set_href(&format!("/admin/preview/{id}"))
+                    .is_err()
+                {
+                    notice.set("Saved, but couldn't open the preview.".to_owned());
+                }
+            }
+            Err(api::ApiError::Unauthorized) => {
+                let _ = win.close();
+                auth.session_expired();
+            }
+            Err(api::ApiError::Message(e)) => {
+                let _ = win.close();
                 if !stale {
                     notice.set(e);
                 }

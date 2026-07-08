@@ -62,6 +62,9 @@ web-sys = { version = "0.3", features = [
     "Node",
     "HtmlHeadElement",
     "RequestCredentials",
+    # Draft preview: open a new tab (Window::open) and steer it (Location::set_href)
+    # once the save lands.
+    "Location",
     # Image upload: a native <input type=file> file picker, the chosen File/FileList,
     # and a FormData multipart body posted to /admin/api/media.
     "HtmlElement",

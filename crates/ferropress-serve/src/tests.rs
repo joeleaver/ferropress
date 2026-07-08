@@ -868,3 +868,65 @@ async fn write_capable_action_does_not_feed_loop() {
         "the action's content:write must have landed (else the guard is untested): {meta:?}"
     );
 }
+
+/// `render_preview` renders an UNPUBLISHED draft through the real theme — the
+/// publish gate `serve_path` enforces is bypassed — WITHOUT touching the cache, and
+/// frames it with the preview banner + a forced `noindex` (even though the default
+/// settings are search-engine-visible).
+#[tokio::test]
+async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Draft).await;
+
+    let path = format!("/{SLUG}");
+    let key = cache_key(&path);
+    let settings = SiteSettings::defaults();
+    assert!(
+        settings.search_engine_visible,
+        "sanity: defaults are indexable, so a preview-forced noindex is meaningful"
+    );
+
+    // The public read path hides a draft (the publish gate) ...
+    let public = serve_path(&store, &blobs, &theme, &NoCustomBlocks, &settings, &path).await;
+    assert!(
+        matches!(public, content::Resolved::NotFound),
+        "a draft must 404 on the public path"
+    );
+
+    // ... but the preview renders it through the same pipeline.
+    let obj = store
+        .get(&TypeName::from(POST_TYPE), id)
+        .await
+        .expect("get the draft object");
+    let html =
+        match content::render_preview(&store, &theme, &NoCustomBlocks, &settings, POST_TYPE, &obj)
+            .await
+        {
+            content::Resolved::Found(html) => html,
+            other => panic!("preview must render a draft, got {other:?}"),
+        };
+
+    assert!(
+        html.contains(PARAGRAPH_TEXT),
+        "the draft body must be rendered: {html}"
+    );
+    assert!(
+        html.contains("preview-bar"),
+        "the preview banner must be present"
+    );
+    assert!(
+        html.contains(r#"name="robots" content="noindex"#),
+        "a preview must be noindex regardless of the (visible) site setting"
+    );
+    assert!(
+        !html.contains(r#"id="fp-comments""#),
+        "comments must be suppressed in a draft preview"
+    );
+
+    // Preview must NOT populate the prerender cache.
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "rendering a preview must never write the prerender cache"
+    );
+}

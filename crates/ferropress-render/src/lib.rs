@@ -45,9 +45,16 @@ impl Html {
     }
 }
 
-/// Whether we are rendering for the public site or the in-editor preview. Some
-/// blocks render differently (e.g. preview shows placeholders for not-yet-
-/// uploaded media; embeds may be click-to-load on publish).
+/// Whether a render is for the public site ([`RenderMode::Publish`]) or the
+/// authenticated draft preview ([`RenderMode::Preview`], served by the admin's
+/// new-tab "preview draft in the real theme" path).
+///
+/// The block dispatch is deliberately **mode-invariant**: a preview must show exactly
+/// what publishing will produce (the what-you-see-is-what-you-publish invariant this
+/// crate exists to guarantee), so the "this is a preview" signal lives in the chrome
+/// (a banner + forced `noindex`), never in the block HTML. `mode` is threaded through
+/// the dispatch so a future *non-content* rendering-context difference has a seam, but
+/// today no block consults it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
     Publish,

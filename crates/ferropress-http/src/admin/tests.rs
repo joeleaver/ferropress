@@ -1805,3 +1805,150 @@ async fn editor_edits_others_post_without_reassigning_the_author() {
         "editing an attributed post must not reassign its author"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Draft preview (GET /admin/preview/{id}) — WordPress-style new-tab preview
+// ---------------------------------------------------------------------------
+
+/// Read a response body as UTF-8 text (the preview route returns HTML, not JSON).
+async fn to_text(resp: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("collect body");
+    String::from_utf8(bytes.to_vec()).expect("utf8 body")
+}
+
+/// Build a `GET /admin/preview/{id}` request, with or without a session cookie.
+fn preview_req(cookie: Option<&str>, id: u64) -> Request<Body> {
+    let mut b = Request::builder().uri(format!("/admin/preview/{id}"));
+    if let Some(c) = cookie {
+        b = b.header(header::COOKIE, c);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+/// The preview renders an UNPUBLISHED draft through the real public theme — the
+/// publish gate that hides it from the public site is bypassed — carrying the
+/// preview banner, a forced `noindex`, and no-store / X-Robots-Tag headers.
+#[tokio::test]
+async fn preview_renders_a_draft_through_the_real_theme() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let post = seed_post(&store, "hidden-draft", Status::Draft).await;
+
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    // The public path hides a draft (404) ...
+    let public = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/hidden-draft")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        public.status(),
+        StatusCode::NOT_FOUND,
+        "a draft must not be publicly served"
+    );
+
+    // ... but the authenticated preview renders it.
+    let resp = router(state.clone())
+        .oneshot(preview_req(Some(&cookie), post.0))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the author can preview a draft"
+    );
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "a preview must not be stored by a shared cache"
+    );
+    assert_eq!(
+        resp.headers().get("x-robots-tag").unwrap(),
+        "noindex, nofollow",
+        "a preview must never be indexed"
+    );
+
+    let html = to_text(resp).await;
+    assert!(
+        html.contains("original body"),
+        "the draft body must be rendered through the theme: {html}"
+    );
+    assert!(
+        html.contains("preview-bar"),
+        "the chrome must show the preview banner"
+    );
+    assert!(
+        html.contains(r#"name="robots" content="noindex"#),
+        "the preview chrome must emit a noindex meta"
+    );
+    assert!(
+        !html.contains(r#"id="fp-comments""#),
+        "the comments island must be suppressed in a draft preview"
+    );
+}
+
+/// The preview route is session-guarded: no cookie → 401 (never a leaked page).
+#[tokio::test]
+async fn preview_requires_a_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let post = seed_post(&store, "hidden-draft", Status::Draft).await;
+
+    let resp = router(state)
+        .oneshot(preview_req(None, post.0))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A lower role previewing another author's draft gets **404** (not 403) — the same
+/// existence-oracle guard as `get_one`, so it can't confirm the draft exists.
+#[tokio::test]
+async fn preview_of_another_authors_draft_is_404_for_a_contributor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let jane = seed_user(&store, "jane", "hunter2hunter2", "contributor").await;
+    let bob = seed_user(&store, "bob", "hunter2hunter2", "contributor").await;
+    let _ = jane;
+    let theirs = seed_post(&store, "bobs-draft", Status::Draft).await;
+    set_author(&store, theirs, bob).await;
+
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let resp = router(state)
+        .oneshot(preview_req(Some(&cookie), theirs.0))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a contributor must not preview another author's draft"
+    );
+}
+
+/// Previewing a non-existent post id is a clean 404.
+#[tokio::test]
+async fn preview_of_a_missing_post_is_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+
+    let (_, cookie, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let resp = router(state)
+        .oneshot(preview_req(Some(&cookie), 999_999))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

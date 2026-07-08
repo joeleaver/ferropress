@@ -63,6 +63,14 @@ a { color: inherit; }
 .skip { position: absolute; left: -999px; top: 0; }
 .skip:focus { left: 1rem; top: .6rem; background: var(--ink); color: var(--paper);
   padding: .5rem .8rem; border-radius: var(--radius); z-index: 60; }
+/* Draft-preview banner (authenticated new-tab preview only) */
+.preview-bar { position: sticky; top: 0; z-index: 70; display: flex; align-items: center;
+  justify-content: center; gap: .7rem; flex-wrap: wrap; padding: .5rem 1rem;
+  background: var(--minium); color: #fff; font-family: var(--ff-mono); font-size: .72rem;
+  letter-spacing: .1em; text-transform: uppercase; }
+.preview-bar__tag { font-weight: 600; letter-spacing: .18em;
+  border: 1px solid rgba(255,255,255,.55); padding: .12rem .45rem; border-radius: 2px; }
+.preview-bar__msg { color: rgba(255,255,255,.9); letter-spacing: .07em; }
 /* Masthead */
 .masthead { padding: 2.6rem 0 0; text-align: center; }
 .masthead__mark { display: flex; justify-content: center; margin-bottom: .9rem; }
@@ -171,7 +179,8 @@ main { padding: 2.4rem 0 3rem; }
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<div class="ruler" aria-hidden="true"></div>
+{% if preview_status %}<div class="preview-bar" role="status"><span class="preview-bar__tag">Preview</span><span class="preview-bar__msg">{{ preview_status }} &middot; a private draft, not the public page</span></div>
+{% endif %}<div class="ruler" aria-hidden="true"></div>
 <header class="masthead">
   <div class="gauge">
     <div class="masthead__mark" aria-hidden="true">
@@ -222,7 +231,7 @@ pub const SINGLE_SRC: &str = r##"{% extends "base.html" %}
       <div class="proof-body">{{ body | safe }}</div>
       <div class="article__foot">
         <div class="press-rule" aria-hidden="true"></div>
-        <div id="fp-comments"></div>
+        {% if not preview_status %}<div id="fp-comments"></div>{% endif %}
       </div>
     </article>
 {% endblock %}

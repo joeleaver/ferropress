@@ -73,11 +73,13 @@ pub fn render_block(block: &Block, mode: RenderMode, custom: &dyn CustomBlockRen
         }
 
         BlockKind::Embed { provider, url } => {
-            // Click-to-load link on publish, static placeholder in preview; both
-            // keep the raw embed out of the static HTML until hydrated. The embed
-            // `url` is author/plugin/import-controlled, so it routes through the SAME
-            // gate as an inline link (`is_renderable_href`): a `javascript:` (or other
-            // unsafe / empty) URL renders as inert text, never a clickable anchor —
+            // A click-to-load link that keeps the raw embed out of the static HTML
+            // until an island hydrates it. Output is identical in Preview and Publish
+            // (the WYSIWYP invariant — a preview must show exactly what will publish),
+            // so `mode` is not consulted here. The embed `url` is
+            // author/plugin/import-controlled, so it routes through the SAME gate as an
+            // inline link (`is_renderable_href`): a `javascript:` (or other unsafe /
+            // empty) URL renders as inert text, never a clickable anchor —
             // attribute-escaping alone does NOT neutralize a script scheme.
             let _ = mode;
             let provider = html_escape::encode_double_quoted_attribute(provider);

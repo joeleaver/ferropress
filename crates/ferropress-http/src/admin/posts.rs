@@ -482,8 +482,11 @@ fn author_edge(post_id: ObjectId) -> Edge {
 
 /// Read a post's author id (the single `author` to-one link), or `None` when the post
 /// is unattributed — a CLI-seeded or pre-attribution legacy row. This is the ownership
-/// signal every per-author gate reads.
-async fn author_of(state: &AppState, post_id: ObjectId) -> Result<Option<ObjectId>, AdminError> {
+/// signal every per-author gate reads (incl. the preview route, hence `pub(super)`).
+pub(super) async fn author_of(
+    state: &AppState,
+    post_id: ObjectId,
+) -> Result<Option<ObjectId>, AdminError> {
     Ok(state
         .store
         .get_links(&author_edge(post_id))

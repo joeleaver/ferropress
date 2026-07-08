@@ -145,7 +145,7 @@ pub async fn resolve_path(
         };
     }
     match build_page(store, custom, path).await {
-        Ok(Some(page)) => match compose_single(theme, settings, &page) {
+        Ok(Some(page)) => match compose_single(theme, settings, &page, None) {
             Ok(html) => Resolved::Found(html),
             Err(e) => Resolved::Error(e),
         },
@@ -196,7 +196,7 @@ pub async fn serve_path(
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedPage>(&bytes) {
             Ok(page) => {
-                return match compose_single(theme, settings, &page) {
+                return match compose_single(theme, settings, &page, None) {
                     Ok(html) => Resolved::Found(html),
                     Err(e) => Resolved::Error(e),
                 };
@@ -231,7 +231,7 @@ pub async fn serve_path(
                     tracing::warn!(%path, error = %e, "could not serialize page envelope for the cache; serving uncached render");
                 }
             }
-            match compose_single(theme, settings, &page) {
+            match compose_single(theme, settings, &page, None) {
                 Ok(html) => Resolved::Found(html),
                 Err(e) => Resolved::Error(e),
             }
@@ -256,17 +256,73 @@ pub(crate) async fn build_page(
         None => return Ok(None),
     };
     Ok(Some(
-        cached_page_from_object(store, custom, type_name, &object).await?,
+        cached_page_from_object(store, custom, RenderMode::Publish, type_name, &object).await?,
     ))
+}
+
+/// Render a specific (possibly **unpublished**) object through the real public theme,
+/// **uncached**, for the authenticated new-tab draft preview.
+///
+/// This is the WordPress-style "preview draft in the real theme" path. It deliberately
+/// reuses the exact serve pipeline — [`cached_page_from_object`] (the one shared block
+/// renderer + media rewrite + metadata) framed by [`compose_single`] against the live
+/// [`SiteSettings`] — so a preview is byte-for-byte what publishing would produce,
+/// EXCEPT for the chrome preview banner and a forced `noindex`. It differs from
+/// [`serve_path`]/[`resolve_path`] in two ways only:
+///   * **No publish gate.** The caller (the admin preview route) has already loaded
+///     and authorized the object, so a draft/pending/scheduled entity renders instead
+///     of 404ing. The permalink read paths must never do this — only this authed path.
+///   * **No cache.** Nothing is read from or written to the prerender [`BlobStore`]
+///     cache, so previewing a draft can never populate the public cache with
+///     unpublished content, and a preview always reflects the object as it is *now*.
+///
+/// `mode` is [`RenderMode::Preview`]; `type_name` is the object's store type
+/// ([`POST_TYPE`]/[`PAGE_TYPE`]). The banner carries the object's status label.
+pub async fn render_preview(
+    store: &Arc<dyn RhypeStore>,
+    theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
+    settings: &SiteSettings,
+    type_name: &'static str,
+    obj: &Object,
+) -> Resolved {
+    let label = status_label(obj);
+    match cached_page_from_object(store, custom, RenderMode::Preview, type_name, obj).await {
+        Ok(page) => match compose_single(theme, settings, &page, Some(&label)) {
+            Ok(html) => Resolved::Found(html),
+            Err(e) => Resolved::Error(e),
+        },
+        Err(e) => Resolved::Error(e),
+    }
+}
+
+/// A human-friendly banner label for a preview from the object's raw `status`
+/// (`"draft"` → `"Draft"`). Empty/absent status falls back to `"Draft"` (a post always
+/// carries one; this is belt-and-suspenders).
+fn status_label(obj: &Object) -> String {
+    let raw = str_field(obj, "status");
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Draft".to_owned(),
+    }
 }
 
 /// Render `object` into a [`CachedPage`] envelope: the block body (media-rewritten)
 /// plus the metadata the chrome needs. The block dispatch is solely
 /// `ferropress_render::render_with` (the one-shared-renderer invariant); `custom`
 /// resolves plugin blocks.
+///
+/// `mode` is threaded straight to the renderer. The public serve/regen paths pass
+/// [`RenderMode::Publish`]; the authenticated draft preview passes
+/// [`RenderMode::Preview`]. Block output is deliberately **mode-independent** — the
+/// preview's whole value is showing exactly what will publish (the
+/// what-you-see-is-what-you-publish invariant), so the "this is a preview" signal
+/// lives in the chrome, never in the block HTML.
 pub(crate) async fn cached_page_from_object(
     store: &Arc<dyn RhypeStore>,
     custom: &dyn CustomBlockRenderer,
+    mode: RenderMode,
     type_name: &'static str,
     obj: &Object,
 ) -> Result<CachedPage, CoreError> {
@@ -285,7 +341,7 @@ pub(crate) async fn cached_page_from_object(
     // Render the block body, then rewrite `data-media-id` placeholders into real
     // media `src`s — the serve layer's job, not the pure renderer's. This runs
     // pre-cache so cached envelopes always carry final URLs.
-    let body = rewrite_media_srcs(render_with(&tree, RenderMode::Publish, custom).as_str());
+    let body = rewrite_media_srcs(render_with(&tree, mode, custom).as_str());
 
     let is_post = type_name == POST_TYPE;
 
@@ -311,10 +367,17 @@ pub(crate) async fn cached_page_from_object(
 
 /// Compose the final single-page HTML: frame the cached envelope in chrome, with
 /// the dateline formatted live per `settings.date_format` + `settings.timezone`.
+///
+/// `preview_status` distinguishes the two callers: `None` is the ordinary public
+/// render; `Some(label)` is the authenticated draft preview, which surfaces the
+/// preview banner (the template reads `preview_status`) and forces `noindex`
+/// regardless of the site's search-engine-visibility setting — a private,
+/// unpublished view must never be indexable.
 fn compose_single(
     theme: &ThemeEngine,
     settings: &SiteSettings,
     page: &CachedPage,
+    preview_status: Option<&str>,
 ) -> Result<String, CoreError> {
     let dateline = page
         .published_at
@@ -326,12 +389,20 @@ fn compose_single(
         None
     };
 
+    let mut site = SiteCtx::from(settings);
+    if preview_status.is_some() {
+        // A preview is an authenticated view of unpublished (or not-yet-live) content:
+        // keep it out of every index no matter what the site setting says.
+        site.noindex = true;
+    }
+
     let ctx = SingleCtx {
         page_title: page_title(&page.title, settings),
         page_description: meta_description(page),
         canonical: page.seo.as_ref().and_then(|s| s.canonical_url.as_deref()),
-        site: SiteCtx::from(settings),
+        site,
         is_home: false,
+        preview_status,
         title: &page.title,
         dateline,
         kicker: None,
@@ -366,6 +437,7 @@ async fn render_home(
         },
         site: SiteCtx::from(settings),
         is_home: true,
+        preview_status: None,
         posts,
     };
 
@@ -654,6 +726,9 @@ struct SingleCtx<'a> {
     canonical: Option<&'a str>,
     site: SiteCtx<'a>,
     is_home: bool,
+    /// `Some(status label)` on the authenticated draft preview → the chrome shows the
+    /// preview banner and the comments island is suppressed; `None` on public renders.
+    preview_status: Option<&'a str>,
     title: &'a str,
     dateline: Option<String>,
     kicker: Option<&'a str>,
@@ -670,6 +745,9 @@ struct HomeCtx<'a> {
     page_description: Option<&'a str>,
     site: SiteCtx<'a>,
     is_home: bool,
+    /// Always `None` — the front page is never previewed; declared so the shared base
+    /// chrome's `preview_status` reference resolves without relying on lenient-undefined.
+    preview_status: Option<&'a str>,
     posts: Vec<PostSummary>,
 }
 
