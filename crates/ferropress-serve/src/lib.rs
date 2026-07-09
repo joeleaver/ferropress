@@ -59,31 +59,40 @@ const CACHE_PREFIX: &str = "prerender";
 
 /// Map a request path to its deterministic, traversal-safe prerender-cache key.
 ///
-/// The scheme is `"prerender/<sanitized-path>.html"`. Determinism + collision
-/// safety: distinct paths map to distinct keys because the path is preserved
-/// verbatim inside the namespace (only the leading `/` is dropped — it is implied
-/// by the prefix join). Traversal safety is layered:
-///   * we strip the leading `/` ourselves, because the localfs adapter REJECTS a
-///     key with a leading slash (it must be a relative path under the blob root);
-///   * the site root `"/"` (empty slug) maps to the sentinel `prerender/index.html`
-///     so it still names a file rather than the bare directory;
-///   * the [`BlobStore`] adapter is the real guard — it independently rejects
-///     `..`, NUL, backslash, and absolute keys (see `ferropress-blob-localfs`),
-///     so even a hostile path cannot escape the root. This function only has to
-///     produce a *valid relative* key; the port enforces safety.
+/// Two disjoint namespaces under `prerender/` keep LISTING pages apart from per-slug
+/// PERMALINK pages so they can never collide:
+///   * the site root `"/"` (empty slug) is a listing page → `prerender/listing/index.html`;
+///   * any other path `"/<slug>"` is a permalink → `prerender/permalink/<slug>.html`.
 ///
-/// `.html` suffix so the on-disk cache is self-describing and never collides with
-/// a media key of the same stem.
+/// The split is load-bearing: without it, a permalink whose slug is literally `index` (or a
+/// nested slug) would map to `prerender/index.html`, the very key the front page would use —
+/// silently defeating BOTH caches (each is deserialized as the other's type, rejected, and
+/// re-rendered on every hit). Because permalinks live one namespace *below* the listing
+/// pages, no slug can ever produce a listing key. Future listing pages (post archive, RSS/
+/// Atom feed) join the `listing/` subtree; slugs can never reach it.
+///
+/// Determinism + collision safety within `permalink/`: distinct slugs map to distinct keys
+/// because the slug is preserved verbatim inside the namespace. Traversal safety is layered:
+///   * we strip the leading `/` ourselves, because the localfs adapter REJECTS a key with a
+///     leading slash (it must be a relative path under the blob root);
+///   * the [`BlobStore`] adapter is the real guard — it independently rejects `..`, NUL,
+///     backslash, and absolute keys (see `ferropress-blob-localfs`), so a `../`-bearing slug
+///     cannot escape `permalink/` into `listing/` or the blob root.
+///
+/// `.html` suffix so the on-disk cache is self-describing and never collides with a media key
+/// of the same stem.
 pub fn cache_key(path: &str) -> BlobKey {
     // Drop a single leading '/'; the prefix join re-introduces the separator.
     // Trailing '/' is also trimmed so "/a/" and "/a" share one cache entry,
     // matching `slug_from_path`'s trim (they resolve to the same page).
     let rel = path.trim_start_matches('/').trim_end_matches('/');
     if rel.is_empty() {
-        // Site root: a bare `prerender/` would name the directory, not a file.
-        return BlobKey(format!("{CACHE_PREFIX}/index.html"));
+        // Site root / front page — a LISTING page, in its own reserved subtree that no
+        // permalink slug can produce (see the collision note above).
+        return BlobKey(format!("{CACHE_PREFIX}/listing/index.html"));
     }
-    BlobKey(format!("{CACHE_PREFIX}/{rel}.html"))
+    // A permalink page, one namespace below the listing pages.
+    BlobKey(format!("{CACHE_PREFIX}/permalink/{rel}.html"))
 }
 
 /// The prerender-cache key for an [`OutputPage`]. Thin wrapper over [`cache_key`]
@@ -224,11 +233,12 @@ impl ServeEngine {
     /// recoverable `Err` the loop logs, not a loop-killing `?` at the top level.
     async fn apply_change(&self, change: &Change) -> ferropress_core::error::Result<()> {
         // A `Setting` change refreshes the live snapshot the read path composes
-        // chrome from — NOT a page-cache eviction. Global chrome (title, tagline,
-        // robots) and date formatting are applied live at request time, so a
-        // settings edit is reflected without regenerating a single cached page
-        // (the serving model's no-global-coupling guardrail). This is why the
-        // whole prerender cache does not need busting when settings change.
+        // chrome from — NOT a broad page-cache eviction. Global chrome (title,
+        // tagline, robots) and date formatting are applied live at request time,
+        // so a settings edit is reflected without regenerating cached pages (the
+        // serving model's no-global-coupling guardrail). The ONE exception is the
+        // home page, whose cached CONTENT a few `reading.*` keys reshape (see the
+        // key-gated `evict_front` below); every other key still busts nothing.
         if change.type_name.as_str() == ferropress_core::SETTING_TYPE {
             if let Some(handle) = &self.settings {
                 match settings::load_site_settings(&self.store).await {
@@ -238,6 +248,20 @@ impl ServeEngine {
                     }
                     Err(e) => tracing::warn!(error = %e, "failed to refresh site settings"),
                 }
+            }
+            // The front page is the ONE cached page whose CONTENT a setting can reshape:
+            // `reading.posts_per_page` / `show_on_front` / `page_on_front` change which and
+            // how many entries `/` lists (and whether it is a static page or the galley).
+            // Evict `/` for those keys so the next request rebuilds from the (just-refreshed)
+            // settings — ordered AFTER the refresh above. This is keyed off the CHANGE, not
+            // the engine's snapshot, so it stays correct whether or not THIS engine holds a
+            // settings handle (the read path carries its own). Every OTHER setting (title,
+            // tagline, robots, timezone, date_format, logo, …) composes live in the chrome and
+            // must NOT bust the cache: the serving model's "a settings change regenerates no
+            // pages" guardrail. `evict_front` is best-effort, so a cache fault never fails the
+            // change apply.
+            if setting_reshapes_front(change) {
+                self.evict_front().await;
             }
             return Ok(());
         }
@@ -260,14 +284,22 @@ impl ServeEngine {
             return Ok(());
         }
 
+        // Only content types map to a page in permalinks v1.
+        let ty = change.type_name.as_str();
+        if ty != POST_TYPE && ty != PAGE_TYPE {
+            return Ok(());
+        }
+
+        // The front page is a LISTING page this content change may also touch — a post
+        // joins/leaves the galley, or the configured static front page itself changed.
+        // Evict `/` (settings-gated + I/O-free) BEFORE the slug-dependent permalink handling
+        // below, so even a slug-less delete still invalidates the home page. Eviction (not
+        // eager rebuild) is the guardrail-2 strategy for this fan-in-N shared page: an
+        // idempotent, coalescing delete whose next-request rebuild is the sole populator.
+        self.invalidate_front_for_content(change).await;
+
         match change.kind {
             ChangeKind::Create | ChangeKind::Update => {
-                // Only content types map to a page in permalinks v1.
-                let ty = change.type_name.as_str();
-                if ty != POST_TYPE && ty != PAGE_TYPE {
-                    return Ok(());
-                }
-
                 // Prefer the slug off the change feed (no extra read). Fall back to
                 // re-`get`ting the object only if the event carried no slug.
                 let slug = match slug_from_change(change) {
@@ -310,12 +342,6 @@ impl ServeEngine {
                 Ok(())
             }
             ChangeKind::Delete => {
-                // Only content types map to a page in permalinks v1.
-                let ty = change.type_name.as_str();
-                if ty != POST_TYPE && ty != PAGE_TYPE {
-                    return Ok(());
-                }
-
                 // The engine publishes the deleted object's (pre-delete) scalar
                 // fields on the change, so we can map the deletion back to its page
                 // and evict the cached HTML — the fix for the former persistent-stale
@@ -346,26 +372,48 @@ impl ServeEngine {
         }
     }
 
-    /// Map a committed change to the set of output pages it invalidates. Pure
-    /// policy (no I/O): given a known slug, the page itself.
+    /// Evict the home page (`/`) prerender cache entry when a POST/PAGE change can reshape
+    /// what it shows. I/O-free (reads only the in-memory settings snapshot, when present).
     ///
-    /// v1 returns ONLY the entity's own permalink (`/<slug>`). The slug must be
-    /// supplied by the caller because it is not on the `Change` (the embedded
-    /// adapter publishes `fields: None`, so `regen_loop` re-`get`s the object and
-    /// reads the slug before calling this).
+    /// Home *eviction* is deliberately NOT gated on the engine holding a [`SettingsHandle`]:
+    /// the read path caches `/` unconditionally (it carries its own settings), so eviction
+    /// must stay live too, or a `/` cached by a read could never be invalidated. Only the
+    /// PAGE precision below consults the snapshot; without one we evict conservatively.
     ///
-    /// TODO(index/archive/feed): a real invalidation set also includes the pages
-    /// that *list* this entity — the home page, the post archive, term/category
-    /// archives, and the RSS/Atom feed. Those are a documented later increment;
-    /// once index pages exist as `OutputPage`s, this returns the permalink PLUS
-    /// each listing page the change touches.
-    pub fn affected_pages(&self, slug: &str) -> Vec<OutputPage> {
-        if slug.is_empty() {
-            return Vec::new();
+    /// - A **post** change always evicts `/`: a post can appear in the galley, INCLUDING the
+    ///   fallback galley shown when a configured static front page is missing/unpublished.
+    ///   Distinguishing a live static front from that fallback would need a store read, so we
+    ///   always evict on a post change — correct in every configuration, and cheap under
+    ///   eviction (an idempotent delete + one lazy rebuild, never an eager scan). The only
+    ///   "waste" is a cheap static-page rebuild on a static-front site's post edits.
+    /// - A **page** change evicts `/` only when the page IS the configured static front page
+    ///   (pages never appear in the galley). With a settings snapshot we gate precisely on
+    ///   `front_page_id`; without one we cannot tell, so we evict conservatively. Keyed on the
+    ///   change's object id, so it also covers unpublishing/deleting the front page (→ the
+    ///   next request falls back to the galley).
+    async fn invalidate_front_for_content(&self, change: &Change) {
+        let affects_front = match change.type_name.as_str() {
+            POST_TYPE => true,
+            PAGE_TYPE => match &self.settings {
+                Some(handle) => handle.current().front_page_id == Some(change.object_id.0),
+                // No snapshot to check the configured front page against → evict conservatively.
+                None => true,
+            },
+            _ => false,
+        };
+        if affects_front {
+            self.evict_front().await;
         }
-        vec![OutputPage {
-            path: format!("/{slug}"),
-        }]
+    }
+
+    /// Evict the home page's prerender cache entry (`/`). **Best-effort**: a blob delete
+    /// failure is logged and swallowed — the read path rebuilds `/` on the next request
+    /// regardless, and the cache is best-effort throughout, so a cache fault must never fail
+    /// the change apply. Idempotent (a no-op if `/` was never cached).
+    async fn evict_front(&self) {
+        if let Err(e) = self.blobs.delete(&cache_key("/")).await {
+            tracing::warn!(error = %e, "evicting the home prerender cache failed");
+        }
     }
 
     /// Build the cache envelope for a single output page, or `None` if no
@@ -383,6 +431,33 @@ impl ServeEngine {
         page: &OutputPage,
     ) -> ferropress_core::error::Result<Option<content::CachedPage>> {
         content::build_page(&self.store, self.custom.as_ref(), &page.path).await
+    }
+}
+
+/// Whether a `Setting` change altered a key that reshapes the cached front page's CONTENT
+/// (which and how many entries `/` lists, and whether it is a static page or the galley).
+/// Only these three `reading.*` keys do; every other setting composes live in the chrome
+/// and must not bust the home cache.
+///
+/// The changed row's `key` is read off the change's scalar `fields` (rhypedb publishes the
+/// full merged scalar snapshot, so an update to a Setting row carries its `key`). If the key
+/// is somehow absent, we treat the change as reshaping and evict conservatively — a delete is
+/// cheap and idempotent, and a stale front page is worse than a needless rebuild.
+///
+/// These key strings mirror the `reading.*` schema keys `SiteSettings::from_values` reads in
+/// `ferropress-render-form`; keep them in sync.
+fn setting_reshapes_front(change: &Change) -> bool {
+    match change
+        .fields
+        .as_ref()
+        .and_then(|f| f.get("key"))
+        .and_then(|v| v.as_str())
+    {
+        Some(key) => matches!(
+            key,
+            "reading.posts_per_page" | "reading.show_on_front" | "reading.page_on_front"
+        ),
+        None => true,
     }
 }
 

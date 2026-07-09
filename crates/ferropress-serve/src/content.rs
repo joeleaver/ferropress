@@ -19,8 +19,8 @@
 //!
 //! Flat, published-only: a path `"/<slug>"` resolves to a **published** `Post`
 //! with that slug, falling back to a **published** `Page`. The site root `"/"`
-//! (empty slug) is the front-page galley (see [`render_home`]); nested paths are a
-//! later increment.
+//! (empty slug) is the cached front page — a static page or the post galley (see
+//! [`serve_front`] / [`build_front`]); nested paths are a later increment.
 //!
 //! ## No block -> HTML logic here
 //!
@@ -128,6 +128,50 @@ pub(crate) struct CachedPage {
     pub body: String,
 }
 
+/// The cached front page: either a configured static [`Page`](CachedFront::Static) or the
+/// latest-posts [`galley`](CachedFront::Galley). Stored (serialized as JSON) at
+/// [`cache_key`](crate::cache_key)`("/")`. Like [`CachedPage`], it holds only
+/// **content-stable** data — the static case reuses the per-object envelope; the galley
+/// stores raw `published_at` millis + author ids. The chrome, datelines, and byline names
+/// are composed **live** in [`compose_front`], so a settings edit or an author rename is
+/// reflected with no `/` regeneration.
+///
+/// The regen loop never *builds* this — it only **evicts** `/` when a change can reshape it
+/// (see [`ServeEngine::apply_change`](crate::ServeEngine)); the read path ([`serve_front`])
+/// is the sole populator, rebuilding on the next request. An externally-tagged enum rejects
+/// an unknown variant tag on deserialize, and the inner structs are `deny_unknown_fields`,
+/// so any format drift fails to deserialize and self-heals on first access (the same
+/// discipline as [`CachedPage`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) enum CachedFront {
+    /// The configured static front page (a published `Page`): the SAME per-object envelope
+    /// its own permalink caches, composed with `is_home = true`. Boxed so the (much larger)
+    /// static variant does not bloat every galley envelope; the `Box` is transparent to serde
+    /// (the on-disk JSON is identical to an unboxed `CachedPage`).
+    Static(Box<CachedPage>),
+    /// The latest-posts galley (newest first, capped at `posts_per_page`).
+    Galley(Vec<CachedHomePost>),
+}
+
+/// One content-stable galley row. The dateline is formatted and the byline name is resolved
+/// LIVE at compose time (from the settings + the author directory), so only the raw
+/// `published_at` millis + the author id are cached — an author rename or a date-format
+/// change needs no `/` regeneration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CachedHomePost {
+    /// The post title (galley card headline + link text).
+    pub title: String,
+    /// The post permalink (`"/<slug>"`).
+    pub url: String,
+    /// A short summary for the galley card.
+    pub excerpt: String,
+    /// Publish instant (epoch millis, UTC) for the live-formatted dateline.
+    pub published_at: Option<i64>,
+    /// The author's `User` id; the byline NAME is resolved live from the author directory.
+    pub author_id: Option<u64>,
+}
+
 /// Derive the lookup slug from a request path (permalinks v1: flat `/<slug>`).
 ///
 /// Strips a single leading `'/'` and any trailing `'/'`; the remainder is the
@@ -192,10 +236,11 @@ pub async fn serve_path(
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
-        // The front page is composed live from the current settings (a static page or
-        // the post galley); it is not blob-cached in v1 (a later increment can cache +
-        // invalidate it on the same change feed).
-        return front_page(store, theme, custom, settings, authors).await;
+        // The front page is blob-cached too (a `CachedFront` envelope at `/`), composed
+        // live from the current settings + author directory. `serve_front` is cache-first
+        // (build + write-through on a miss); the change-driven regen loop EVICTS `/` when a
+        // content/settings change can reshape it, and this read path is the sole populator.
+        return serve_front(store, blobs, theme, custom, settings, authors).await;
     }
 
     let key = cache_key(path);
@@ -251,6 +296,77 @@ pub async fn serve_path(
             }
         }
         Ok(None) => Resolved::NotFound,
+        Err(e) => Resolved::Error(e),
+    }
+}
+
+/// Cache-first resolution of the site root (`/`): the static-first hot path for the front
+/// page, mirroring [`serve_path`] for permalinks.
+///
+/// 1. Try the prerender cache (`blobs.get(cache_key("/"))`). On a hit, deserialize the
+///    [`CachedFront`] envelope and compose it live (chrome + datelines + bylines from the
+///    current settings + author directory) — **no store scan, no block re-render**. A
+///    corrupt/legacy entry that fails to deserialize is treated as a miss (self-heal).
+/// 2. On a miss, [`build_front`] the envelope (a static Page or the galley scan), write it
+///    *through* to the cache, and compose.
+///
+/// The cache is **best-effort** (a blob fault degrades to a live render, never a 500). The
+/// regen loop keeps `/` fresh by **evicting** it on a reshaping change; this read path is the
+/// sole *populator*, so there is no eager-regen writer to race a PUT against. A narrow
+/// residual window remains — a write-through that builds from state S then lands just after a
+/// concurrent evict can re-cache pre-change content — the same best-effort read-vs-invalidate
+/// class the permalink path ([`serve_path`]) already carries; it self-clears on the next
+/// reshaping change (and a post/page/setting change is a broad trigger set).
+async fn serve_front(
+    store: &Arc<dyn RhypeStore>,
+    blobs: &Arc<dyn BlobStore>,
+    theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
+    settings: &SiteSettings,
+    authors: &AuthorDirectory,
+) -> Resolved {
+    let key = cache_key("/");
+
+    match blobs.get(&key).await {
+        Ok(bytes) => match serde_json::from_slice::<CachedFront>(&bytes) {
+            Ok(front) => {
+                return match compose_front(theme, settings, authors, &front) {
+                    Ok(html) => Resolved::Found(html),
+                    Err(e) => Resolved::Error(e),
+                };
+            }
+            Err(e) => {
+                // Not the current `CachedFront` shape (corrupt, or a legacy/format-drifted
+                // entry rejected by the enum tag / `deny_unknown_fields`): re-render live and
+                // write-through the current format — the cache self-heals on first access.
+                tracing::warn!(error = %e, "home prerender cache entry not in the current format; re-rendering");
+            }
+        },
+        Err(CoreError::NotFound { .. }) => {
+            // Ordinary cache miss — fall through to render-on-demand.
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "home prerender cache read failed; falling back to render");
+        }
+    }
+
+    match build_front(store, custom, settings).await {
+        Ok(front) => {
+            match serde_json::to_vec(&front) {
+                Ok(bytes) => {
+                    if let Err(e) = blobs.put(&key, bytes).await {
+                        tracing::warn!(error = %e, "home prerender cache write-through failed; serving uncached render");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not serialize the home envelope for the cache; serving uncached render");
+                }
+            }
+            match compose_front(theme, settings, authors, &front) {
+                Ok(html) => Resolved::Found(html),
+                Err(e) => Resolved::Error(e),
+            }
+        }
         Err(e) => Resolved::Error(e),
     }
 }
@@ -448,13 +564,10 @@ fn compose_single(
         .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
 }
 
-/// Resolve the site root: a configured static front page if one is set (and
-/// published), otherwise the latest-posts galley. Shared by both read paths
-/// ([`resolve_path`] + [`serve_path`]) so the empty-slug decision lives in one place.
-///
-/// A configured static page that is missing / unpublished / trashed FALLS BACK to the
-/// galley rather than 404ing or leaking an unpublished page — the front page is never
-/// a dead end.
+/// Resolve the site root **uncached** (the SSR-on-demand form used by [`resolve_path`] +
+/// tests): [`build_front`] the envelope, then [`compose_front`] it live. The cache-first
+/// hot path is [`serve_front`]; both share `build_front`/`compose_front`, so the cached and
+/// uncached front pages are byte-for-byte identical.
 async fn front_page(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
@@ -462,97 +575,116 @@ async fn front_page(
     settings: &SiteSettings,
     authors: &AuthorDirectory,
 ) -> Resolved {
-    if let Some(page_id) = settings.front_page_id {
-        match render_static_front_page(store, theme, custom, settings, authors, page_id).await {
-            Ok(Some(html)) => return Resolved::Found(html),
-            // Missing / unpublished target — fall through to the galley below.
-            Ok(None) => {}
-            Err(e) => return Resolved::Error(e),
-        }
-    }
-    match render_home(store, theme, settings, authors).await {
-        Ok(html) => Resolved::Found(html),
+    match build_front(store, custom, settings).await {
+        Ok(front) => match compose_front(theme, settings, authors, &front) {
+            Ok(html) => Resolved::Found(html),
+            Err(e) => Resolved::Error(e),
+        },
         Err(e) => Resolved::Error(e),
     }
 }
 
-/// Render a specific published `Page` as the static front page, reusing the exact
-/// single-page pipeline ([`cached_page_from_object`] + [`compose_single`]) so the body
-/// is byte-for-byte what the page's own permalink shows — only the chrome differs
-/// (`is_home` marks the Front-page nav link current). `Ok(None)` means "no such
-/// published page" (a dangling id, or one that has since been unpublished/trashed), so
-/// the caller can fall back to the galley.
+/// Build the [`CachedFront`] envelope for the site root, or resolve which shape it takes.
 ///
-/// The by-id lookup deliberately bypasses the slug publish gate (the id came from a
-/// trusted setting, not a public slug), so this re-checks [`is_published`] itself — an
-/// unpublished page must never surface publicly, even as the home page.
-async fn render_static_front_page(
+/// A configured static front page ([`settings.front_page_id`](SiteSettings)) wins when it
+/// exists AND is published, producing a [`CachedFront::Static`] carrying the SAME per-object
+/// envelope its own permalink caches (composed later with `is_home = true`). A missing /
+/// unpublished / trashed target FALLS BACK to the [`CachedFront::Galley`] rather than 404ing
+/// or leaking an unpublished page — the front page is never a dead end. The by-id lookup
+/// bypasses the slug publish gate (the id came from a trusted setting, not a public slug),
+/// so this re-checks [`is_published`] itself.
+///
+/// `pub(crate)` so the read path ([`serve_front`], [`front_page`]) builds it on a miss. The
+/// regen loop never calls this — it only *evicts* `/`.
+pub(crate) async fn build_front(
     store: &Arc<dyn RhypeStore>,
-    theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
-    authors: &AuthorDirectory,
-    page_id: u64,
-) -> Result<Option<String>, CoreError> {
-    let obj = match store
-        .get(&TypeName::from(PAGE_TYPE), ObjectId(page_id))
-        .await
-    {
-        Ok(obj) => obj,
-        Err(CoreError::NotFound { .. }) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if !is_published(&obj) {
-        return Ok(None);
+) -> Result<CachedFront, CoreError> {
+    if let Some(page_id) = settings.front_page_id {
+        match store
+            .get(&TypeName::from(PAGE_TYPE), ObjectId(page_id))
+            .await
+        {
+            Ok(obj) if is_published(&obj) => {
+                let page =
+                    cached_page_from_object(store, custom, RenderMode::Publish, PAGE_TYPE, &obj)
+                        .await?;
+                return Ok(CachedFront::Static(Box::new(page)));
+            }
+            // Unpublished target -> galley fallback (must never surface publicly).
+            Ok(_) => {}
+            // Dangling id -> galley fallback.
+            Err(CoreError::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
     }
-    let page = cached_page_from_object(store, custom, RenderMode::Publish, PAGE_TYPE, &obj).await?;
-    Ok(Some(compose_single(
-        theme, settings, authors, &page, true, None,
-    )?))
+    Ok(CachedFront::Galley(build_galley(store, settings).await?))
 }
 
-/// Render the front-page galley: the most-recent published posts (up to
-/// `settings.posts_per_page`), newest first, composed live. Not blob-cached in v1.
-async fn render_home(
-    store: &Arc<dyn RhypeStore>,
+/// Compose the final front-page HTML from a cached [`CachedFront`], live. The static case
+/// is framed exactly like its own permalink (only the `is_home` nav flag differs); the
+/// galley formats each row's dateline (from the live settings) and resolves its byline name
+/// (from the live [`AuthorDirectory`]) — so a settings edit or an author rename is reflected
+/// with no `/` regeneration, exactly as on the single-page path.
+fn compose_front(
     theme: &ThemeEngine,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    front: &CachedFront,
 ) -> Result<String, CoreError> {
-    let posts = recent_published_posts(store, settings, authors).await?;
+    match front {
+        CachedFront::Static(page) => compose_single(theme, settings, authors, page, true, None),
+        CachedFront::Galley(rows) => {
+            let posts: Vec<PostSummary> = rows
+                .iter()
+                .map(|p| PostSummary {
+                    title: p.title.clone(),
+                    url: p.url.clone(),
+                    excerpt: p.excerpt.clone(),
+                    dateline: p.published_at.map(|ms| {
+                        datefmt::format_datetime(ms, &settings.date_format, &settings.timezone)
+                    }),
+                    author: p
+                        .author_id
+                        .and_then(|id| authors.name(id))
+                        .map(str::to_owned),
+                })
+                .collect();
 
-    let ctx = HomeCtx {
-        page_title: settings.title_or_default().to_owned(),
-        page_description: if settings.tagline.is_empty() {
-            None
-        } else {
-            Some(&settings.tagline)
-        },
-        site: SiteCtx::from(settings),
-        is_home: true,
-        preview_status: None,
-        posts,
-    };
+            let ctx = HomeCtx {
+                page_title: settings.title_or_default().to_owned(),
+                page_description: if settings.tagline.is_empty() {
+                    None
+                } else {
+                    Some(&settings.tagline)
+                },
+                site: SiteCtx::from(settings),
+                is_home: true,
+                preview_status: None,
+                posts,
+            };
 
-    theme
-        .render(HOME_TEMPLATE, &ctx)
-        .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
+            theme
+                .render(HOME_TEMPLATE, &ctx)
+                .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
+        }
+    }
 }
 
-/// The most-recent published posts for the galley, newest first, capped at `limit`.
+/// The most-recent published posts for the galley, newest first, capped at
+/// `settings.posts_per_page`, as content-stable [`CachedHomePost`] rows (raw `published_at`
+/// millis + the author *id* — the dateline is formatted and the byline name resolved live in
+/// [`compose_front`], so a settings edit or an author rename needs no `/` regeneration).
 ///
-/// Scans posts and filters/sorts in Rust: v1 has no compound "status == published
-/// ORDER BY published_at DESC LIMIT n" query primitive, and the post table is
-/// small. Posts with no `published_at` sort last (keyed as `i64::MIN`). Each row's
-/// author *id* is resolved with ONE batched link read (no N+1); the display name is
-/// looked up live from the [`AuthorDirectory`] — the SAME directory the single-page
-/// byline uses, so the galley and the permalink can never disagree on an author's
-/// name (the cross-entity byline consistency the whole directory exists to give).
-async fn recent_published_posts(
+/// Scans posts and filters/sorts in Rust: v1 has no compound "status == published ORDER BY
+/// published_at DESC LIMIT n" query primitive, and the post table is small. Posts with no
+/// `published_at` sort last (keyed as `i64::MIN`). Each row's author id is resolved with ONE
+/// batched link read (no N+1).
+async fn build_galley(
     store: &Arc<dyn RhypeStore>,
     settings: &SiteSettings,
-    authors: &AuthorDirectory,
-) -> Result<Vec<PostSummary>, CoreError> {
+) -> Result<Vec<CachedHomePost>, CoreError> {
     let mut published: Vec<Object> = store
         .scan(&TypeName::from(POST_TYPE))
         .await?
@@ -571,8 +703,9 @@ async fn recent_published_posts(
     });
     published.truncate(settings.posts_per_page as usize);
 
-    // Resolve every row's author id in ONE batched link read (no N+1), then look the
-    // display name up live in the author directory (an in-memory map, no store call).
+    // Resolve every row's author id in ONE batched link read (no N+1). The display name is
+    // NOT stored — it is looked up live from the author directory at compose time (the SAME
+    // directory the single-page byline uses, so the galley + permalink can never disagree).
     let ids: Vec<ObjectId> = published.iter().map(|o| o.id).collect();
     let author_links = store
         .get_links_many(&TypeName::from(POST_TYPE), &ids, "author")
@@ -581,23 +714,12 @@ async fn recent_published_posts(
     Ok(published
         .iter()
         .zip(author_links.iter())
-        .map(|(obj, author_ids)| {
-            let author = author_ids
-                .first()
-                .and_then(|id| authors.name(id.0))
-                .map(str::to_owned);
-            PostSummary {
-                title: str_field(obj, "title"),
-                url: format!("/{}", str_field(obj, "slug")),
-                excerpt: str_field(obj, "excerpt"),
-                dateline: obj
-                    .get("published_at")
-                    .and_then(Value::as_datetime)
-                    .map(|ms| {
-                        datefmt::format_datetime(ms, &settings.date_format, &settings.timezone)
-                    }),
-                author,
-            }
+        .map(|(obj, author_ids)| CachedHomePost {
+            title: str_field(obj, "title"),
+            url: format!("/{}", str_field(obj, "slug")),
+            excerpt: str_field(obj, "excerpt"),
+            published_at: obj.get("published_at").and_then(Value::as_datetime),
+            author_id: author_ids.first().map(|id| id.0),
         })
         .collect())
 }

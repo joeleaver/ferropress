@@ -172,14 +172,16 @@ async fn seed_media(store: &Arc<dyn RhypeStore>, uuid: &str) -> ObjectId {
         .expect("seeding a media must succeed")
 }
 
-/// A `Setting`-typed change, as the loop sees it on the feed.
-fn settings_change(kind: ChangeKind) -> Change {
+/// A `Setting`-typed change carrying its row `key` on the change fields — matching what the
+/// engine publishes (the full merged scalar snapshot). The regen loop reads `key` to decide
+/// whether the changed setting reshapes the cached front page.
+fn setting_change_with_key(kind: ChangeKind, key: &str) -> Change {
     Change {
         version: 1,
         kind,
         type_name: TypeName::from(SETTING_TYPE),
         object_id: ObjectId(0),
-        fields: None,
+        fields: Some(serde_json::json!({ "key": key })),
         origin: None,
     }
 }
@@ -207,8 +209,10 @@ async fn load_site_settings_overlays_stored_on_defaults() {
     assert!(!loaded.search_engine_visible);
 }
 
-/// A `Setting` change on the feed refreshes the live snapshot the read path
-/// holds — and does NOT touch the page cache (settings are composed live).
+/// A `Setting` change on the feed refreshes the live snapshot the read path holds. A
+/// CHROME-only key (`site.title`) composes live, so it does NOT bust the page cache — the
+/// front page's cache-eviction dimension is covered by
+/// [`setting_change_evicts_home_only_for_front_shaping_keys`].
 #[tokio::test]
 async fn regen_loop_refreshes_settings_snapshot_on_setting_change() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -224,10 +228,10 @@ async fn regen_loop_refreshes_settings_snapshot_on_setting_change() {
     )
     .with_settings(handle.clone());
 
-    // A settings edit lands in the store, then the change arrives on the feed.
+    // A settings edit lands in the store, then the change arrives on the feed carrying its key.
     seed_setting(&store, "site.title", "\"Live Title\"").await;
     engine
-        .apply_change(&settings_change(ChangeKind::Update))
+        .apply_change(&setting_change_with_key(ChangeKind::Update, "site.title"))
         .await
         .expect("a Setting change must refresh cleanly");
 
@@ -1426,4 +1430,952 @@ async fn legacy_format_envelope_is_rejected_and_self_heals() {
         serde_json::from_slice(&blobs.get(&key).await.unwrap())
             .expect("the re-rendered entry is a current-format envelope");
     assert_eq!(healed.author_id, Some(user_id.0));
+}
+
+// --- Home-page caching (track 3a) --------------------------------------------
+//
+// `/` is now a first-class cache entry: a `CachedFront` envelope (a static Page or the
+// latest-posts galley), built + write-through on a read miss, and EVICTED by the regen loop
+// when a content/settings change can reshape it (never eagerly rebuilt — the read path is the
+// sole populator). These tests drive the real store + blob backends.
+
+/// On a cache MISS for `/`, `serve_front` builds the galley, composes it live, AND populates
+/// the cache with a `CachedFront::Galley` envelope carrying content-stable rows (raw
+/// `published_at` + author id — never the formatted dateline or resolved name).
+#[tokio::test]
+async fn serve_front_galley_read_through_populates_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, "post-a", Status::Published).await;
+    seed_post(&store, "post-b", Status::Published).await;
+
+    let home_key = cache_key("/");
+    assert!(
+        !blobs.exists(&home_key).await.unwrap(),
+        "home cache starts empty"
+    );
+
+    let served = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (galley), got {other:?}"),
+    };
+    assert!(
+        served.contains("Latest from the galley"),
+        "the galley rendered: {served}"
+    );
+    assert!(
+        served.contains("Hello World"),
+        "the galley lists the published posts: {served}"
+    );
+
+    let front: crate::content::CachedFront = serde_json::from_slice(
+        &blobs
+            .get(&home_key)
+            .await
+            .expect("home cache populated on a read-through miss"),
+    )
+    .expect("the home cache holds a CachedFront envelope, not composed HTML");
+    match front {
+        crate::content::CachedFront::Galley(rows) => {
+            assert_eq!(
+                rows.len(),
+                2,
+                "both published posts are in the galley envelope"
+            );
+            assert!(
+                rows.iter().all(|r| r.title == "Hello World"),
+                "rows carry content-stable titles"
+            );
+        }
+        other => panic!("expected a Galley envelope, got {other:?}"),
+    }
+}
+
+/// A cache HIT for `/` composes from the STORED `CachedFront` — no galley re-scan. The
+/// sentinel row is not in the store, so its presence in the response can only come from the
+/// cache; a real published post's title must be ABSENT (the store was never scanned).
+#[tokio::test]
+async fn serve_front_cache_hit_composes_from_stored_galley() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    // A real published post, so a MISS would render "Hello World" — making the sentinel the
+    // only way the assertions pass if the cache is genuinely consulted.
+    seed_post(&store, "real", Status::Published).await;
+
+    let home_key = cache_key("/");
+    const SENTINEL: &str = "SENTINEL GALLEY ROW STRAIGHT FROM THE ENVELOPE";
+    let front = crate::content::CachedFront::Galley(vec![crate::content::CachedHomePost {
+        title: SENTINEL.to_owned(),
+        url: "/sentinel".to_owned(),
+        excerpt: String::new(),
+        published_at: None,
+        author_id: None,
+    }]);
+    blobs
+        .put(&home_key, serde_json::to_vec(&front).unwrap())
+        .await
+        .expect("seed the home cache entry");
+
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => {
+            assert!(
+                h.contains(SENTINEL),
+                "the served galley must come from the cached envelope: {h}"
+            );
+            assert!(
+                !h.contains("Hello World"),
+                "a cache hit must NOT re-scan the store for posts: {h}"
+            );
+        }
+        other => panic!("expected Found (cache hit), got {other:?}"),
+    }
+}
+
+/// With a static front page configured, the site root caches a `CachedFront::Static` and a
+/// later request serves it FROM the cache. Proven by unpublishing the page in the store AFTER
+/// caching (without driving the regen loop): a live render would fall back to the galley, but
+/// the cache hit still serves the page body.
+#[tokio::test]
+async fn serve_front_static_read_through_then_hit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let page_id = seed_page(&store, "about", Status::Published, "About the Press body.").await;
+    seed_post(&store, "a-post", Status::Published).await; // galley would have content if hit
+    seed_setting(&store, "reading.show_on_front", "\"page\"").await;
+    seed_setting(&store, "reading.page_on_front", &page_id.0.to_string()).await;
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+
+    let home_key = cache_key("/");
+
+    // MISS -> a Static envelope is cached.
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => assert!(
+            h.contains("About the Press body."),
+            "the static front page rendered: {h}"
+        ),
+        other => panic!("expected Found (static front), got {other:?}"),
+    }
+    let front: crate::content::CachedFront =
+        serde_json::from_slice(&blobs.get(&home_key).await.unwrap()).unwrap();
+    assert!(
+        matches!(front, crate::content::CachedFront::Static(_)),
+        "the home cache holds a Static envelope"
+    );
+
+    // Unpublish the page WITHOUT the regen loop: a live render would now fall back to the
+    // galley, but the cache HIT still serves the page body -> proves `/` is served cached.
+    let mut patch: HashMap<String, Value> = HashMap::new();
+    patch.insert(
+        "status".to_owned(),
+        Value::String(Status::Draft.as_str().to_owned()),
+    );
+    store
+        .update(&TypeName::from(PAGE_TYPE), page_id, patch)
+        .await
+        .unwrap();
+
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => {
+            assert!(
+                h.contains("About the Press body."),
+                "the cached static front is served on a HIT: {h}"
+            );
+            assert!(
+                !h.contains("Latest from the galley"),
+                "a cache hit must not fall back to a live galley: {h}"
+            );
+        }
+        other => panic!("expected Found (cache hit), got {other:?}"),
+    }
+}
+
+/// A POST change EVICTS the home cache (the post may be in the galley), so the next request
+/// rebuilds it — the regen loop invalidates `/` rather than eagerly rebuilding it.
+#[tokio::test]
+async fn post_change_evicts_home_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Published).await;
+
+    let settings = SiteSettings::defaults();
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings.clone()));
+
+    let home_key = cache_key("/");
+    // Warm the home cache via a read.
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await;
+    assert!(
+        blobs.exists(&home_key).await.unwrap(),
+        "home cache warmed by the read"
+    );
+
+    // A post change evicts it.
+    engine
+        .apply_change(&change(ChangeKind::Update, id))
+        .await
+        .expect("apply post change");
+    assert!(
+        !blobs.exists(&home_key).await.unwrap(),
+        "a POST change must evict the home cache"
+    );
+
+    // The next read rebuilds it.
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await;
+    assert!(
+        blobs.exists(&home_key).await.unwrap(),
+        "the next request rebuilds the home cache"
+    );
+}
+
+/// A PAGE change evicts the home cache ONLY when that page is the configured static front
+/// page; an edit to any other page leaves `/` cached (pages never appear in the galley).
+#[tokio::test]
+async fn page_change_evicts_home_only_for_the_configured_front_page() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let front_id = seed_page(&store, "home-page", Status::Published, "Front body.").await;
+    let other_id = seed_page(&store, "other", Status::Published, "Other body.").await;
+    seed_setting(&store, "reading.show_on_front", "\"page\"").await;
+    seed_setting(&store, "reading.page_on_front", &front_id.0.to_string()).await;
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings.clone()));
+
+    let home_key = cache_key("/");
+    // Warm the cache (a Static envelope).
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await;
+    assert!(blobs.exists(&home_key).await.unwrap(), "home cache warmed");
+
+    // A change to a NON-front page does NOT evict `/`.
+    engine
+        .apply_change(&change_of(ChangeKind::Update, PAGE_TYPE, other_id.0, 1))
+        .await
+        .expect("apply non-front page change");
+    assert!(
+        blobs.exists(&home_key).await.unwrap(),
+        "a non-front page edit must not evict the home cache"
+    );
+
+    // A change to the CONFIGURED front page DOES evict `/`.
+    engine
+        .apply_change(&change_of(ChangeKind::Update, PAGE_TYPE, front_id.0, 2))
+        .await
+        .expect("apply front page change");
+    assert!(
+        !blobs.exists(&home_key).await.unwrap(),
+        "editing the configured front page must evict the home cache"
+    );
+}
+
+/// A chrome-only Setting change (`site.title`) refreshes the live snapshot but does NOT bust
+/// the home cache — chrome composes live. A front-shaping Setting change
+/// (`reading.posts_per_page`) evicts `/` so the next request rebuilds it. This is the
+/// settings dimension the design's "settings compose live, no page regen" invariant hinges on.
+#[tokio::test]
+async fn setting_change_evicts_home_only_for_front_shaping_keys() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await;
+
+    let settings = SiteSettings::defaults();
+    let handle = SettingsHandle::new(settings.clone());
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(handle.clone());
+
+    let home_key = cache_key("/");
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await;
+    assert!(blobs.exists(&home_key).await.unwrap(), "home cache warmed");
+
+    // Chrome key -> snapshot refreshes, cache untouched.
+    seed_setting(&store, "site.title", "\"Live Title\"").await;
+    engine
+        .apply_change(&setting_change_with_key(ChangeKind::Update, "site.title"))
+        .await
+        .expect("chrome setting refresh");
+    assert_eq!(
+        handle.current().title,
+        "Live Title",
+        "the snapshot refreshed"
+    );
+    assert!(
+        blobs.exists(&home_key).await.unwrap(),
+        "a chrome setting must NOT bust the home cache"
+    );
+
+    // Front-shaping key -> evict.
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "reading.posts_per_page",
+        ))
+        .await
+        .expect("front-shaping setting");
+    assert!(
+        !blobs.exists(&home_key).await.unwrap(),
+        "a reading.* front-shaping setting must evict the home cache"
+    );
+}
+
+/// THE home-page byline guarantee: the galley byline resolves LIVE from the author directory,
+/// so renaming the author reflects on the ALREADY-CACHED `/` with NO regeneration — the
+/// cached envelope stores only the author id. The single-page proof does not cover `/`.
+#[tokio::test]
+async fn home_galley_byline_stays_live_on_cached_front_without_regen() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let user_id = seed_user(&store, "user-ada", "Ada Lovelace").await;
+    let post_id = seed_post(&store, SLUG, Status::Published).await;
+    link_author(&store, post_id, user_id).await;
+
+    let home_key = cache_key("/");
+    let settings = SiteSettings::defaults();
+
+    // First render (a MISS): byline present, envelope caches the id (not the name).
+    let dir1 = crate::authors::load_author_directory(&store).await.unwrap();
+    let html1 = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir1,
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html1.contains("Ada Lovelace"),
+        "the galley byline is present: {html1}"
+    );
+    let envelope_bytes = blobs.get(&home_key).await.unwrap();
+    let front: crate::content::CachedFront = serde_json::from_slice(&envelope_bytes).unwrap();
+    match &front {
+        crate::content::CachedFront::Galley(rows) => assert_eq!(
+            rows[0].author_id,
+            Some(user_id.0),
+            "the envelope caches the author id, not the name"
+        ),
+        other => panic!("expected Galley, got {other:?}"),
+    }
+
+    // Rename the author; rebuild the directory as the feed refresh would.
+    let mut patch: HashMap<String, Value> = HashMap::new();
+    patch.insert(
+        "display_name".to_owned(),
+        Value::String("Ada, Countess of Lovelace".to_owned()),
+    );
+    store
+        .update(&TypeName::from(USER_TYPE), user_id, patch)
+        .await
+        .unwrap();
+    let dir2 = crate::authors::load_author_directory(&store).await.unwrap();
+
+    // Render AGAIN — a cache HIT: the byline reflects the NEW name, purely from the directory.
+    let html2 = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir2,
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html2.contains("Ada, Countess of Lovelace"),
+        "the renamed byline shows live from the directory: {html2}"
+    );
+    assert!(
+        !html2.contains("Ada Lovelace"),
+        "the stale name is gone: {html2}"
+    );
+
+    // Prove NO regeneration: the cached envelope is byte-for-byte unchanged.
+    assert_eq!(
+        blobs.get(&home_key).await.unwrap(),
+        envelope_bytes,
+        "the byline changed with NO `/` regeneration — the cached envelope is unchanged"
+    );
+}
+
+/// A corrupt / non-`CachedFront` entry at the home key is rejected (treated as a miss) and
+/// `serve_front` re-renders live + write-throughs the current format — the home cache
+/// self-heals on first access, mirroring the single-page envelope self-heal.
+#[tokio::test]
+async fn corrupt_home_cache_entry_is_rejected_and_self_heals() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await;
+
+    let home_key = cache_key("/");
+    // A blob that is not a CachedFront envelope (e.g. legacy raw HTML or garbage).
+    blobs
+        .put(&home_key, b"<html>not an envelope</html>".to_vec())
+        .await
+        .expect("seed a corrupt home entry");
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (self-heal), got {other:?}"),
+    };
+    assert!(
+        html.contains("Latest from the galley"),
+        "the galley re-rendered live: {html}"
+    );
+    // The cache now holds a valid CachedFront (self-healed to the current format).
+    let _: crate::content::CachedFront =
+        serde_json::from_slice(&blobs.get(&home_key).await.unwrap())
+            .expect("the home cache self-healed to a CachedFront envelope");
+}
+
+/// Deleting a post evicts the home cache even when the Delete change carries NO slug — the
+/// home invalidation runs BEFORE the slug-dependent permalink handling, so a slug-less delete
+/// cannot strand `/` showing a post that no longer exists.
+#[tokio::test]
+async fn delete_evicts_home_even_without_a_slug_on_the_change() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Published).await;
+
+    let settings = SiteSettings::defaults();
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings.clone()));
+
+    let home_key = cache_key("/");
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await;
+    assert!(blobs.exists(&home_key).await.unwrap(), "home cache warmed");
+
+    // A Delete with NO fields (no slug): the home eviction must still fire.
+    let del = Change {
+        version: 2,
+        kind: ChangeKind::Delete,
+        type_name: TypeName::from(POST_TYPE),
+        object_id: id,
+        fields: None,
+        origin: None,
+    };
+    engine
+        .apply_change(&del)
+        .await
+        .expect("apply a slug-less delete");
+    assert!(
+        !blobs.exists(&home_key).await.unwrap(),
+        "a slug-less post delete must still evict the home cache"
+    );
+}
+
+/// The front page (empty slug) and a permalink whose slug is literally `index` (or a nested
+/// slug) must NOT share a cache key. Before the two-namespace scheme both mapped to
+/// `prerender/index.html`, silently defeating each other's cache — this pins the split.
+#[test]
+fn front_page_and_index_slug_do_not_share_a_cache_key() {
+    let home = cache_key("/");
+    let index = cache_key("/index");
+    assert_ne!(
+        home, index,
+        "the home page and a slug-'index' permalink must use distinct keys"
+    );
+    assert!(
+        home.0.contains("/listing/"),
+        "the front page lives under the reserved listing namespace: {}",
+        home.0
+    );
+    assert!(
+        index.0.contains("/permalink/"),
+        "a permalink lives under the permalink namespace: {}",
+        index.0
+    );
+    // A nested slug cannot escape into the listing subtree either.
+    assert_ne!(cache_key("/listing/index"), home);
+    // The root's trailing-slash variants all resolve to the one listing key.
+    assert_eq!(cache_key("/"), cache_key("///"));
+}
+
+/// The `setting_reshapes_front` classifier that gates home eviction: all three front-shaping
+/// `reading.*` keys evict; other settings (incl. non-front `reading.*` keys) do not; a change
+/// carrying no key evicts conservatively. Guards the exact regression the reviewer named — a
+/// dropped key from the match would silently stop evicting `/` on a static-vs-galley flip.
+#[test]
+fn setting_reshapes_front_classifies_every_key() {
+    for key in [
+        "reading.posts_per_page",
+        "reading.show_on_front",
+        "reading.page_on_front",
+    ] {
+        assert!(
+            crate::setting_reshapes_front(&setting_change_with_key(ChangeKind::Update, key)),
+            "{key} must reshape the front page and evict /"
+        );
+    }
+    for key in [
+        "site.title",
+        "site.timezone",
+        "reading.feed_items",
+        "reading.search_engine_visible",
+    ] {
+        assert!(
+            !crate::setting_reshapes_front(&setting_change_with_key(ChangeKind::Update, key)),
+            "{key} composes live and must NOT bust the home cache"
+        );
+    }
+    // A Setting change whose fields carry no `key` evicts conservatively.
+    let no_key = Change {
+        version: 1,
+        kind: ChangeKind::Update,
+        type_name: TypeName::from(SETTING_TYPE),
+        object_id: ObjectId(0),
+        fields: None,
+        origin: None,
+    };
+    assert!(
+        crate::setting_reshapes_front(&no_key),
+        "a keyless setting change must evict conservatively"
+    );
+}
+
+/// After a `reading.posts_per_page` change evicts `/`, the next request REBUILDS the galley
+/// honoring the NEW cap — proving the evict→rebuild loop reflects the change, not just that
+/// the entry was deleted.
+#[tokio::test]
+async fn home_rebuild_honors_new_posts_per_page_after_eviction() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    for slug in ["p-a", "p-b", "p-c"] {
+        seed_post(&store, slug, Status::Published).await;
+    }
+
+    let settings0 = SiteSettings::defaults(); // posts_per_page = 10
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings0.clone()));
+
+    let home_key = cache_key("/");
+    // Warm at the default cap: all three posts.
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings0,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await;
+    let front0: crate::content::CachedFront =
+        serde_json::from_slice(&blobs.get(&home_key).await.unwrap()).unwrap();
+    match front0 {
+        crate::content::CachedFront::Galley(rows) => assert_eq!(rows.len(), 3),
+        other => panic!("expected Galley, got {other:?}"),
+    }
+
+    // Lower the cap in the store, then apply the setting change (evicts `/`).
+    seed_setting(&store, "reading.posts_per_page", "2").await;
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "reading.posts_per_page",
+        ))
+        .await
+        .expect("apply posts_per_page change");
+    assert!(
+        !blobs.exists(&home_key).await.unwrap(),
+        "the reading.posts_per_page change must evict /"
+    );
+
+    // Re-read with the reloaded settings: the rebuilt galley honors the new cap of 2.
+    let settings1 = crate::settings::load_site_settings(&store).await.unwrap();
+    assert_eq!(settings1.posts_per_page, 2);
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings1,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await;
+    let front1: crate::content::CachedFront =
+        serde_json::from_slice(&blobs.get(&home_key).await.unwrap()).unwrap();
+    match front1 {
+        crate::content::CachedFront::Galley(rows) => assert_eq!(
+            rows.len(),
+            2,
+            "the rebuilt galley must honor the new posts_per_page cap"
+        ),
+        other => panic!("expected Galley, got {other:?}"),
+    }
+}
+
+/// After editing the configured static front page and applying its change (which evicts `/`),
+/// the next request rebuilds `/` with the NEW page body — the static analogue of the galley
+/// rebuild test.
+#[tokio::test]
+async fn home_rebuild_reflects_edited_static_front_after_eviction() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let page_id = seed_page(&store, "home-page", Status::Published, "Original body.").await;
+    seed_setting(&store, "reading.show_on_front", "\"page\"").await;
+    seed_setting(&store, "reading.page_on_front", &page_id.0.to_string()).await;
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings.clone()));
+
+    let home_key = cache_key("/");
+    // Warm the Static front.
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => assert!(h.contains("Original body."), "{h}"),
+        other => panic!("expected Found, got {other:?}"),
+    }
+
+    // Edit the page body in the store.
+    let updated = BlockTree::from_blocks(vec![Block {
+        uid: "01J0000000000000000000PAGE".to_owned(),
+        kind: BlockKind::Paragraph {
+            runs: vec![InlineRun {
+                text: "Updated body.".to_owned(),
+                marks: Vec::new(),
+                href: None,
+            }],
+        },
+        children: Vec::new(),
+    }]);
+    let mut patch: HashMap<String, Value> = HashMap::new();
+    patch.insert(
+        "block_tree".to_owned(),
+        Value::Json(updated.to_json_value().unwrap()),
+    );
+    store
+        .update(&TypeName::from(PAGE_TYPE), page_id, patch)
+        .await
+        .unwrap();
+
+    // The page change evicts `/` (object id == configured front page).
+    engine
+        .apply_change(&change_of(ChangeKind::Update, PAGE_TYPE, page_id.0, 2))
+        .await
+        .expect("apply front-page edit");
+    assert!(
+        !blobs.exists(&home_key).await.unwrap(),
+        "editing the configured static front page must evict /"
+    );
+
+    // Re-read: the rebuilt static front shows the new body.
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => {
+            assert!(h.contains("Updated body."), "the new body is served: {h}");
+            assert!(!h.contains("Original body."), "the old body is gone: {h}");
+        }
+        other => panic!("expected Found, got {other:?}"),
+    }
+}
+
+/// Structurally-drifted (valid-JSON-but-wrong-shape) home envelopes are rejected and
+/// self-heal — not just non-JSON garbage. Covers the invariants the design leans on: an
+/// unknown variant tag, a galley row with a stray field (`deny_unknown_fields`), and a
+/// `Static` wrapping a legacy `CachedPage` that carries a baked `author` name.
+#[tokio::test]
+async fn structurally_drifted_home_envelope_is_rejected_and_self_heals() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await;
+    let home_key = cache_key("/");
+
+    let drifted = [
+        // Unknown variant tag.
+        serde_json::json!({ "Grid": [] }),
+        // Galley row with a stray field (rejected by deny_unknown_fields on CachedHomePost).
+        serde_json::json!({ "Galley": [{
+            "title": "x", "url": "/x", "excerpt": "", "published_at": null,
+            "author_id": null, "extra": 1
+        }]}),
+        // Static wrapping a legacy CachedPage (baked `author` name, no `author_id`).
+        serde_json::json!({ "Static": {
+            "title": "x", "excerpt": "", "published_at": null, "author": "Legacy Baked Name",
+            "featured_image": null, "is_post": false, "seo": null, "body": "OLD CACHED BODY"
+        }}),
+    ];
+
+    for bad in drifted {
+        // Sanity: the drifted shape must NOT deserialize as the current CachedFront.
+        assert!(
+            serde_json::from_value::<crate::content::CachedFront>(bad.clone()).is_err(),
+            "drifted shape must be rejected: {bad}"
+        );
+        blobs
+            .put(&home_key, serde_json::to_vec(&bad).unwrap())
+            .await
+            .expect("seed a drifted home entry");
+
+        // Serve: the drifted entry is treated as a miss → re-rendered live.
+        match serve_path(
+            &store,
+            &blobs,
+            &theme,
+            &NoCustomBlocks,
+            &SiteSettings::defaults(),
+            &AuthorDirectory::default(),
+            "/",
+        )
+        .await
+        {
+            crate::Resolved::Found(h) => {
+                assert!(
+                    h.contains("Latest from the galley"),
+                    "self-healed live: {h}"
+                );
+                assert!(
+                    !h.contains("OLD CACHED BODY"),
+                    "the drifted body is not served: {h}"
+                );
+            }
+            other => panic!("expected Found (self-heal), got {other:?}"),
+        }
+        // The cache now holds a valid current-format CachedFront.
+        let _: crate::content::CachedFront =
+            serde_json::from_slice(&blobs.get(&home_key).await.unwrap())
+                .expect("the home cache self-healed to a valid CachedFront");
+    }
+}
+
+/// The refactor's central invariant: the cached (`serve_front`) and uncached
+/// (`resolve_path`/`front_page`) front pages are byte-for-byte identical, and the cache-hit
+/// (envelope round-trip) render equals the cache-miss (in-memory) render. Uses a post with a
+/// non-empty excerpt + a real published_at + a byline so every `CachedHomePost` field is
+/// exercised — a dropped field on the round-trip would diverge the HIT from the MISS.
+#[tokio::test]
+async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let user_id = seed_user(&store, "user-ada", "Ada Lovelace").await;
+    // A post exercising all CachedHomePost fields.
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String("rich".to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(Status::Published.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String("Rich Post".to_owned()));
+    fields.insert(
+        "excerpt".to_owned(),
+        Value::String("A meaningful excerpt.".to_owned()),
+    );
+    fields.insert(
+        "published_at".to_owned(),
+        Value::DateTime(1_700_000_000_000),
+    );
+    fields.insert(
+        "block_tree".to_owned(),
+        Value::Json(paragraph_block_tree_json()),
+    );
+    let post_id = store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .unwrap();
+    link_author(&store, post_id, user_id).await;
+
+    let settings = SiteSettings::defaults();
+    let dir = crate::authors::load_author_directory(&store).await.unwrap();
+
+    let uncached =
+        match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, &dir, "/").await {
+            crate::Resolved::Found(h) => h,
+            other => panic!("expected Found (uncached), got {other:?}"),
+        };
+    let miss = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir,
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (cache miss), got {other:?}"),
+    };
+    let hit = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir,
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (cache hit), got {other:?}"),
+    };
+
+    // Sanity: the exercised fields actually appear (so parity is not vacuously over blanks).
+    assert!(
+        hit.contains("A meaningful excerpt."),
+        "excerpt rendered: {hit}"
+    );
+    assert!(hit.contains("Ada Lovelace"), "byline rendered: {hit}");
+
+    assert_eq!(
+        uncached, miss,
+        "the uncached (resolve_path) and cache-miss (serve_front build) front pages must match"
+    );
+    assert_eq!(
+        miss, hit,
+        "the cache-hit (envelope round-trip) render must equal the cache-miss render"
+    );
 }
