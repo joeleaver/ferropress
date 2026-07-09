@@ -17,10 +17,12 @@
 //! `ferropress-render` (the one block->HTML dispatch); the difference is only that
 //! form UI is interactive, so its renderer needs rinch and must be excluded.
 
+mod catalog;
 mod schema;
 mod settings;
 mod site_settings;
 
+pub use catalog::{NoPlugins, PluginCatalog, PluginDescriptor};
 pub use schema::{
     Choice, Condition, Field, FieldError, FormSchema, FormSection, TextFormat, WidgetKind,
 };

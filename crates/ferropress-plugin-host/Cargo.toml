@@ -13,6 +13,10 @@ ferropress-core = { workspace = true }
 # Implements `ferropress_render::CustomBlockRenderer` (the seam render uses to ask
 # a plugin for a custom block's HTML).
 ferropress-render = { workspace = true }
+# The rinch-free form-schema types: a plugin's inline `[settings]` manifest table is
+# parsed into a `FormSchema`, and the host implements `PluginCatalog` (the port the
+# admin uses to list plugins + fetch a plugin's config schema).
+ferropress-render-form = { workspace = true }
 # Embedded WASM plugin runtime. extism gives us owned limits (timeout + memory),
 # deny-by-default host functions + allowed_hosts, and PDK compatibility; the
 # `PluginHost` API here is the seam so the runtime could be swapped later.

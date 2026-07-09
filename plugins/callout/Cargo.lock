@@ -117,6 +117,7 @@ dependencies = [
  "extism-pdk",
  "html-escape",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

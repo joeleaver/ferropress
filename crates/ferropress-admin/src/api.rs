@@ -363,6 +363,68 @@ pub async fn put_settings(
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
+// ── plugin config ────────────────────────────────────────────────────────────────
+
+/// A configurable plugin, as listed by `GET /admin/api/plugins`. Reuses the shared
+/// rinch-free `PluginDescriptor` from `ferropress-render-form` (server → client),
+/// so the list shape has a single source of truth.
+pub use ferropress_render_form::PluginDescriptor;
+
+/// `GET /admin/api/plugins` — the installed plugins (Administrator only; a 401 routes
+/// back to login, a 403 surfaces as a message).
+pub async fn list_plugins() -> Result<Vec<PluginDescriptor>, ApiError> {
+    let resp = Request::get("/admin/api/plugins")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<Vec<PluginDescriptor>>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `GET /admin/api/plugins/{id}/settings` — a plugin's config schema + current values
+/// (the SAME `SettingsDto` shape as site settings, rendered by the same form).
+pub async fn get_plugin_settings(id: &str) -> Result<SettingsDto, ApiError> {
+    let resp = Request::get(&format!("/admin/api/plugins/{id}/settings"))
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<SettingsDto>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `PUT /admin/api/plugins/{id}/settings` — persist edited plugin config; returns the
+/// fresh schema + values. A validation failure surfaces the server message; a 401
+/// routes back to login.
+pub async fn put_plugin_settings(
+    id: &str,
+    values: serde_json::Map<String, serde_json::Value>,
+) -> Result<SettingsDto, ApiError> {
+    let built = Request::put(&format!("/admin/api/plugins/{id}/settings"))
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&PutSettingsBody { values });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<SettingsDto>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
 /// Read a failed response's `{ error }` body, falling back to the status code.
 async fn error_message(resp: Response) -> String {
     let status = resp.status();

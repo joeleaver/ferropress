@@ -3,8 +3,46 @@
 # loads via --plugins-dir. `id` matches the block tree's `Custom.plugin` field;
 # the host renders `Custom` blocks by calling this plugin's `render_block` export.
 id = "callout"
+name = "Callout"
 wasm = "ferropress_plugin_callout.wasm"
 # Block names this plugin provides (editor/discovery metadata).
 blocks = ["callout"]
-# No [capabilities] table → capability-zero (pure compute, no host access).
-# No [[hooks]] → renders blocks only.
+
+# This plugin is GRANTED `plugin_settings` — the host wires the `fp_get_setting`
+# host function into its sandbox so it can read its OWN configuration (below). Deny-
+# by-default: without this grant the host function is absent and the plugin could not
+# call it (it would fail to instantiate).
+[capabilities]
+plugin_settings = true
+
+# The plugin's declarative config form. The admin renders THIS with the very same
+# FormSchemaRenderer the site-settings page uses (a pure addition — no plugin admin
+# code). Field keys are BARE; the host persists them under `plugin.callout.<key>`.
+[[settings.sections]]
+id = "appearance"
+title = "Appearance"
+
+[[settings.sections.fields]]
+key = "default_variant"
+label = "Default variant"
+help = "The style used for a callout that doesn't set its own variant."
+default = "note"
+
+[settings.sections.fields.widget]
+type = "select"
+
+[[settings.sections.fields.widget.options]]
+value = "note"
+label = "Note"
+
+[[settings.sections.fields.widget.options]]
+value = "info"
+label = "Info"
+
+[[settings.sections.fields.widget.options]]
+value = "warning"
+label = "Warning"
+
+[[settings.sections.fields.widget.options]]
+value = "danger"
+label = "Danger"

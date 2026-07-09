@@ -20,6 +20,8 @@ crate-type = ["cdylib"]
 [dependencies]
 extism-pdk = "1"
 serde = { version = "1", features = ["derive"] }
+# Parses the `fp_get_setting` host result (the configured default variant's JSON).
+serde_json = "1"
 # The plugin produces FINAL HTML, so it escapes its own text/attributes.
 html-escape = "0.2"
 

@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use ferropress_core::error::{CoreError, Result as CoreResult};
 use ferropress_core::hook::{HookEvent, HookKind};
-use ferropress_core::plugin_caps::{ContentReader, ContentWriter, PublishedRef};
+use ferropress_core::plugin_caps::{
+    ContentReader, ContentWriter, PluginSettingsReader, PublishedRef,
+};
 use ferropress_render::CustomBlockRenderer;
 
 use crate::{Capabilities, HookRegistration, HostLimits, PluginHost};
@@ -35,12 +37,19 @@ fn callout_plugin_renders_block() {
         return;
     };
 
-    let mut host = PluginHost::new();
+    // Callout now imports `fp_get_setting` (the `plugin_settings` capability), so the
+    // host function must be wired for it to instantiate. This block sets its own
+    // variant, so the configured default is never consulted (a null reader suffices).
+    let mut host = PluginHost::new().with_plugin_settings(Arc::new(NullSettings));
     host.load_plugin(
         "callout",
         &wasm,
-        Capabilities::default(),
+        Capabilities {
+            plugin_settings: true,
+            ..Default::default()
+        },
         HostLimits::default(),
+        None,
     )
     .expect("load callout plugin");
 
@@ -84,12 +93,24 @@ fn load_dir_loads_callout() {
         );
         return;
     }
-    let mut host = PluginHost::new();
+    // Callout grants `plugin_settings`, so the settings backend must be wired for it
+    // to instantiate (deny-by-default is structural; `load_dir` would otherwise skip it).
+    let mut host = PluginHost::new().with_plugin_settings(Arc::new(NullSettings));
     host.load_dir(&dist).expect("load plugins dir");
     assert!(
         host.has_plugin("callout"),
         "callout loaded from plugins/dist"
     );
+    // And its config schema is surfaced through the catalog port.
+    use ferropress_render_form::PluginCatalog;
+    let listed = host.plugins();
+    let callout = listed
+        .iter()
+        .find(|p| p.id == "callout")
+        .expect("callout in catalog");
+    assert_eq!(callout.name, "Callout");
+    assert!(callout.has_settings, "callout ships a settings form");
+    assert!(host.settings_schema("callout").is_some());
 }
 
 /// Build a `comment.create` filter event with the given body/author (the shape the
@@ -275,6 +296,7 @@ fn wiki_plugin_resolves_links_via_capability() {
             ..Default::default()
         },
         HostLimits::default(),
+        None,
     )
     .expect("load wiki plugin");
 
@@ -326,6 +348,7 @@ fn wiki_plugin_without_capability_backend_fails_to_load() {
                 ..Default::default()
             },
             HostLimits::default(),
+            None,
         )
         .expect_err("a read_store plugin must fail to load when no ContentReader backs it");
 
@@ -446,6 +469,7 @@ fn backlink_index_writes_backlink_via_capabilities() {
             ..Default::default()
         },
         HostLimits::default(),
+        None,
     )
     .expect("load backlink-index plugin");
 
@@ -509,6 +533,7 @@ fn backlink_index_without_writer_backend_fails_to_load() {
                 ..Default::default()
             },
             HostLimits::default(),
+            None,
         )
         .expect_err("a write_store plugin must fail to load when no ContentWriter backs it");
 
@@ -519,5 +544,261 @@ fn backlink_index_without_writer_backend_fails_to_load() {
     assert!(
         err.to_string().contains("fp_set_meta"),
         "the failure must be the unresolved fp_set_meta host import: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// plugin_settings capability + config-schema catalog
+// ---------------------------------------------------------------------------
+
+/// A [`PluginSettingsReader`] double that never has a stored value (so the host's
+/// schema-default overlay is what the guest sees).
+struct NullSettings;
+impl PluginSettingsReader for NullSettings {
+    fn get_setting(&self, _namespace: &str, _key: &str) -> CoreResult<Option<serde_json::Value>> {
+        Ok(None)
+    }
+}
+
+/// A [`PluginSettingsReader`] double returning one canned value for a single
+/// (namespace, key) — proves a stored value overrides the schema default and that a
+/// plugin only reads its OWN namespace.
+struct StubSettings {
+    namespace: String,
+    key: String,
+    value: serde_json::Value,
+}
+impl PluginSettingsReader for StubSettings {
+    fn get_setting(&self, namespace: &str, key: &str) -> CoreResult<Option<serde_json::Value>> {
+        if namespace == self.namespace && key == self.key {
+            Ok(Some(self.value.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The built callout plugin wasm, or `None` if it has not been built yet.
+fn callout_wasm() -> Option<Vec<u8>> {
+    let path = repo_root().join("plugins/dist/callout/ferropress_plugin_callout.wasm");
+    std::fs::read(path).ok()
+}
+
+/// A plugin's inline `[settings]` TOML parses into a `FormSchema` via the
+/// TOML → JSON → schema bridge (the mechanism that lets a plugin ship a config form
+/// the admin renders with the very same `FormSchemaRenderer`).
+#[test]
+fn settings_toml_parses_into_a_form_schema() {
+    let toml_src = r#"
+        [[sections]]
+        id = "appearance"
+        title = "Appearance"
+
+        [[sections.fields]]
+        key = "default_variant"
+        label = "Default variant"
+        default = "note"
+
+        [sections.fields.widget]
+        type = "select"
+
+        [[sections.fields.widget.options]]
+        value = "note"
+        label = "Note"
+
+        [[sections.fields.widget.options]]
+        value = "warning"
+        label = "Warning"
+    "#;
+    let raw: toml::Value = toml::from_str(toml_src).expect("parse toml");
+    let schema = crate::parse_settings_schema(raw).expect("valid schema");
+    assert_eq!(
+        schema.defaults()["default_variant"],
+        serde_json::json!("note")
+    );
+    let field = schema.field("default_variant").expect("field present");
+    assert!(matches!(
+        field.widget,
+        ferropress_render_form::WidgetKind::Select { .. }
+    ));
+}
+
+/// An empty or key-duplicating settings form is rejected at parse (the field key is
+/// the persisted `Setting` sub-key, so duplicates/blanks are a config error).
+#[test]
+fn settings_schema_rejects_empty_and_duplicate_keys() {
+    // No sections at all → no fields → rejected.
+    let empty: toml::Value = toml::from_str("").expect("parse");
+    assert!(crate::parse_settings_schema(empty).is_err());
+
+    // The SAME field key in two sections → rejected (the key is the persisted sub-key).
+    let dup: toml::Value = toml::from_str(
+        r#"
+        [[sections]]
+        id = "s"
+        title = "S"
+        [[sections.fields]]
+        key = "k"
+        label = "A"
+        default = ""
+        [sections.fields.widget]
+        type = "text_area"
+        [[sections]]
+        id = "s2"
+        title = "S2"
+        [[sections.fields]]
+        key = "k"
+        label = "B"
+        default = ""
+        [sections.fields.widget]
+        type = "text_area"
+    "#,
+    )
+    .expect("parse dup");
+    assert!(
+        crate::parse_settings_schema(dup).is_err(),
+        "a duplicate field key across sections must be rejected"
+    );
+}
+
+/// The catalog lists a loaded plugin's config schema (via the `PluginCatalog` port),
+/// and `fp_get_setting` returns the effective value: the schema DEFAULT when unset,
+/// the STORED value when set. Proven end-to-end through the real callout guest.
+#[test]
+fn callout_reads_configured_default_variant() {
+    let Some(wasm) = callout_wasm() else {
+        eprintln!(
+            "skipping callout_reads_configured_default_variant: callout wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    };
+
+    // Build the callout config schema the way the manifest declares it (default = note).
+    let schema_toml: toml::Value = toml::from_str(
+        r#"
+        [[sections]]
+        id = "appearance"
+        title = "Appearance"
+        [[sections.fields]]
+        key = "default_variant"
+        label = "Default variant"
+        default = "note"
+        [sections.fields.widget]
+        type = "select"
+        [[sections.fields.widget.options]]
+        value = "note"
+        label = "Note"
+        [[sections.fields.widget.options]]
+        value = "warning"
+        label = "Warning"
+    "#,
+    )
+    .expect("parse");
+    let schema = crate::parse_settings_schema(schema_toml).expect("schema");
+
+    // (1) No stored value → the guest sees the schema DEFAULT ("note"). A block with
+    // an EMPTY variant triggers the configured-default read.
+    let mut host = PluginHost::new().with_plugin_settings(Arc::new(NullSettings));
+    host.load_plugin(
+        "callout",
+        &wasm,
+        Capabilities {
+            plugin_settings: true,
+            ..Default::default()
+        },
+        HostLimits::default(),
+        Some(&schema),
+    )
+    .expect("load callout");
+    let html = host
+        .render("callout", "callout", &serde_json::json!({ "text": "hi" }))
+        .expect("renders")
+        .into_string();
+    assert!(
+        html.contains("fp-callout-note"),
+        "unset → schema default variant: {html}"
+    );
+
+    // (2) A STORED value overrides the default: the same empty-variant block now
+    // renders the configured "warning".
+    let mut host = PluginHost::new().with_plugin_settings(Arc::new(StubSettings {
+        namespace: "callout".to_owned(),
+        key: "default_variant".to_owned(),
+        value: serde_json::json!("warning"),
+    }));
+    host.load_plugin(
+        "callout",
+        &wasm,
+        Capabilities {
+            plugin_settings: true,
+            ..Default::default()
+        },
+        HostLimits::default(),
+        Some(&schema),
+    )
+    .expect("load callout");
+    let html = host
+        .render("callout", "callout", &serde_json::json!({ "text": "hi" }))
+        .expect("renders")
+        .into_string();
+    assert!(
+        html.contains("fp-callout-warning"),
+        "stored value overrides default: {html}"
+    );
+}
+
+/// Deny-by-default is STRUCTURAL for `plugin_settings` too: callout declares the
+/// grant but, loaded with NO `PluginSettingsReader`, has no `fp_get_setting` import
+/// and fails to instantiate.
+#[test]
+fn callout_without_settings_backend_fails_to_load() {
+    let Some(wasm) = callout_wasm() else {
+        eprintln!(
+            "skipping callout_without_settings_backend_fails_to_load: callout wasm not built — run `cargo xtask build-plugins`"
+        );
+        return;
+    };
+    let mut host = PluginHost::new(); // no with_plugin_settings
+    let err = host
+        .load_plugin(
+            "callout",
+            &wasm,
+            Capabilities {
+                plugin_settings: true,
+                ..Default::default()
+            },
+            HostLimits::default(),
+            None,
+        )
+        .expect_err("a plugin_settings plugin must fail to load when no backend is wired");
+    assert!(
+        matches!(err, CoreError::Unavailable(_)),
+        "expected an instantiation failure, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("fp_get_setting"),
+        "the failure must be the unresolved fp_get_setting host import: {err}"
+    );
+}
+
+/// A plugin id containing a `.` is rejected at load: it would make the
+/// `plugin.{id}.{bare}` `Setting`-key namespace ambiguous (a dotted-prefix id pair
+/// could read across namespaces). Validation runs before the wasm is even parsed.
+#[test]
+fn load_plugin_rejects_id_with_dot() {
+    let mut host = PluginHost::new();
+    let err = host
+        .load_plugin(
+            "acme.pro",
+            b"not-wasm",
+            Capabilities::default(),
+            HostLimits::default(),
+            None,
+        )
+        .expect_err("a dotted plugin id must be rejected");
+    assert!(matches!(err, CoreError::Validation(_)), "got: {err}");
+    assert!(
+        err.to_string().contains("invalid plugin id"),
+        "the failure must name the invalid id: {err}"
     );
 }

@@ -40,7 +40,7 @@ pub use entity::*;
 pub use error::{CoreError, Result};
 pub use hook::{HookDispatcher, HookEvent, HookKind, NoHooks};
 pub use ids::{SchemaVersion, Slug};
-pub use plugin_caps::{ContentReader, ContentWriter, PublishedRef};
+pub use plugin_caps::{ContentReader, ContentWriter, PluginSettingsReader, PublishedRef};
 pub use ports::{
     BlobKey, BlobStore, BoxFuture, CertSource, Certificate, ScheduleId, ScheduledJob, Scheduler,
     SecretRef, SecretStore,

@@ -71,6 +71,20 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) {
 
 /// Boot a real embedded store + the SAME theme the composition root uses, into an
 /// `AppState`. Returns the store handle (for seeding) and the state (for serving).
+/// A `PluginSettingsReader` that never has a stored value — used where a plugin
+/// imports `fp_get_setting` (so the host function must be wired to instantiate) but
+/// the test doesn't exercise configuration.
+struct NullSettings;
+impl ferropress_core::plugin_caps::PluginSettingsReader for NullSettings {
+    fn get_setting(
+        &self,
+        _namespace: &str,
+        _key: &str,
+    ) -> ferropress_core::error::Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+}
+
 fn boot_state(dir: &Path) -> (Arc<dyn RhypeStore>, AppState) {
     let store: Arc<dyn RhypeStore> =
         Arc::new(EmbeddedStore::open(dir.join("db")).expect("open embedded store"));
@@ -222,9 +236,22 @@ async fn serves_custom_block_via_plugin() {
     let (store, state) = boot_state(tmp.path());
 
     // A real plugin host, loaded with the built callout plugin, as the renderer.
-    let mut host = ferropress_plugin_host::PluginHost::new();
-    host.load_plugin("callout", &wasm, Default::default(), Default::default())
-        .expect("load callout plugin");
+    // Callout now imports `fp_get_setting` (the `plugin_settings` capability), so the
+    // host function must be wired for it to instantiate; this block's own variant is
+    // "warning", so the configured default is never consulted (a null reader suffices).
+    let mut host =
+        ferropress_plugin_host::PluginHost::new().with_plugin_settings(Arc::new(NullSettings));
+    host.load_plugin(
+        "callout",
+        &wasm,
+        ferropress_plugin_host::Capabilities {
+            plugin_settings: true,
+            ..Default::default()
+        },
+        Default::default(),
+        None,
+    )
+    .expect("load callout plugin");
     let state = state.with_custom_renderer(Arc::new(host));
 
     seed_callout_post(&store, "with-callout").await;
@@ -321,8 +348,11 @@ async fn serves_wiki_block_resolving_links_via_capability() {
     let theme = Arc::new(ferropress_serve::default_theme().expect("default theme builds"));
 
     // A real plugin host loaded from plugins/dist (wiki's plugin.toml grants
-    // read_store), with the embedded store as the content-read backend.
-    let mut host = ferropress_plugin_host::PluginHost::new().with_content_reader(store_concrete);
+    // read_store; callout's grants plugin_settings), with the embedded store backing
+    // both capabilities — so the whole dir loads cleanly, as the composition root does.
+    let mut host = ferropress_plugin_host::PluginHost::new()
+        .with_content_reader(store_concrete.clone())
+        .with_plugin_settings(store_concrete);
     host.load_dir(plugins_dist()).expect("load plugins dir");
     let state = AppState::new(store.clone(), blobs, theme).with_custom_renderer(Arc::new(host));
 

@@ -10,9 +10,9 @@
 //! it in `spawn_blocking`), so no async bridge is needed. The adapter implements
 //! the sync read directly over the engine.
 //!
-//! Capabilities ship incrementally: [`ContentReader`] (read published content)
-//! and [`ContentWriter`] (a tight, typed write surface) exist; a plugin-settings
-//! backend is a later increment.
+//! Capabilities ship incrementally: [`ContentReader`] (read published content),
+//! [`ContentWriter`] (a tight, typed write surface), and [`PluginSettingsReader`]
+//! (a plugin reads its OWN configuration) exist.
 
 use crate::error::Result;
 
@@ -115,4 +115,30 @@ pub trait ContentWriter: Send + Sync {
         key: &str,
         value: serde_json::Value,
     ) -> Result<()>;
+}
+
+/// The `plugin_settings` capability backend: a plugin's read-only view of its OWN
+/// configuration. Backs the `fp_get_setting` host function the plugin host exposes
+/// to plugins granted `plugin_settings`.
+///
+/// Security posture: the host passes the CALLING plugin's id as `namespace`, and
+/// the backend resolves only the persisted `Setting` at
+/// [`plugin_setting_key(namespace, key)`](crate::entity::plugin_setting_key) — so a
+/// plugin can only ever read its own config sub-namespace. Reading another plugin's
+/// (or a core `site.*`) setting is structurally impossible, exactly like
+/// [`ContentWriter::set_meta`]'s write namespacing.
+///
+/// Read-only in v1: an admin configures a plugin through the admin UI and the
+/// plugin reads the result; a plugin WRITING its own settings is a later increment.
+///
+/// Synchronous (see the module docs): implemented by the embedded store adapter
+/// directly over the engine; injected at the composition root. A lookup error
+/// degrades to `None` at the host-function boundary (a capability call never aborts
+/// the guest); the host overlays the plugin's schema default when the stored value
+/// is absent, so the guest always sees an *effective* value without re-embedding
+/// its own defaults.
+pub trait PluginSettingsReader: Send + Sync {
+    /// The stored value for `(namespace, key)` — the persisted `Setting` at
+    /// `plugin.{namespace}.{key}` — or `None` when no value has been saved yet.
+    fn get_setting(&self, namespace: &str, key: &str) -> Result<Option<serde_json::Value>>;
 }

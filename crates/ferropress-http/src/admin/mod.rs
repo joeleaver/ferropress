@@ -35,8 +35,10 @@ use crate::AppState;
 
 pub mod auth;
 pub mod media;
+pub mod plugins;
 pub mod posts;
 pub mod preview;
+mod setting_store;
 pub mod settings;
 
 #[cfg(test)]
@@ -282,6 +284,13 @@ pub fn api_routes() -> Router<AppState> {
         // Site settings: read the schema + values, write a validated submission.
         // Both gated on `ManageSettings` (Administrator).
         .route("/admin/api/settings", get(settings::get).put(settings::put))
+        // Plugin config: list installed plugins, and read/write a plugin's settings
+        // through the same declarative FormSchema. All gated on `ManagePlugins`.
+        .route("/admin/api/plugins", get(plugins::list))
+        .route(
+            "/admin/api/plugins/{id}/settings",
+            get(plugins::get).put(plugins::put),
+        )
         // WordPress-style draft preview: render a (possibly unpublished) post through
         // the REAL public theme, uncached, in a new tab. Under `/admin` so the session
         // cookie (Path=/admin) is sent; returns HTML (not JSON). See [`preview`].

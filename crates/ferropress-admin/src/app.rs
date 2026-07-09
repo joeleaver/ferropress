@@ -29,6 +29,7 @@ enum View {
     List,
     Editor,
     Settings,
+    Plugins,
 }
 
 /// Load state of the post list.
@@ -37,6 +38,16 @@ enum Load {
     Loading,
     Ready,
     Error,
+}
+
+/// What the shared settings form is editing: the first-party site settings, or a
+/// specific plugin's config. The `Settings` view + its load/save switch on this, so
+/// one FormSchemaRenderer serves both surfaces (the plugin config is a pure addition
+/// — no new form-rendering code).
+#[derive(Clone, PartialEq)]
+enum SettingsTarget {
+    Site,
+    Plugin { id: String, name: String },
 }
 
 /// The signals a guarded request needs to route back to login on a 401. `Signal` is
@@ -101,6 +112,13 @@ pub fn app() -> NodeHandle {
     let settings_schema = Signal::new(Option::<FormSchema>::None);
     let settings_values = Signal::new(Option::<FormValues>::None);
     let settings_saving = Signal::new(false);
+    // What the settings form is currently editing (site vs a plugin), so its chrome,
+    // load, and save target the right endpoint.
+    let settings_target = Signal::new(SettingsTarget::Site);
+
+    // Plugins view (Administrator only): the list of installed plugins.
+    let plugins_list = Signal::new(Vec::<api::PluginDescriptor>::new());
+    let plugins_state = Signal::new(Load::Loading);
 
     // The re-auth routing bundle, shared by every guarded request.
     let auth = AuthCtx {
@@ -215,13 +233,21 @@ pub fn app() -> NodeHandle {
                                 ),
                                 "\u{002B} New post"
                             }
-                            // Settings is Administrator-only; hide the nav for lower
-                            // roles (the server enforces `ManageSettings` regardless).
+                            // Plugins + Settings are Administrator-only; hide the nav
+                            // for lower roles (the server enforces the capability regardless).
                             if is_admin(&me_user.get()) {
                                 button {
                                     class: "btn btn--quiet",
+                                    onclick: move || open_plugins(
+                                        plugins_list, plugins_state, notice, view, auth,
+                                    ),
+                                    "Plugins"
+                                }
+                                button {
+                                    class: "btn btn--quiet",
                                     onclick: move || open_settings(
-                                        settings_load, settings_schema, settings_values, notice, view, auth,
+                                        settings_load, settings_schema, settings_values,
+                                        settings_target, notice, view, auth,
                                     ),
                                     "Settings"
                                 }
@@ -432,7 +458,7 @@ pub fn app() -> NodeHandle {
                     }
                 },
 
-                // ── SETTINGS (THE FORMS DRAWER) ────────────────────────────────
+                // ── SETTINGS (THE FORMS DRAWER) — site settings OR plugin config ──
                 View::Settings => div {
                     header { class: "masthead",
                         div { class: "ruler" }
@@ -441,18 +467,31 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--quiet",
                                 onclick: move || {
                                     notice.set(String::new());
-                                    view.set(View::List);
+                                    // Back to wherever this form was opened from.
+                                    match settings_target.get() {
+                                        SettingsTarget::Site => view.set(View::List),
+                                        SettingsTarget::Plugin { .. } => view.set(View::Plugins),
+                                    }
                                 },
-                                "\u{2190} Posts"
+                                {move || match settings_target.get() {
+                                    SettingsTarget::Site => "\u{2190} Posts".to_owned(),
+                                    SettingsTarget::Plugin { .. } => "\u{2190} Plugins".to_owned(),
+                                }}
                             }
                             span { class: "masthead__sep", "\u{00B7}" }
-                            span { class: "masthead__here", "Settings" }
+                            span { class: "masthead__here",
+                                {move || match settings_target.get() {
+                                    SettingsTarget::Site => "Settings".to_owned(),
+                                    SettingsTarget::Plugin { name, .. } => name,
+                                }}
+                            }
                             span { class: "masthead__spacer" }
                             button {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || save_settings(
-                                    settings_values, settings_saving, notice, toast, auth,
+                                    settings_values, settings_saving, notice, toast,
+                                    settings_target.get(), auth,
                                 ),
                                 {move || if settings_saving.get() { "Saving\u{2026}" } else { "Save changes" }}
                             }
@@ -460,8 +499,18 @@ pub fn app() -> NodeHandle {
                     }
                     div { class: "wrap",
                         div { class: "galley__head",
-                            h2 { class: "galley__title", "Settings" }
-                            span { class: "galley__count", "site configuration" }
+                            h2 { class: "galley__title",
+                                {move || match settings_target.get() {
+                                    SettingsTarget::Site => "Settings".to_owned(),
+                                    SettingsTarget::Plugin { name, .. } => name,
+                                }}
+                            }
+                            span { class: "galley__count",
+                                {move || match settings_target.get() {
+                                    SettingsTarget::Site => "site configuration".to_owned(),
+                                    SettingsTarget::Plugin { .. } => "plugin configuration".to_owned(),
+                                }}
+                            }
                         }
                         if !notice.get().is_empty() {
                             div { class: "galley__state err", {move || notice.get()} }
@@ -478,6 +527,79 @@ pub fn app() -> NodeHandle {
                         match (settings_load.get(), settings_schema.get(), settings_values.get()) {
                             (Load::Ready, Some(schema), Some(values)) => SchemaForm { schema: schema, values: values },
                             _ => span {},
+                        }
+                    }
+                },
+
+                // ── PLUGINS (THE CABINET) — pick a plugin to configure ─────────
+                View::Plugins => div {
+                    header { class: "masthead",
+                        div { class: "ruler" }
+                        div { class: "masthead__bar",
+                            button {
+                                class: "btn btn--quiet",
+                                onclick: move || {
+                                    notice.set(String::new());
+                                    view.set(View::List);
+                                },
+                                "\u{2190} Posts"
+                            }
+                            span { class: "masthead__sep", "\u{00B7}" }
+                            span { class: "masthead__here", "Plugins" }
+                            span { class: "masthead__spacer" }
+                        }
+                    }
+                    div { class: "wrap",
+                        div { class: "galley__head",
+                            h2 { class: "galley__title", "Plugins" }
+                            span { class: "galley__count",
+                                {move || match plugins_state.get() {
+                                    Load::Ready => format!("{} installed", plugins_list.get().len()),
+                                    _ => String::new(),
+                                }}
+                            }
+                        }
+                        if !notice.get().is_empty() {
+                            div { class: "galley__state err", {move || notice.get()} }
+                        }
+                        if matches!(plugins_state.get(), Load::Loading) {
+                            div { class: "galley__state", "Opening the cabinet\u{2026}" }
+                        }
+                        if matches!(plugins_state.get(), Load::Error) {
+                            div { class: "galley__state err", "Plugins are unavailable right now." }
+                        }
+                        for row in plugin_row_vms(&plugins_list.get()) {
+                            button {
+                                key: row.id.clone(),
+                                class: "row",
+                                onclick: {
+                                    let id = row.id.clone();
+                                    let name = row.name.clone();
+                                    let configurable = row.has_settings;
+                                    move || {
+                                        if configurable {
+                                            open_plugin_config(
+                                                id.clone(), name.clone(), settings_target,
+                                                settings_load, settings_schema, settings_values,
+                                                notice, view, auth,
+                                            );
+                                        } else {
+                                            notice.set(
+                                                "This plugin has no configurable settings.".to_owned(),
+                                            );
+                                        }
+                                    }
+                                },
+                                span { class: "row__mark", "\u{2295}" }
+                                span {
+                                    span { class: "row__title", {row.name} }
+                                    span { class: "row__slug", {row.id} }
+                                }
+                                span { class: "row__edit", {row.hint} }
+                            }
+                        }
+                        if matches!(plugins_state.get(), Load::Ready) && plugins_list.get().is_empty() {
+                            div { class: "galley__state", "No plugins installed." }
                         }
                     }
                 },
@@ -521,6 +643,31 @@ fn row_vms(posts: &[PostSummary]) -> Vec<RowVm> {
         .collect()
 }
 
+/// A plugin-cabinet row's presentation fields, precomputed so the reactive `for`
+/// body reads each once. `hint` is the trailing affordance (configurable vs not).
+#[derive(Clone, PartialEq)]
+struct PluginRowVm {
+    id: String,
+    name: String,
+    has_settings: bool,
+    hint: &'static str,
+}
+
+fn plugin_row_vms(list: &[api::PluginDescriptor]) -> Vec<PluginRowVm> {
+    list.iter()
+        .map(|p| PluginRowVm {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            has_settings: p.has_settings,
+            hint: if p.has_settings {
+                "Configure \u{2192}"
+            } else {
+                "No settings"
+            },
+        })
+        .collect()
+}
+
 /// The galley-row leading cell: the post's featured-image thumbnail when `url` is
 /// non-empty, else the registration crosshair. A component so the choice is a
 /// one-shot `if` (a `#[component]` body runs once) instead of a reactive rsx `if`,
@@ -559,8 +706,59 @@ fn is_admin(user: &Option<UserDto>) -> bool {
         .unwrap_or(false)
 }
 
-/// Switch to the Settings view and (re)load its schema + values.
+/// Switch to the Plugins view and (re)load the installed-plugin list.
+fn open_plugins(
+    list: Signal<Vec<api::PluginDescriptor>>,
+    state: Signal<Load>,
+    notice: Signal<String>,
+    view: Signal<View>,
+    auth: AuthCtx,
+) {
+    notice.set(String::new());
+    view.set(View::Plugins);
+    load_plugins(list, state, auth);
+}
+
+/// Fetch the installed-plugin list into `list`, tracking `state`. A 401 routes back
+/// to login; any other failure shows the error state.
+fn load_plugins(list: Signal<Vec<api::PluginDescriptor>>, state: Signal<Load>, auth: AuthCtx) {
+    state.set(Load::Loading);
+    spawn_local(async move {
+        match api::list_plugins().await {
+            Ok(v) => {
+                list.set(v);
+                state.set(Load::Ready);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(_)) => state.set(Load::Error),
+        }
+    });
+}
+
+/// Switch to the Settings view for the SITE settings and (re)load its schema + values.
+#[allow(clippy::too_many_arguments)]
 fn open_settings(
+    load: Signal<Load>,
+    schema: Signal<Option<FormSchema>>,
+    values: Signal<Option<FormValues>>,
+    target: Signal<SettingsTarget>,
+    notice: Signal<String>,
+    view: Signal<View>,
+    auth: AuthCtx,
+) {
+    notice.set(String::new());
+    target.set(SettingsTarget::Site);
+    view.set(View::Settings);
+    load_settings(load, schema, values, SettingsTarget::Site, auth);
+}
+
+/// Switch to the Settings view for a specific PLUGIN's config and (re)load it. Reuses
+/// the exact same form pipeline as the site settings — only the endpoint differs.
+#[allow(clippy::too_many_arguments)]
+fn open_plugin_config(
+    id: String,
+    name: String,
+    target: Signal<SettingsTarget>,
     load: Signal<Load>,
     schema: Signal<Option<FormSchema>>,
     values: Signal<Option<FormValues>>,
@@ -569,22 +767,29 @@ fn open_settings(
     auth: AuthCtx,
 ) {
     notice.set(String::new());
+    let t = SettingsTarget::Plugin { id, name };
+    target.set(t.clone());
     view.set(View::Settings);
-    load_settings(load, schema, values, auth);
+    load_settings(load, schema, values, t, auth);
 }
 
-/// Fetch the settings schema + current values. On success stores the schema + a fresh
-/// `FormValues` handle (the live map the form writes and Save reads). A 401 routes back
-/// to login; any other failure shows the error state.
+/// Fetch the schema + current values for `target` (site or a plugin). On success
+/// stores the schema + a fresh `FormValues` handle (the live map the form writes and
+/// Save reads). A 401 routes back to login; any other failure shows the error state.
 fn load_settings(
     load: Signal<Load>,
     schema: Signal<Option<FormSchema>>,
     values: Signal<Option<FormValues>>,
+    target: SettingsTarget,
     auth: AuthCtx,
 ) {
     load.set(Load::Loading);
     spawn_local(async move {
-        match api::get_settings().await {
+        let result = match &target {
+            SettingsTarget::Site => api::get_settings().await,
+            SettingsTarget::Plugin { id, .. } => api::get_plugin_settings(id).await,
+        };
+        match result {
             Ok(dto) => {
                 schema.set(Some(dto.schema));
                 values.set(Some(FormValues::new(dto.values)));
@@ -596,15 +801,17 @@ fn load_settings(
     });
 }
 
-/// Persist the settings form: snapshot the live `FormValues`, PUT it, and on success
-/// stamp the save toast and re-seed the form from the server's (validated + normalized,
-/// e.g. clamped) values. A 401 routes back to login; a validation error (400) surfaces
-/// its message.
+/// Persist the settings form to `target`: snapshot the live `FormValues`, PUT it to
+/// the site or plugin endpoint, and on success stamp the save toast and re-seed the
+/// form from the server's (validated + normalized, e.g. clamped) values. A 401 routes
+/// back to login; a validation error (400) surfaces its message.
+#[allow(clippy::too_many_arguments)]
 fn save_settings(
     values: Signal<Option<FormValues>>,
     saving: Signal<bool>,
     notice: Signal<String>,
     toast: Signal<bool>,
+    target: SettingsTarget,
     auth: AuthCtx,
 ) {
     if saving.get() {
@@ -617,7 +824,10 @@ fn save_settings(
     notice.set(String::new());
     saving.set(true);
     spawn_local(async move {
-        let result = api::put_settings(snapshot).await;
+        let result = match &target {
+            SettingsTarget::Site => api::put_settings(snapshot).await,
+            SettingsTarget::Plugin { id, .. } => api::put_plugin_settings(id, snapshot).await,
+        };
         saving.set(false);
         match result {
             Ok(dto) => {

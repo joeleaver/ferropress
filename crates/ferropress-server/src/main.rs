@@ -28,8 +28,8 @@ use ferropress_core::ports::{BlobStore, CertSource, Scheduler, SecretRef, Secret
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, now_millis};
 use ferropress_core::{
-    Block, BlockKind, BlockTree, ContentReader, ContentWriter, InlineRun, POST_TYPE, Status,
-    USER_TYPE,
+    Block, BlockKind, BlockTree, ContentReader, ContentWriter, InlineRun, POST_TYPE,
+    PluginSettingsReader, Status, USER_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
@@ -84,6 +84,9 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let store = select_store(&cfg)?;
     let content_reader: Arc<dyn ContentReader> = store.clone();
     let content_writer: Arc<dyn ContentWriter> = store.clone();
+    // The same concrete store also backs the synchronous `plugin_settings` capability
+    // (a plugin reads its OWN config via `fp_get_setting`).
+    let plugin_settings_reader: Arc<dyn PluginSettingsReader> = store.clone();
     let store: Arc<dyn RhypeStore> = store;
 
     // Seed the live site-settings snapshot from the store ONCE at boot. The SAME
@@ -119,7 +122,8 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // structural: an ungranted plugin never gets the host functions.
     let mut plugins = PluginHost::new()
         .with_content_reader(content_reader)
-        .with_content_writer(content_writer);
+        .with_content_writer(content_writer)
+        .with_plugin_settings(plugin_settings_reader);
     plugins
         .load_dir(&cfg.plugins_dir)
         .context("loading plugins")?;
@@ -139,7 +143,8 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
         .with_settings(settings.clone())
         .with_islands_dir(cfg.islands_dir.clone())
         .with_custom_renderer(plugins.clone())
-        .with_hook_dispatcher(plugins.clone());
+        .with_hook_dispatcher(plugins.clone())
+        .with_plugin_catalog(plugins.clone());
 
     // Admin API + SPA: enabled ONLY when a signing secret is configured (from the
     // SecretStore). No secret -> the admin surface is not mounted (public-only),

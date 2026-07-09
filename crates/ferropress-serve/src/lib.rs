@@ -40,7 +40,7 @@ pub use content::{
     slug_from_path,
 };
 pub use hook_bridge::HookBridge;
-pub use settings::{SettingsHandle, load_site_settings, load_values};
+pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it

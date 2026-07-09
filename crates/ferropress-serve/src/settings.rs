@@ -33,24 +33,48 @@ use serde_json::{Map, Value as JsonValue};
 /// handler and this share the same overlay rule so the form and the public page
 /// agree on what a setting resolves to.
 pub async fn load_values(store: &Arc<dyn RhypeStore>) -> Result<Map<String, JsonValue>> {
-    let schema = schema_for_settings();
-    let mut values = schema.defaults();
+    // Site settings store keys verbatim, so the store key IS the schema key.
+    overlay_settings(store, schema_for_settings().defaults(), |key| {
+        Some(key.to_owned())
+    })
+    .await
+}
 
+/// THE single settings overlay rule, factored so every config surface resolves a
+/// stored value the same way (the form and the served page can never disagree).
+/// Overlays stored `Setting` rows onto `defaults`: for each row, `to_schema_key`
+/// maps the stored key to a schema key (returning `None` to skip the row — e.g. a
+/// row outside a plugin's namespace); a mapped key not present in `defaults` is
+/// ignored (the schema is the whitelist); a `value` String that fails to parse is
+/// skipped so its default stands (never an error). One scan of the tiny `Setting`
+/// table. Site settings pass an identity mapping; plugin config strips the
+/// `plugin.{id}.` prefix (see `ferropress_http`'s plugin route).
+pub async fn overlay_settings<F>(
+    store: &Arc<dyn RhypeStore>,
+    mut defaults: Map<String, JsonValue>,
+    to_schema_key: F,
+) -> Result<Map<String, JsonValue>>
+where
+    F: Fn(&str) -> Option<String>,
+{
     for obj in store.scan(&TypeName::from(SETTING_TYPE)).await? {
         let (Some(Value::String(key)), Some(Value::String(raw))) =
             (obj.get("key"), obj.get("value"))
         else {
             continue;
         };
+        let Some(schema_key) = to_schema_key(key) else {
+            continue;
+        };
         // Only overlay keys the schema knows; unknown stored keys are ignored.
-        if !values.contains_key(key) {
+        if !defaults.contains_key(&schema_key) {
             continue;
         }
         if let Ok(parsed) = serde_json::from_str::<JsonValue>(raw) {
-            values.insert(key.clone(), parsed);
+            defaults.insert(schema_key, parsed);
         }
     }
-    Ok(values)
+    Ok(defaults)
 }
 
 /// Read the settings and project them into the typed [`SiteSettings`] the theme

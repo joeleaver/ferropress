@@ -30,6 +30,7 @@ use ferropress_core::hook::{HookDispatcher, NoHooks};
 use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
+use ferropress_render_form::{NoPlugins, PluginCatalog};
 use ferropress_serve::{Resolved, SettingsHandle};
 use ferropress_theme::ThemeEngine;
 
@@ -72,6 +73,11 @@ pub struct AppState {
     /// to [`NoHooks`] (every event passes through unchanged); the composition root
     /// injects the plugin host via [`with_hook_dispatcher`](Self::with_hook_dispatcher).
     pub hooks: Arc<dyn HookDispatcher>,
+    /// Lists loaded plugins + their config schemas for the admin's plugin-config
+    /// surface. Defaults to [`NoPlugins`] (no plugin is configurable — the plugin
+    /// routes answer an empty list / 404); the composition root injects the plugin
+    /// host via [`with_plugin_catalog`](Self::with_plugin_catalog).
+    pub plugins: Arc<dyn PluginCatalog>,
     /// Admin API + SPA configuration (signing key, bundle dir, cookie policy). When
     /// `None`, NO `/admin*` route is mounted — a public-only deployment. Injected by
     /// the composition root via [`with_admin`](Self::with_admin).
@@ -95,6 +101,7 @@ impl AppState {
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
             hooks: Arc::new(NoHooks),
+            plugins: Arc::new(NoPlugins),
             admin: None,
         }
     }
@@ -126,6 +133,13 @@ impl AppState {
     /// (the `ferropress-plugin-host`).
     pub fn with_hook_dispatcher(mut self, hooks: Arc<dyn HookDispatcher>) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// List plugins + fetch their config schemas through `plugins` (the
+    /// `ferropress-plugin-host`), for the admin's plugin-config routes.
+    pub fn with_plugin_catalog(mut self, plugins: Arc<dyn PluginCatalog>) -> Self {
+        self.plugins = plugins;
         self
     }
 

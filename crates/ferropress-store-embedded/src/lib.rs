@@ -22,6 +22,7 @@ mod content_reader;
 mod content_writer;
 mod convert;
 mod error;
+mod plugin_settings;
 mod store_impl;
 
 use std::path::Path;

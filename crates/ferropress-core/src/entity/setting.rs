@@ -16,3 +16,59 @@ pub struct Setting {
     /// Whether to preload this setting at startup.
     pub autoload: bool,
 }
+
+/// Whether `id` is a well-formed plugin id: a non-empty run of ASCII
+/// alphanumerics, `-`, or `_`. The [`plugin_setting_key`] namespacing DEPENDS on a
+/// plugin id containing no `.`: because the key is the string join
+/// `plugin.{id}.{bare}`, two ids where one is a dotted prefix of the other
+/// (`acme` with bare `pro.color` vs `acme.pro` with bare `color`) would otherwise
+/// build byte-identical `Setting` keys and a plugin could read/write across
+/// namespaces. Restricting ids to a dot-free charset makes the boundary
+/// unambiguous — the segment between `plugin.` and the FIRST following `.` is
+/// always the id — so cross-plugin/core isolation is genuinely structural. The
+/// plugin host rejects an id that fails this at load.
+pub fn is_valid_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The `Setting`-key namespace prefix for a plugin's configuration:
+/// `"plugin.{plugin_id}."`. **The host owns this prefix** — a plugin never
+/// supplies it — so a plugin's settings can never collide with core keys
+/// (`site.*` / `reading.*`) or another plugin's, exactly like the `content:write`
+/// `set_meta` namespacing (the host passes the namespace, the guest can't forge
+/// it). This isolation is structural PROVIDED the plugin id is well-formed
+/// ([`is_valid_plugin_id`] — no `.`, enforced by the host at load), so the
+/// id↔bare-key boundary is unambiguous. A plugin's config schema uses BARE keys
+/// (e.g. `"default_variant"`); this prefix + the bare key is the persisted key.
+pub fn plugin_setting_prefix(plugin_id: &str) -> String {
+    format!("plugin.{plugin_id}.")
+}
+
+/// The fully-qualified `Setting` key for a plugin's bare config key — the prefix
+/// ([`plugin_setting_prefix`]) joined with `bare_key`. Single source of truth
+/// shared by the admin route (which persists) and the store adapter (which reads
+/// the value back for the `plugin_settings` capability), so the two never disagree
+/// about where a plugin setting lives.
+pub fn plugin_setting_key(plugin_id: &str, bare_key: &str) -> String {
+    format!("plugin.{plugin_id}.{bare_key}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_plugin_id;
+
+    #[test]
+    fn valid_plugin_ids_exclude_dots_and_empties() {
+        for ok in ["callout", "wiki", "backlink-index", "my_plugin", "a1"] {
+            assert!(is_valid_plugin_id(ok), "{ok} should be valid");
+        }
+        // A `.` is the killer case: it would make `plugin.{id}.{bare}` ambiguous
+        // between a dotted-prefix id pair (`acme` + `pro.color` vs `acme.pro` + `color`).
+        for bad in ["", "acme.pro", "a b", "a/b", "café", "a.", ".a"] {
+            assert!(!is_valid_plugin_id(bad), "{bad:?} should be rejected");
+        }
+    }
+}

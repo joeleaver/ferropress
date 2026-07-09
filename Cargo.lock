@@ -1604,6 +1604,7 @@ dependencies = [
  "extism",
  "ferropress-core",
  "ferropress-render",
+ "ferropress-render-form",
  "serde",
  "serde_json",
  "tokio",

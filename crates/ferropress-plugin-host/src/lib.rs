@@ -25,18 +25,20 @@
 //! (load / call / dispatch + [`Capabilities`]/[`HostLimits`]) is runtime-agnostic,
 //! so the implementation could move to raw wasmtime later without touching callers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use extism::{Manifest, Plugin, PluginBuilder, UserData, ValType, Wasm, host_fn};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 
 use ferropress_core::error::{CoreError, Result as CoreResult};
 use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
-use ferropress_core::plugin_caps::{ContentReader, ContentWriter};
+use ferropress_core::plugin_caps::{ContentReader, ContentWriter, PluginSettingsReader};
 use ferropress_render::{CustomBlockRenderer, Html};
+use ferropress_render_form::{FormSchema, PluginCatalog, PluginDescriptor};
 
 /// The guest export a plugin must provide to render a custom block: it receives
 /// JSON `{ "name": <block name>, "data": <block payload> }` and returns HTML bytes.
@@ -162,6 +164,10 @@ impl HookBus {
 struct PluginManifest {
     /// Stable plugin id (matches `BlockKind::Custom.plugin`).
     id: String,
+    /// Human-facing display name (shown in the admin's plugin list). Defaults to
+    /// the `id` when absent.
+    #[serde(default)]
+    name: Option<String>,
     /// Wasm filename, relative to the plugin's directory.
     wasm: String,
     #[serde(default)]
@@ -174,6 +180,15 @@ struct PluginManifest {
     #[serde(default)]
     #[allow(dead_code)]
     blocks: Vec<String>,
+    /// The plugin's declarative config form, as an inline `[settings]` table whose
+    /// shape is a [`FormSchema`] (sections → fields → widgets). Held as a raw
+    /// [`toml::Value`] and converted to a `FormSchema` at load ([`parse_settings_schema`])
+    /// so any TOML-vs-serde edge with the internally-tagged `WidgetKind` is sidestepped
+    /// (the conversion routes through `serde_json`). Absent → the plugin is not
+    /// configurable. Field keys are BARE (e.g. `default_variant`); the host owns the
+    /// persisted `plugin.<id>.` prefix.
+    #[serde(default)]
+    settings: Option<toml::Value>,
 }
 
 /// `[capabilities]` table (all default-deny).
@@ -223,6 +238,12 @@ struct HookManifest {
 pub struct PluginHost {
     plugins: HashMap<String, Mutex<Plugin>>,
     bus: HookBus,
+    /// Manifest-level metadata for each loaded plugin (display name + parsed config
+    /// schema), keyed by plugin id. Backs the [`PluginCatalog`] port the admin uses
+    /// to list plugins and fetch a plugin's settings schema. Populated by
+    /// [`load_manifest`](Self::load_manifest); a plugin loaded via the lower-level
+    /// [`load_plugin`](Self::load_plugin) (e.g. in tests) is runnable but not listed.
+    catalog: HashMap<String, CatalogEntry>,
     /// The `content:read` capability backend. `None` until injected via
     /// [`with_content_reader`](Self::with_content_reader); when absent, a plugin's
     /// `read_store` grant has no effect (the `fp_lookup_slug` host function is not
@@ -235,6 +256,20 @@ pub struct PluginHost {
     /// this now that the feed-loop guard exists (plugin writes carry `PLUGIN_ORIGIN`
     /// and the action-hook bridge excludes it — see [`with_content_writer`]).
     writer: Option<Arc<dyn ContentWriter>>,
+    /// The `plugin_settings` capability backend. `None` until injected via
+    /// [`with_plugin_settings`](Self::with_plugin_settings); when absent, a plugin's
+    /// `plugin_settings` grant has no effect (the `fp_get_setting` host function is
+    /// not wired, so deny-by-default holds).
+    settings_reader: Option<Arc<dyn PluginSettingsReader>>,
+}
+
+/// Manifest-derived metadata for a loaded plugin (the [`PluginCatalog`] payload).
+struct CatalogEntry {
+    /// Display name (manifest `name`, falling back to the id).
+    name: String,
+    /// The parsed config form, if the plugin ships one. Held with BARE field keys —
+    /// the host owns the persisted `plugin.<id>.` key prefix.
+    schema: Option<FormSchema>,
 }
 
 impl PluginHost {
@@ -244,8 +279,10 @@ impl PluginHost {
         Self {
             plugins: HashMap::new(),
             bus: HookBus::new(),
+            catalog: HashMap::new(),
             content: None,
             writer: None,
+            settings_reader: None,
         }
     }
 
@@ -274,6 +311,20 @@ impl PluginHost {
     /// this in production alongside the bridge (the composition root does).
     pub fn with_content_writer(mut self, writer: Arc<dyn ContentWriter>) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Inject the `plugin_settings` capability backend (the embedded store's
+    /// synchronous [`PluginSettingsReader`]). Plugins granted `plugin_settings` then
+    /// get the `fp_get_setting` host function backed by it — reading their OWN config
+    /// (the host passes the calling plugin's id as the namespace; the stored value is
+    /// overlaid on the plugin's schema default). MUST be set before
+    /// [`load_dir`](Self::load_dir) / [`load_plugin`](Self::load_plugin), since the
+    /// host function is wired at plugin-build time. When absent, a plugin's
+    /// `plugin_settings` grant leaves the host function unresolved and the plugin
+    /// fails to instantiate (deny-by-default is structural).
+    pub fn with_plugin_settings(mut self, reader: Arc<dyn PluginSettingsReader>) -> Self {
+        self.settings_reader = Some(reader);
         self
     }
 
@@ -325,12 +376,33 @@ impl PluginHost {
         let wasm = std::fs::read(&wasm_path)
             .map_err(|e| CoreError::Unavailable(format!("reading {}: {e}", wasm_path.display())))?;
 
+        // Parse the plugin's inline `[settings]` config form, if any. A malformed
+        // schema fails the whole plugin load (surfaced + skipped by `load_dir`)
+        // rather than silently shipping an un-renderable form to the admin.
+        let schema = match manifest.settings {
+            Some(raw) => Some(parse_settings_schema(raw).map_err(|e| {
+                CoreError::Validation(format!("plugin `{}` [settings]: {e}", manifest.id))
+            })?),
+            None => None,
+        };
+
         self.load_plugin(
             &manifest.id,
             &wasm,
             manifest.capabilities.into(),
             HostLimits::default(),
+            schema.as_ref(),
         )?;
+
+        // Record catalog metadata AFTER a successful load (so a plugin that fails to
+        // instantiate is not listed as configurable).
+        self.catalog.insert(
+            manifest.id.clone(),
+            CatalogEntry {
+                name: manifest.name.unwrap_or_else(|| manifest.id.clone()),
+                schema,
+            },
+        );
 
         for hook in manifest.hooks {
             let kind = parse_hook_kind(&hook.kind)?;
@@ -356,7 +428,18 @@ impl PluginHost {
         wasm_bytes: &[u8],
         capabilities: Capabilities,
         limits: HostLimits,
+        settings: Option<&FormSchema>,
     ) -> CoreResult<()> {
+        // The plugin id is the `Setting`-key namespace root (`plugin.{id}.…`) and a
+        // meta sub-object key, so it must be well-formed — no `.`, which would make
+        // the `plugin.{id}.{bare}` join ambiguous between a dotted-prefix id pair and
+        // let a plugin read across namespaces. Reject a bad id at load (deny-by-default).
+        if !ferropress_core::entity::is_valid_plugin_id(id) {
+            return Err(CoreError::Validation(format!(
+                "invalid plugin id {id:?} (allowed: ASCII alphanumeric, '-', '_'; no '.')"
+            )));
+        }
+
         let mut manifest =
             Manifest::new([Wasm::data(wasm_bytes.to_vec())]).with_timeout(limits.timeout);
         if let Some(pages) = limits.max_memory_pages {
@@ -433,6 +516,40 @@ impl PluginHost {
                         plugin = id,
                         "plugin requests `write_store` but no ContentWriter is wired; \
                          write host functions will be unresolved and the plugin will fail to load"
+                    );
+                }
+            }
+        }
+
+        // `plugin_settings`: expose `fp_get_setting`, backed by the injected
+        // `PluginSettingsReader`. The UserData carries the CALLING plugin's id as the
+        // namespace (so a plugin can only ever read its OWN config — cross-plugin/core
+        // reads are structurally impossible) plus this plugin's schema defaults, which
+        // the host overlays when a value is unset (the guest sees the effective value
+        // without re-embedding its defaults). Same deny-by-default posture: an
+        // un-backed `plugin_settings` grant leaves the host function unresolved and the
+        // plugin fails to instantiate.
+        if capabilities.plugin_settings {
+            match &self.settings_reader {
+                Some(reader) => {
+                    let defaults = settings.map(FormSchema::defaults).unwrap_or_default();
+                    builder = builder.with_function(
+                        "fp_get_setting",
+                        [ValType::I64],
+                        [ValType::I64],
+                        UserData::new(SettingsBackend {
+                            reader: Arc::clone(reader),
+                            plugin_id: id.to_owned(),
+                            defaults: Arc::new(defaults),
+                        }),
+                        fp_get_setting,
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        plugin = id,
+                        "plugin requests `plugin_settings` but no PluginSettingsReader is wired; \
+                         `fp_get_setting` will be unresolved and the plugin will fail to load"
                     );
                 }
             }
@@ -536,6 +653,26 @@ impl HookDispatcher for PluginHost {
 
     fn has_hooks(&self, name: &str) -> bool {
         self.has_hooks(name)
+    }
+}
+
+/// The plugin host is the [`PluginCatalog`] port (declared in `ferropress-render-form`
+/// so the admin HTTP layer can list plugins + fetch a plugin's config schema without
+/// depending on extism). Reads the manifest metadata recorded at load time.
+impl PluginCatalog for PluginHost {
+    fn plugins(&self) -> Vec<PluginDescriptor> {
+        self.catalog
+            .iter()
+            .map(|(id, entry)| PluginDescriptor {
+                id: id.clone(),
+                name: entry.name.clone(),
+                has_settings: entry.schema.is_some(),
+            })
+            .collect()
+    }
+
+    fn settings_schema(&self, id: &str) -> Option<FormSchema> {
+        self.catalog.get(id).and_then(|e| e.schema.clone())
     }
 }
 
@@ -672,6 +809,79 @@ host_fn!(fp_set_meta(user_data: WriteBackend; req: String) -> String {
     };
     Ok(json)
 });
+
+// The `plugin_settings` capability's UserData: the injected [`PluginSettingsReader`],
+// the CALLING plugin's id (passed as the read namespace so a plugin can only reach its
+// own config), and the plugin's schema defaults (overlaid when a value is unset).
+struct SettingsBackend {
+    reader: Arc<dyn PluginSettingsReader>,
+    plugin_id: String,
+    defaults: Arc<serde_json::Map<String, JsonValue>>,
+}
+
+// `fp_get_setting` (the `plugin_settings` capability). The guest passes a BARE config
+// key (e.g. `"default_variant"`); the host reads the stored value for THIS plugin's
+// namespace and, if unset, overlays the plugin's schema default — returning the
+// effective value's JSON, or the literal `null` when neither a stored value nor a
+// default exists. A lookup error / poisoned lock degrades to the default-or-`null` (a
+// capability call never aborts the guest). Wired only under `plugin_settings` with a
+// backend present.
+host_fn!(fp_get_setting(user_data: SettingsBackend; key: String) -> String {
+    let backend = user_data.get()?;
+    let backend = match backend.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Stored value (its own namespace only); on any error treat as unset.
+    let stored = backend
+        .reader
+        .get_setting(&backend.plugin_id, &key)
+        .unwrap_or_else(|e| {
+            tracing::error!(plugin = %backend.plugin_id, %key, error = %e, "fp_get_setting failed");
+            None
+        });
+    // Effective value = stored, else the plugin's schema default, else JSON null.
+    let effective = stored
+        .or_else(|| backend.defaults.get(&key).cloned())
+        .unwrap_or(JsonValue::Null);
+    Ok(serde_json::to_string(&effective).unwrap_or_else(|_| "null".to_owned()))
+});
+
+/// Convert a plugin's inline `[settings]` TOML table into a [`FormSchema`] and
+/// validate it. The conversion routes through `serde_json` (TOML value → JSON value →
+/// `FormSchema`) rather than deserializing `FormSchema` straight from TOML: `WidgetKind`
+/// is an internally-tagged enum, and going via a self-describing JSON value sidesteps
+/// any TOML/serde tag-buffering edge. Validation rejects an empty schema and a
+/// duplicate/blank field key (the field key is the persisted `Setting` sub-key).
+fn parse_settings_schema(raw: toml::Value) -> CoreResult<FormSchema> {
+    let json = serde_json::to_value(&raw)
+        .map_err(|e| CoreError::Validation(format!("not representable as JSON: {e}")))?;
+    let schema: FormSchema = serde_json::from_value(json)
+        .map_err(|e| CoreError::Validation(format!("not a valid form schema: {e}")))?;
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut fields = 0usize;
+    for field in schema.fields() {
+        fields += 1;
+        if field.key.trim().is_empty() {
+            return Err(CoreError::Validation(
+                "a settings field has an empty key".to_owned(),
+            ));
+        }
+        if !seen.insert(field.key.as_str()) {
+            return Err(CoreError::Validation(format!(
+                "duplicate settings field key {:?}",
+                field.key
+            )));
+        }
+    }
+    if fields == 0 {
+        return Err(CoreError::Validation(
+            "declares no fields (an empty settings form)".to_owned(),
+        ));
+    }
+    Ok(schema)
+}
 
 /// Map a manifest hook-kind string to [`HookKind`].
 fn parse_hook_kind(s: &str) -> CoreResult<HookKind> {

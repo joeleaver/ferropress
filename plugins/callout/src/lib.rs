@@ -2,13 +2,27 @@
 //!
 //! The host (`ferropress-plugin-host`) calls the `render_block` export with JSON
 //! `{ "name": <block name>, "data": <block payload> }` and uses the returned
-//! string as the block's HTML. This is a pure-compute, capability-zero plugin: it
-//! reads only its input and produces final HTML, escaping its own text +
+//! string as the block's HTML. It produces final HTML, escaping its own text +
 //! constraining the variant so it can't inject markup (the host emits plugin
 //! output raw, so escaping is the plugin's responsibility).
+//!
+//! It is also the reference for the **`plugin_settings`** capability: it declares a
+//! `[settings]` config form (a "default variant") in its `plugin.toml`, and when a
+//! block sets no variant of its own it reads the admin-configured default via the
+//! `fp_get_setting` host function. Deny-by-default is structural — without the
+//! `plugin_settings` grant that host function is absent and the plugin would fail to
+//! instantiate.
 
 use extism_pdk::*;
 use serde::Deserialize;
+
+// The `plugin_settings` host function: given a BARE config key, returns the JSON of
+// this plugin's effective setting value (the admin-saved value, or the schema
+// default), or the literal `null`. Linked from the default host namespace.
+#[host_fn]
+extern "ExtismHost" {
+    fn fp_get_setting(key: String) -> String;
+}
 
 /// The host's block-render input envelope: `{ name, data }`.
 #[derive(Deserialize)]
@@ -41,11 +55,34 @@ pub fn render_block(Json(input): Json<BlockInput>) -> FnResult<String> {
     if !input.name.is_empty() && input.name != "callout" {
         return Ok(String::new());
     }
-    let variant = sanitize_variant(&input.data.variant);
+    // The block's own variant wins; if it sets none, fall back to the admin-
+    // configured site-wide default (the `plugin_settings` capability). Both flow
+    // through `sanitize_variant`, so a hostile setting value can't break the class.
+    let raw_variant = if input.data.variant.trim().is_empty() {
+        configured_default_variant()
+    } else {
+        input.data.variant.clone()
+    };
+    let variant = sanitize_variant(&raw_variant);
     let text = html_escape::encode_text(&input.data.text);
     Ok(format!(
         "<div class=\"fp-callout fp-callout-{variant}\"><p>{text}</p></div>"
     ))
+}
+
+/// Read the admin-configured default variant via the `plugin_settings` capability.
+/// The host returns the effective value's JSON (the saved value or the schema
+/// default, which is `"note"`); any error / a `null` degrades to an empty string,
+/// which [`sanitize_variant`] maps to `note`.
+fn configured_default_variant() -> String {
+    let Ok(json) = (unsafe { fp_get_setting("default_variant".to_owned()) }) else {
+        return String::new();
+    };
+    // The value is JSON — a string like `"warning"`, or `null` when unset.
+    serde_json::from_str::<Option<String>>(&json)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Constrain the variant to `[a-z0-9-]` (lowercased) so it can't break out of the

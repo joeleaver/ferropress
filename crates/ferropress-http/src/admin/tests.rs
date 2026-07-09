@@ -1952,3 +1952,302 @@ async fn preview_of_a_missing_post_is_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Plugin config (GET /admin/api/plugins, GET/PUT /admin/api/plugins/{id}/settings
+// — ManagePlugins). Uses a fake PluginCatalog so the tests need no built wasm.
+// ---------------------------------------------------------------------------
+
+/// A `PluginCatalog` double: one configurable plugin (`demo`) and one that ships no
+/// settings (`plain`).
+struct FakeCatalog;
+
+impl ferropress_render_form::PluginCatalog for FakeCatalog {
+    fn plugins(&self) -> Vec<ferropress_render_form::PluginDescriptor> {
+        // Intentionally NOT name-sorted, to prove the handler sorts.
+        vec![
+            ferropress_render_form::PluginDescriptor {
+                id: "plain".to_owned(),
+                name: "Plain".to_owned(),
+                has_settings: false,
+            },
+            ferropress_render_form::PluginDescriptor {
+                id: "demo".to_owned(),
+                name: "Demo".to_owned(),
+                has_settings: true,
+            },
+        ]
+    }
+
+    fn settings_schema(&self, id: &str) -> Option<ferropress_render_form::FormSchema> {
+        (id == "demo").then(demo_schema)
+    }
+}
+
+/// A compact demo schema exercising a Select (vocabulary gate) and a bounded Number
+/// (clamp), mirroring what a real plugin ships.
+fn demo_schema() -> ferropress_render_form::FormSchema {
+    use ferropress_render_form::{Choice, Field, FormSchema, FormSection, WidgetKind};
+    FormSchema {
+        sections: vec![FormSection {
+            id: "appearance".to_owned(),
+            title: "Appearance".to_owned(),
+            help: None,
+            fields: vec![
+                Field {
+                    key: "variant".to_owned(),
+                    label: "Variant".to_owned(),
+                    help: None,
+                    default: serde_json::json!("info"),
+                    widget: WidgetKind::Select {
+                        options: vec![
+                            Choice {
+                                value: "info".to_owned(),
+                                label: "Info".to_owned(),
+                            },
+                            Choice {
+                                value: "warn".to_owned(),
+                                label: "Warn".to_owned(),
+                            },
+                        ],
+                    },
+                    visible_when: None,
+                },
+                Field {
+                    key: "count".to_owned(),
+                    label: "Count".to_owned(),
+                    help: None,
+                    default: serde_json::json!(3),
+                    widget: WidgetKind::Number {
+                        min: Some(1.0),
+                        max: Some(10.0),
+                        step: Some(1.0),
+                        unit: None,
+                    },
+                    visible_when: None,
+                },
+            ],
+        }],
+    }
+}
+
+fn boot_with_plugins(dir: &Path) -> (Arc<dyn RhypeStore>, AppState) {
+    let (store, state) = boot(dir);
+    (store, state.with_plugin_catalog(Arc::new(FakeCatalog)))
+}
+
+async fn admin_cookie(state: &AppState, store: &Arc<dyn RhypeStore>) -> String {
+    seed_user(store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, cookie, _) = do_login(state, "jane", "hunter2hunter2").await;
+    session_pair(&cookie.unwrap())
+}
+
+async fn get_uri(state: &AppState, uri: &str, cookie: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+async fn do_put_plugin_settings(
+    state: &AppState,
+    id: &str,
+    cookie: &str,
+    values: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/admin/api/plugins/{id}/settings"))
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "values": values }).to_string(),
+        ))
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+#[tokio::test]
+async fn plugins_list_returns_sorted_and_gated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot_with_plugins(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    let (status, body) = get_uri(&state, "/admin/api/plugins", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let arr = body.as_array().expect("array");
+    // Sorted by name: Demo before Plain.
+    assert_eq!(arr[0]["id"], "demo");
+    assert_eq!(arr[0]["name"], "Demo");
+    assert_eq!(arr[0]["has_settings"], true);
+    assert_eq!(arr[1]["id"], "plain");
+    assert_eq!(arr[1]["has_settings"], false);
+
+    // No session → 401.
+    let (status, _) = get_uri(&state, "/admin/api/plugins", "session=bogus").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn plugin_settings_get_schema_defaults_and_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot_with_plugins(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    let (status, body) = get_uri(&state, "/admin/api/plugins/demo/settings", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["schema"]["sections"].is_array());
+    // Values are the schema defaults (no rows stored yet).
+    assert_eq!(body["values"]["variant"], "info");
+    assert_eq!(body["values"]["count"], 3);
+
+    // An unknown plugin id → 404 (before any store access).
+    let (status, _) = get_uri(&state, "/admin/api/plugins/nope/settings", &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // A plugin that ships no settings form → 404.
+    let (status, _) = get_uri(&state, "/admin/api/plugins/plain/settings", &cookie).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn plugin_settings_put_persists_namespaced_reflects_and_coerces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot_with_plugins(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // A valid select value + an out-of-range number (clamped to max 10).
+    let (status, body) = do_put_plugin_settings(
+        &state,
+        "demo",
+        &cookie,
+        serde_json::json!({ "variant": "warn", "count": 99 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["values"]["variant"], "warn");
+    assert_eq!(body["values"]["count"], 10, "number clamped to max");
+
+    // Persisted under the host-owned namespace `plugin.demo.*` — NOT the bare key,
+    // and NOT any `site.*` key.
+    let namespaced = store
+        .filter(ferropress_core::query::FilterSpec {
+            type_name: TypeName::from(SETTING_TYPE),
+            field: "key".to_owned(),
+            op: ferropress_core::query::Compare::Eq,
+            value: Value::String(ferropress_core::entity::plugin_setting_key(
+                "demo", "variant",
+            )),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert_eq!(namespaced.len(), 1, "one namespaced row");
+    assert!(
+        matches!(namespaced[0].get("value"), Some(Value::String(s)) if s == "\"warn\""),
+        "value JSON-encoded under the plugin namespace: {:?}",
+        namespaced[0].get("value")
+    );
+    // No BARE `variant` row leaked into the global namespace.
+    let bare = store
+        .filter(ferropress_core::query::FilterSpec {
+            type_name: TypeName::from(SETTING_TYPE),
+            field: "key".to_owned(),
+            op: ferropress_core::query::Compare::Eq,
+            value: Value::String("variant".to_owned()),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert!(
+        bare.is_empty(),
+        "a bare (un-namespaced) key must never be written"
+    );
+
+    // A fresh GET reflects the stored, namespaced values.
+    let (_, got) = get_uri(&state, "/admin/api/plugins/demo/settings", &cookie).await;
+    assert_eq!(got["values"]["variant"], "warn");
+    assert_eq!(got["values"]["count"], 10);
+}
+
+#[tokio::test]
+async fn plugin_settings_put_rejects_bad_and_ignores_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot_with_plugins(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // Out-of-vocabulary select value → 400, nothing stored.
+    let (status, _) = do_put_plugin_settings(
+        &state,
+        "demo",
+        &cookie,
+        serde_json::json!({ "variant": "bogus" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Unknown key is dropped (schema is the whitelist); the valid key still applies.
+    let (status, body) = do_put_plugin_settings(
+        &state,
+        "demo",
+        &cookie,
+        serde_json::json!({ "variant": "warn", "evil.rce": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["values"]["variant"], "warn");
+    // Nothing persisted for the unknown key under the plugin namespace.
+    let evil = store
+        .filter(ferropress_core::query::FilterSpec {
+            type_name: TypeName::from(SETTING_TYPE),
+            field: "key".to_owned(),
+            op: ferropress_core::query::Compare::Eq,
+            value: Value::String(ferropress_core::entity::plugin_setting_key(
+                "demo", "evil.rce",
+            )),
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert!(evil.is_empty(), "unknown keys must never be persisted");
+
+    // Writing to an unknown plugin id → 404 (no write path for an un-cataloged id).
+    let (status, _) = do_put_plugin_settings(
+        &state,
+        "nope",
+        &cookie,
+        serde_json::json!({ "variant": "warn" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn plugin_config_requires_manage_plugins_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot_with_plugins(tmp.path());
+    // An editor is high-privilege for content but LACKS ManagePlugins (admin-only).
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let (_, cookie, _) = do_login(&state, "ed", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+
+    let (status, _) = get_uri(&state, "/admin/api/plugins", &cookie).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "list gated on ManagePlugins");
+
+    let (status, _) = get_uri(&state, "/admin/api/plugins/demo/settings", &cookie).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "get gated on ManagePlugins");
+
+    let (status, _) = do_put_plugin_settings(
+        &state,
+        "demo",
+        &cookie,
+        serde_json::json!({ "variant": "warn" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "put gated on ManagePlugins");
+}
