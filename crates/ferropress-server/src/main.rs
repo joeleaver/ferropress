@@ -39,7 +39,8 @@ use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{
-    HookBridge, ServeEngine, SettingsHandle, default_theme, load_site_settings,
+    AuthorsHandle, HookBridge, ServeEngine, SettingsHandle, default_theme, load_author_directory,
+    load_site_settings,
 };
 use ferropress_store_embedded::EmbeddedStore;
 
@@ -100,6 +101,17 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
             .context("loading site settings")?,
     );
 
+    // Seed the live author directory from the store ONCE at boot. The SAME handle is
+    // shared with the HTTP read path (`AppState`) and the regen loop (`ServeEngine`),
+    // which refreshes it on a `User` change — so an author rename is reflected in
+    // every one of their post bylines with NO page regeneration (the byline name is
+    // resolved live at request time; only the author id is cached in the envelope).
+    let authors = AuthorsHandle::new(
+        load_author_directory(&store)
+            .await
+            .context("loading author directory")?,
+    );
+
     // 2. Build the owned subsystems over the ports.
     // Build the page-chrome theme once (its templates registered) for the HTTP read
     // path (`AppState`). The regen loop does NOT need it: it caches per-object
@@ -133,7 +145,8 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // `Arc<dyn CustomBlockRenderer>` at each call site (the `PluginHost` is the
     // renderer for both the regen loop and the read path).
     let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), plugins.clone())
-        .with_settings(settings.clone());
+        .with_settings(settings.clone())
+        .with_authors(authors.clone());
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
     // The same plugin host is the custom-block renderer AND the hook dispatcher
@@ -141,6 +154,7 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // coerces `Arc<PluginHost>` to each trait object at the call site.
     let mut app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
         .with_settings(settings.clone())
+        .with_authors(authors.clone())
         .with_islands_dir(cfg.islands_dir.clone())
         .with_custom_renderer(plugins.clone())
         .with_hook_dispatcher(plugins.clone())

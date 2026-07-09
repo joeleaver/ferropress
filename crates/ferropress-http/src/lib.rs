@@ -31,7 +31,7 @@ use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
 use ferropress_render_form::{NoPlugins, PluginCatalog};
-use ferropress_serve::{Resolved, SettingsHandle};
+use ferropress_serve::{AuthorsHandle, Resolved, SettingsHandle};
 use ferropress_theme::ThemeEngine;
 
 pub mod admin;
@@ -61,6 +61,13 @@ pub struct AppState {
     /// with no page regeneration. Defaults to the schema defaults until the
     /// composition root seeds it via [`with_settings`](Self::with_settings).
     pub settings: SettingsHandle,
+    /// The live author directory the public read path resolves post bylines from.
+    /// The SAME handle is given to the `ServeEngine` regen loop, which refreshes it
+    /// on a `User` change — so an author rename is reflected in every post's byline
+    /// without page regeneration. Defaults to an empty directory (unresolved ids
+    /// render as no byline) until the composition root seeds it via
+    /// [`with_authors`](Self::with_authors).
+    pub authors: AuthorsHandle,
     /// Directory holding the built wasm island bundle (the `wasm-bindgen` output
     /// of `ferropress-islands`). When set, it is served at `/_fp/islands`; `None`
     /// (e.g. in tests) simply omits that route.
@@ -98,6 +105,7 @@ impl AppState {
             blobs,
             theme,
             settings: SettingsHandle::default(),
+            authors: AuthorsHandle::default(),
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
             hooks: Arc::new(NoHooks),
@@ -112,6 +120,15 @@ impl AppState {
     /// settings edit refreshed by the loop is immediately visible here.
     pub fn with_settings(mut self, settings: SettingsHandle) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Share the live [`AuthorsHandle`] the public read path resolves post bylines
+    /// from. The composition root creates ONE handle (seeded from the store) and
+    /// gives the same handle to both this state and the `ServeEngine` regen loop, so
+    /// an author rename refreshed by the loop is immediately visible here.
+    pub fn with_authors(mut self, authors: AuthorsHandle) -> Self {
+        self.authors = authors;
         self
     }
 
@@ -270,6 +287,7 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
         &state.theme,
         state.custom.as_ref(),
         &state.settings.current(),
+        &state.authors.current(),
         &path,
     )
     .await

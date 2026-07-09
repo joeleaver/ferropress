@@ -26,15 +26,17 @@ use ferropress_core::ports::{BlobKey, BlobStore};
 use ferropress_core::query::{Change, ChangeKind, SubscribeFilter};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::Value;
-use ferropress_core::{PAGE_TYPE, POST_TYPE};
+use ferropress_core::{PAGE_TYPE, POST_TYPE, USER_TYPE};
 use ferropress_render::CustomBlockRenderer;
 
+pub mod authors;
 pub mod content;
 pub mod datefmt;
 pub mod hook_bridge;
 pub mod settings;
 pub mod templates;
 
+pub use authors::{AuthorDirectory, AuthorsHandle, load_author_directory};
 pub use content::{
     Resolved, default_theme, render_preview, resolve_path, resolve_published_entity, serve_path,
     slug_from_path,
@@ -123,6 +125,13 @@ pub struct ServeEngine {
     /// without settings wired) simply skips the refresh. This is the SAME handle
     /// the HTTP read path holds, so a refresh here is visible there.
     settings: Option<SettingsHandle>,
+    /// The live author directory the read path resolves post bylines from. When
+    /// present, a `User` change on the feed refreshes it (see
+    /// [`apply_change`](Self::apply_change)) — so an author rename is reflected on
+    /// the public site with NO page regeneration (the byline name is composed live,
+    /// like chrome). `None` (tests, a boot without authors wired) skips the refresh;
+    /// unresolved ids simply render as no byline. Same handle the read path holds.
+    authors: Option<AuthorsHandle>,
 }
 
 impl ServeEngine {
@@ -139,6 +148,7 @@ impl ServeEngine {
             blobs,
             custom,
             settings: None,
+            authors: None,
         }
     }
 
@@ -148,6 +158,15 @@ impl ServeEngine {
     /// is reflected on the public site without any page-cache regeneration.
     pub fn with_settings(mut self, settings: SettingsHandle) -> Self {
         self.settings = Some(settings);
+        self
+    }
+
+    /// Wire the live [`AuthorsHandle`] so the regen loop refreshes it whenever a
+    /// `User` changes on the feed. Pass the SAME handle the HTTP read path holds, so
+    /// an author rename is reflected in every post's byline on the next request
+    /// without regenerating a single cached page (the byline name is composed live).
+    pub fn with_authors(mut self, authors: AuthorsHandle) -> Self {
+        self.authors = Some(authors);
         self
     }
 
@@ -219,6 +238,24 @@ impl ServeEngine {
                     }
                     Err(e) => tracing::warn!(error = %e, "failed to refresh site settings"),
                 }
+            }
+            return Ok(());
+        }
+
+        // A `User` change refreshes the live author directory the read path resolves
+        // bylines from — NOT a page-cache eviction. A post's byline name is composed
+        // live at request time (only the author's *id* is cached in the envelope), so
+        // an author rename is reflected on every one of their posts without
+        // regenerating any page — the cross-entity analogue of the settings guardrail
+        // above (and it avoids the guardrail-2 trap of regenerating a prolific
+        // author's entire back catalogue on a single rename).
+        if change.type_name.as_str() == USER_TYPE {
+            if let Some(authors) = &self.authors {
+                authors.apply_user_change(change);
+                tracing::debug!(
+                    user_id = change.object_id.0,
+                    "refreshed author directory from change feed",
+                );
             }
             return Ok(());
         }

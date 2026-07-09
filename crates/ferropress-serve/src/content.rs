@@ -37,13 +37,14 @@ use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
     BlockTree, Compare, FilterSpec, MEDIA_TYPE, Object, PAGE_TYPE, POST_TYPE, Seo, Status,
-    USER_TYPE, is_media_token, media_url,
+    is_media_token, media_url,
 };
 use ferropress_render::{CustomBlockRenderer, RenderMode, render_with};
 use ferropress_render_form::SiteSettings;
 use ferropress_theme::{SandboxLimits, ThemeEngine, ThemeError};
 use serde::{Deserialize, Serialize};
 
+use crate::authors::AuthorDirectory;
 use crate::cache_key;
 use crate::datefmt;
 use crate::templates::{
@@ -86,7 +87,18 @@ pub enum Resolved {
 /// what the prerender cache stores (serialized as JSON). The chrome is NOT baked
 /// in — it is composed live from the current [`SiteSettings`] on each request, so
 /// the envelope only ever needs regenerating when the *content* changes.
+///
+/// `#[serde(deny_unknown_fields)]` makes the envelope **fail-closed on any shape
+/// drift**: an envelope written by a different (older or newer) format — e.g. a
+/// pre-`author_id` envelope that still carries the old resolved `author` name key —
+/// fails to deserialize rather than deserializing to a lossy/wrong value. The read
+/// path ([`serve_path`]) already treats a deserialize failure as a miss and
+/// re-renders live, so a format change **self-heals on first access** instead of
+/// silently serving a stale/blank page. (The persistent blob cache has no schema
+/// version in its key and no prefix-delete, so this fail-closed-then-re-render is
+/// how a cache migration happens.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CachedPage {
     /// The entry's own title (the `<h1>` and part of the `<title>`).
     pub title: String,
@@ -94,16 +106,18 @@ pub(crate) struct CachedPage {
     pub excerpt: String,
     /// Publish instant (epoch millis, UTC) for the live-formatted dateline.
     pub published_at: Option<i64>,
-    /// Author display name for the byline (posts only; resolved once here).
+    /// The author's `User` object id (posts only). The BYLINE NAME is **not** baked
+    /// here — it is resolved LIVE from the [`AuthorDirectory`](crate::authors) at
+    /// compose time, so an author rename is reflected on every one of their posts
+    /// with no page regeneration (the cross-entity byline-staleness fix). The *id*
+    /// itself is content-stable: it changes only when the post is re-linked to a
+    /// different author, which is a Post edit and regenerates this envelope.
     ///
-    /// NB this is a *cross-entity* value cached in the envelope: if the author
-    /// later renames their `User.display_name`, this post's cached byline stays
-    /// stale until the POST itself is re-rendered (the regen loop reacts to
-    /// Post/Page/Setting changes, not User changes), while the live front-page
-    /// galley shows the new name. This is the same cross-entity-invalidation gap
-    /// documented on [`ServeEngine::affected_pages`](crate::ServeEngine::affected_pages)
-    /// (term/archive/feed dependencies), and closing it there closes it here.
-    pub author: Option<String>,
+    /// A pre-existing envelope that stored the resolved `author` NAME (and no
+    /// `author_id`) is a shape mismatch under `deny_unknown_fields`, so it fails to
+    /// deserialize and is re-rendered live on first access — the byline self-heals
+    /// rather than silently vanishing.
+    pub author_id: Option<u64>,
     /// Featured image URL (`/media/{uuid}`) for the hero, if set.
     pub featured_image: Option<String>,
     /// Whether this is a `Post` (shows a byline) vs a `Page` (does not).
@@ -136,13 +150,14 @@ pub async fn resolve_path(
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
-        return front_page(store, theme, custom, settings).await;
+        return front_page(store, theme, custom, settings, authors).await;
     }
     match build_page(store, custom, path).await {
-        Ok(Some(page)) => match compose_single(theme, settings, &page, false, None) {
+        Ok(Some(page)) => match compose_single(theme, settings, authors, &page, false, None) {
             Ok(html) => Resolved::Found(html),
             Err(e) => Resolved::Error(e),
         },
@@ -173,13 +188,14 @@ pub async fn serve_path(
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
         // The front page is composed live from the current settings (a static page or
         // the post galley); it is not blob-cached in v1 (a later increment can cache +
         // invalidate it on the same change feed).
-        return front_page(store, theme, custom, settings).await;
+        return front_page(store, theme, custom, settings, authors).await;
     }
 
     let key = cache_key(path);
@@ -190,16 +206,20 @@ pub async fn serve_path(
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedPage>(&bytes) {
             Ok(page) => {
-                return match compose_single(theme, settings, &page, false, None) {
+                return match compose_single(theme, settings, authors, &page, false, None) {
                     Ok(html) => Resolved::Found(html),
                     Err(e) => Resolved::Error(e),
                 };
             }
             Err(e) => {
-                // A non-envelope cache entry should never happen (we only ever put
-                // serialized `CachedPage`s), but if it does, don't serve garbage —
-                // log and re-render below.
-                tracing::warn!(%path, error = %e, "prerender cache held a non-envelope entry; re-rendering");
+                // The entry doesn't match the current `CachedPage` shape: either a
+                // corrupt/non-envelope blob, or — after a format change — a legacy
+                // envelope rejected by `deny_unknown_fields` (e.g. one that still
+                // carries the old resolved `author` name). Either way, don't serve
+                // garbage or a lossy render: fall through to re-render live and
+                // write-through the current-format envelope (the cache self-heals on
+                // first access). One log line per stale entry, once.
+                tracing::warn!(%path, error = %e, "prerender cache entry not in the current envelope format; re-rendering");
             }
         },
         Err(CoreError::NotFound { .. }) => {
@@ -225,7 +245,7 @@ pub async fn serve_path(
                     tracing::warn!(%path, error = %e, "could not serialize page envelope for the cache; serving uncached render");
                 }
             }
-            match compose_single(theme, settings, &page, false, None) {
+            match compose_single(theme, settings, authors, &page, false, None) {
                 Ok(html) => Resolved::Found(html),
                 Err(e) => Resolved::Error(e),
             }
@@ -277,12 +297,13 @@ pub async fn render_preview(
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
     type_name: &'static str,
     obj: &Object,
 ) -> Resolved {
     let label = status_label(obj);
     match cached_page_from_object(store, custom, RenderMode::Preview, type_name, obj).await {
-        Ok(page) => match compose_single(theme, settings, &page, false, Some(&label)) {
+        Ok(page) => match compose_single(theme, settings, authors, &page, false, Some(&label)) {
             Ok(html) => Resolved::Found(html),
             Err(e) => Resolved::Error(e),
         },
@@ -344,8 +365,12 @@ pub(crate) async fn cached_page_from_object(
         excerpt: str_field(obj, "excerpt"),
         published_at: obj.get("published_at").and_then(Value::as_datetime),
         // A byline only makes sense on posts; pages have no author line (WP parity).
-        author: if is_post {
-            author_display_name(store, type_name, obj.id).await
+        // Cache only the author's *id* — the display name is resolved live at compose
+        // time from the author directory, so a rename needs no page regeneration.
+        author_id: if is_post {
+            single_link(store, type_name, obj.id, "author")
+                .await
+                .map(|oid| oid.0)
         } else {
             None
         },
@@ -374,6 +399,7 @@ pub(crate) async fn cached_page_from_object(
 fn compose_single(
     theme: &ThemeEngine,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
     page: &CachedPage,
     is_home: bool,
     preview_status: Option<&str>,
@@ -382,8 +408,12 @@ fn compose_single(
         .published_at
         .map(|ms| datefmt::format_datetime(ms, &settings.date_format, &settings.timezone));
 
+    // Resolve the byline name LIVE from the author directory (posts only): the
+    // envelope carries only the author id, so a `User` rename shows here on the next
+    // request with no page regeneration. An unknown id (e.g. a legacy envelope with
+    // no id, or an author since deleted) simply renders as no byline.
     let author = if page.is_post {
-        page.author.as_deref()
+        page.author_id.and_then(|id| authors.name(id))
     } else {
         None
     };
@@ -430,16 +460,17 @@ async fn front_page(
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
 ) -> Resolved {
     if let Some(page_id) = settings.front_page_id {
-        match render_static_front_page(store, theme, custom, settings, page_id).await {
+        match render_static_front_page(store, theme, custom, settings, authors, page_id).await {
             Ok(Some(html)) => return Resolved::Found(html),
             // Missing / unpublished target — fall through to the galley below.
             Ok(None) => {}
             Err(e) => return Resolved::Error(e),
         }
     }
-    match render_home(store, theme, settings).await {
+    match render_home(store, theme, settings, authors).await {
         Ok(html) => Resolved::Found(html),
         Err(e) => Resolved::Error(e),
     }
@@ -460,6 +491,7 @@ async fn render_static_front_page(
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
     page_id: u64,
 ) -> Result<Option<String>, CoreError> {
     let obj = match store
@@ -474,7 +506,9 @@ async fn render_static_front_page(
         return Ok(None);
     }
     let page = cached_page_from_object(store, custom, RenderMode::Publish, PAGE_TYPE, &obj).await?;
-    Ok(Some(compose_single(theme, settings, &page, true, None)?))
+    Ok(Some(compose_single(
+        theme, settings, authors, &page, true, None,
+    )?))
 }
 
 /// Render the front-page galley: the most-recent published posts (up to
@@ -483,8 +517,9 @@ async fn render_home(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
 ) -> Result<String, CoreError> {
-    let posts = recent_published_posts(store, settings).await?;
+    let posts = recent_published_posts(store, settings, authors).await?;
 
     let ctx = HomeCtx {
         page_title: settings.title_or_default().to_owned(),
@@ -509,10 +544,14 @@ async fn render_home(
 /// Scans posts and filters/sorts in Rust: v1 has no compound "status == published
 /// ORDER BY published_at DESC LIMIT n" query primitive, and the post table is
 /// small. Posts with no `published_at` sort last (keyed as `i64::MIN`). Each row's
-/// author byline is resolved with ONE batched link read (no N+1).
+/// author *id* is resolved with ONE batched link read (no N+1); the display name is
+/// looked up live from the [`AuthorDirectory`] — the SAME directory the single-page
+/// byline uses, so the galley and the permalink can never disagree on an author's
+/// name (the cross-entity byline consistency the whole directory exists to give).
 async fn recent_published_posts(
     store: &Arc<dyn RhypeStore>,
     settings: &SiteSettings,
+    authors: &AuthorDirectory,
 ) -> Result<Vec<PostSummary>, CoreError> {
     let mut published: Vec<Object> = store
         .scan(&TypeName::from(POST_TYPE))
@@ -532,22 +571,21 @@ async fn recent_published_posts(
     });
     published.truncate(settings.posts_per_page as usize);
 
-    // Resolve every row's author in ONE batched link read, then one `get_many`
-    // over the distinct author ids — no N+1.
+    // Resolve every row's author id in ONE batched link read (no N+1), then look the
+    // display name up live in the author directory (an in-memory map, no store call).
     let ids: Vec<ObjectId> = published.iter().map(|o| o.id).collect();
     let author_links = store
         .get_links_many(&TypeName::from(POST_TYPE), &ids, "author")
         .await?;
-    let names = resolve_author_names(store, &author_links).await;
 
     Ok(published
         .iter()
         .zip(author_links.iter())
-        .map(|(obj, authors)| {
-            let author = authors
+        .map(|(obj, author_ids)| {
+            let author = author_ids
                 .first()
-                .and_then(|id| names.get(id).cloned())
-                .filter(|n| !n.is_empty());
+                .and_then(|id| authors.name(id.0))
+                .map(str::to_owned);
             PostSummary {
                 title: str_field(obj, "title"),
                 url: format!("/{}", str_field(obj, "slug")),
@@ -562,32 +600,6 @@ async fn recent_published_posts(
             }
         })
         .collect())
-}
-
-/// Map the distinct author ids from a batch of link reads to their display names
-/// (one `get_many`). Missing/blank names are simply absent from the map.
-async fn resolve_author_names(
-    store: &Arc<dyn RhypeStore>,
-    author_links: &[Vec<ObjectId>],
-) -> std::collections::HashMap<ObjectId, String> {
-    let mut ids: Vec<ObjectId> = author_links
-        .iter()
-        .filter_map(|a| a.first().copied())
-        .collect();
-    ids.sort_by_key(|i| i.0);
-    ids.dedup();
-
-    let mut names = std::collections::HashMap::new();
-    if let Ok(users) = store.get_many(&TypeName::from(USER_TYPE), &ids).await {
-        for user in users {
-            if let Some(Value::String(name)) = user.get("display_name")
-                && !name.trim().is_empty()
-            {
-                names.insert(user.id, name.clone());
-            }
-        }
-    }
-    names
 }
 
 /// Resolve a request slug to the PUBLISHED entity behind it, returning its store
@@ -660,23 +672,6 @@ fn str_field(obj: &Object, field: &str) -> String {
     match obj.get(field) {
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
-    }
-}
-
-/// Resolve an object's `author` relation to a `User.display_name`, if any.
-async fn author_display_name(
-    store: &Arc<dyn RhypeStore>,
-    type_name: &str,
-    id: ObjectId,
-) -> Option<String> {
-    let author_id = single_link(store, type_name, id, "author").await?;
-    let user = store
-        .get(&TypeName::from(USER_TYPE), author_id)
-        .await
-        .ok()?;
-    match user.get("display_name") {
-        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
-        _ => None,
     }
 }
 

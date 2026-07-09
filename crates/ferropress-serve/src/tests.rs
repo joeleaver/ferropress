@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use ferropress_core::hook::{HookDispatcher, HookEvent, HookKind};
 use ferropress_core::ports::BlobStore;
-use ferropress_core::query::{Change, ChangeKind};
+use ferropress_core::query::{Change, ChangeKind, Edge};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
     Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, PAGE_TYPE, POST_TYPE, SETTING_TYPE,
-    Status,
+    Status, USER_TYPE,
 };
 use ferropress_render_form::SiteSettings;
 
@@ -26,7 +26,10 @@ use ferropress_theme::ThemeEngine;
 
 use ferropress_render::NoCustomBlocks;
 
-use crate::{OutputPage, ServeEngine, SettingsHandle, cache_key, content, serve_path};
+use crate::{
+    AuthorDirectory, AuthorsHandle, OutputPage, ServeEngine, SettingsHandle, cache_key, content,
+    serve_path,
+};
 
 const PARAGRAPH_TEXT: &str = "Hello from the Ferropress cache test.";
 const SLUG: &str = "hello-world";
@@ -257,6 +260,7 @@ async fn serve_path_read_through_populates_cache() {
         &theme,
         &NoCustomBlocks,
         &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
         &path,
     )
     .await
@@ -309,7 +313,7 @@ async fn serve_path_cache_hit_composes_from_stored_envelope() {
         title: "Cached Title".to_owned(),
         excerpt: String::new(),
         published_at: None,
-        author: None,
+        author_id: None,
         featured_image: None,
         is_post: true,
         seo: None,
@@ -327,6 +331,7 @@ async fn serve_path_cache_hit_composes_from_stored_envelope() {
         &theme,
         &NoCustomBlocks,
         &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
         &path,
     )
     .await
@@ -946,7 +951,16 @@ async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
     );
 
     // The public read path hides a draft (the publish gate) ...
-    let public = serve_path(&store, &blobs, &theme, &NoCustomBlocks, &settings, &path).await;
+    let public = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &path,
+    )
+    .await;
     assert!(
         matches!(public, content::Resolved::NotFound),
         "a draft must 404 on the public path"
@@ -957,13 +971,20 @@ async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
         .get(&TypeName::from(POST_TYPE), id)
         .await
         .expect("get the draft object");
-    let html =
-        match content::render_preview(&store, &theme, &NoCustomBlocks, &settings, POST_TYPE, &obj)
-            .await
-        {
-            content::Resolved::Found(html) => html,
-            other => panic!("preview must render a draft, got {other:?}"),
-        };
+    let html = match content::render_preview(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        POST_TYPE,
+        &obj,
+    )
+    .await
+    {
+        content::Resolved::Found(html) => html,
+        other => panic!("preview must render a draft, got {other:?}"),
+    };
 
     assert!(
         html.contains(PARAGRAPH_TEXT),
@@ -1005,7 +1026,16 @@ async fn front_page_renders_configured_static_page() {
     let settings = crate::settings::load_site_settings(&store).await.unwrap();
     assert_eq!(settings.front_page_id, Some(page_id.0));
 
-    match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, "/").await {
+    match content::resolve_path(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
         crate::Resolved::Found(html) => {
             assert!(
                 html.contains("About the Press body."),
@@ -1036,7 +1066,16 @@ async fn front_page_falls_back_to_galley_for_unpublished_target() {
     // The id is still resolved (from the setting), but rendering must gate on publish.
     assert_eq!(settings.front_page_id, Some(page_id.0));
 
-    match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, "/").await {
+    match content::resolve_path(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
         crate::Resolved::Found(html) => {
             assert!(
                 !html.contains("Secret draft body."),
@@ -1078,6 +1117,7 @@ async fn logo_resolves_and_renders_in_masthead() {
         &theme,
         &NoCustomBlocks,
         &settings,
+        &AuthorDirectory::default(),
         &format!("/{SLUG}"),
     )
     .await
@@ -1107,4 +1147,283 @@ async fn dangling_logo_id_falls_back_to_text_title() {
     seed_setting(&store, "site.logo", "999999").await;
     let settings = crate::settings::load_site_settings(&store).await.unwrap();
     assert_eq!(settings.logo_url, None);
+}
+
+// --- Cross-entity byline resolution (the live author directory) --------------
+
+/// Seed one `User` with a unique uuid + a display name; return its id (so a test can
+/// link a post's `author` to it, or rename it later). Only the byline-relevant fields
+/// are populated.
+async fn seed_user(store: &Arc<dyn RhypeStore>, uuid: &str, display_name: &str) -> ObjectId {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("uuid".to_owned(), Value::String(uuid.to_owned()));
+    fields.insert(
+        "display_name".to_owned(),
+        Value::String(display_name.to_owned()),
+    );
+    store
+        .create(&TypeName::from(USER_TYPE), fields)
+        .await
+        .expect("seeding a user must succeed")
+}
+
+/// Link a post's to-one `author` relation to a user.
+async fn link_author(store: &Arc<dyn RhypeStore>, post_id: ObjectId, user_id: ObjectId) {
+    let edge = Edge {
+        type_name: TypeName::from(POST_TYPE),
+        id: post_id,
+        field: "author".to_owned(),
+    };
+    store
+        .link(&edge, user_id, HashMap::new())
+        .await
+        .expect("linking the post author must succeed");
+}
+
+/// A `User`-typed change as the loop sees it on the feed: the full scalar snapshot in
+/// `fields` (incl. the current `display_name`), matching what the engine publishes.
+fn user_change(kind: ChangeKind, id: ObjectId, display_name: Option<&str>) -> Change {
+    Change {
+        version: 1,
+        kind,
+        type_name: TypeName::from(USER_TYPE),
+        object_id: id,
+        fields: display_name.map(|n| serde_json::json!({ "display_name": n })),
+        origin: None,
+    }
+}
+
+/// THE cross-entity byline fix: a post's byline is resolved LIVE from the author
+/// directory, so renaming the author is reflected on the ALREADY-CACHED page with no
+/// regeneration. The envelope caches only the author *id*, never the name.
+#[tokio::test]
+async fn byline_resolves_live_from_the_author_directory_without_regen() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let user_id = seed_user(&store, "user-ada", "Ada Lovelace").await;
+    let post_id = seed_post(&store, SLUG, Status::Published).await;
+    link_author(&store, post_id, user_id).await;
+
+    let path = format!("/{SLUG}");
+    let key = cache_key(&path);
+    let settings = SiteSettings::defaults();
+
+    // First render (a MISS): the directory reflects the original name → byline present,
+    // and the write-through envelope caches the author id (not the name).
+    let dir1 = crate::authors::load_author_directory(&store).await.unwrap();
+    assert_eq!(dir1.name(user_id.0), Some("Ada Lovelace"));
+    let html1 = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir1,
+        &path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html1.contains("By Ada Lovelace"),
+        "the byline must show the author's name; was:\n{html1}"
+    );
+    let envelope: crate::content::CachedPage =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+    assert_eq!(
+        envelope.author_id,
+        Some(user_id.0),
+        "the envelope must cache the author id, not the name"
+    );
+
+    // Rename the author in the store, and rebuild the directory as the feed refresh would.
+    let mut patch: HashMap<String, Value> = HashMap::new();
+    patch.insert(
+        "display_name".to_owned(),
+        Value::String("Ada, Countess of Lovelace".to_owned()),
+    );
+    store
+        .update(&TypeName::from(USER_TYPE), user_id, patch)
+        .await
+        .unwrap();
+    let dir2 = crate::authors::load_author_directory(&store).await.unwrap();
+
+    // Render AGAIN — a cache HIT (no regeneration): the byline reflects the NEW name
+    // purely because it is composed live from the directory.
+    let html2 = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir2,
+        &path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html2.contains("By Ada, Countess of Lovelace"),
+        "the renamed byline must show live from the directory; was:\n{html2}"
+    );
+    assert!(
+        !html2.contains("By Ada Lovelace"),
+        "the stale name must be gone; was:\n{html2}"
+    );
+
+    // Prove no regeneration happened: the cached envelope is byte-for-byte unchanged.
+    let envelope_after: crate::content::CachedPage =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+    assert_eq!(
+        envelope_after, envelope,
+        "the byline changed with NO page regeneration — the cached envelope is unchanged"
+    );
+}
+
+/// The regen loop routes a `User` change on the feed into the live author directory
+/// (upsert on create/update from the change's scalar snapshot, forget on delete) — the
+/// mechanism that keeps the byline fresh in production, with no page-cache eviction.
+#[tokio::test]
+async fn regen_loop_refreshes_author_directory_on_user_change() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    let user_id = seed_user(&store, "user-grace", "Grace").await;
+    let handle = AuthorsHandle::new(crate::authors::load_author_directory(&store).await.unwrap());
+    assert_eq!(handle.current().name(user_id.0), Some("Grace"));
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_authors(handle.clone());
+
+    // A rename arrives on the feed carrying the full scalars — the directory updates,
+    // with no store round-trip and no cache regeneration.
+    engine
+        .apply_change(&user_change(
+            ChangeKind::Update,
+            user_id,
+            Some("Grace Hopper"),
+        ))
+        .await
+        .expect("a User change must refresh the directory cleanly");
+    assert_eq!(handle.current().name(user_id.0), Some("Grace Hopper"));
+
+    // A delete forgets the author (unresolved id → no byline).
+    engine
+        .apply_change(&user_change(ChangeKind::Delete, user_id, None))
+        .await
+        .expect("a User delete must refresh cleanly");
+    assert_eq!(handle.current().name(user_id.0), None);
+}
+
+/// The front-page galley resolves its bylines from the SAME author directory as the
+/// single-page path, so the two surfaces can never show an author under different names.
+#[tokio::test]
+async fn home_galley_byline_resolves_from_the_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, theme) = boot(tmp.path());
+
+    let user_id = seed_user(&store, "user-grace", "Grace Hopper").await;
+    let post_id = seed_post(&store, "post-a", Status::Published).await;
+    link_author(&store, post_id, user_id).await;
+
+    let settings = SiteSettings::defaults();
+    let dir = crate::authors::load_author_directory(&store).await.unwrap();
+
+    match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, &dir, "/").await {
+        crate::Resolved::Found(html) => {
+            assert!(
+                html.contains("Grace Hopper"),
+                "the galley byline must resolve live from the directory; was:\n{html}"
+            );
+        }
+        other => panic!("expected Found (galley), got {other:?}"),
+    }
+}
+
+/// A pre-existing (legacy-format) cache envelope — one that stored the resolved
+/// `author` NAME and no `author_id`, as the pre-fix build did — must NOT be served
+/// byline-less. `deny_unknown_fields` rejects its stray `author` key, so `serve_path`
+/// treats it as a miss and re-renders live: the cache self-heals to the current format
+/// and the byline resolves from the directory. (Guards the deploy-over-a-cached-site
+/// regression the adversarial review surfaced.)
+#[tokio::test]
+async fn legacy_format_envelope_is_rejected_and_self_heals() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let user_id = seed_user(&store, "user-live", "Live Name").await;
+    let post_id = seed_post(&store, SLUG, Status::Published).await;
+    link_author(&store, post_id, user_id).await;
+
+    // Hand-write a LEGACY envelope at the cache key: the old `author` name string, no
+    // `author_id`, and a sentinel body distinct from the real post's render.
+    let path = format!("/{SLUG}");
+    let key = cache_key(&path);
+    let legacy = serde_json::json!({
+        "title": "Hello World",
+        "excerpt": "",
+        "published_at": null,
+        "author": "Stale Baked Name",
+        "featured_image": null,
+        "is_post": true,
+        "seo": null,
+        "body": "<p>OLD CACHED BODY FROM THE LEGACY ENVELOPE</p>",
+    });
+    // Sanity: the legacy shape must NOT deserialize as the current envelope.
+    assert!(
+        serde_json::from_value::<crate::content::CachedPage>(legacy.clone()).is_err(),
+        "the legacy envelope must be rejected by deny_unknown_fields"
+    );
+    blobs
+        .put(&key, serde_json::to_vec(&legacy).unwrap())
+        .await
+        .expect("seed the legacy cache entry");
+
+    // Serve: the rejected legacy entry falls through to a live re-render.
+    let dir = crate::authors::load_author_directory(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &dir,
+        &path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (self-heal re-render), got {other:?}"),
+    };
+    assert!(
+        html.contains("By Live Name"),
+        "the byline must self-heal to the live name, not vanish; was:\n{html}"
+    );
+    assert!(
+        !html.contains("Stale Baked Name"),
+        "the legacy baked name must be gone; was:\n{html}"
+    );
+    assert!(
+        html.contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
+        "the body must be re-rendered from the store, not the legacy blob; was:\n{html}"
+    );
+    assert!(
+        !html.contains("OLD CACHED BODY"),
+        "the legacy body must not be served; was:\n{html}"
+    );
+
+    // The cache is now a current-format envelope (author id, no name).
+    let healed: crate::content::CachedPage =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap())
+            .expect("the re-rendered entry is a current-format envelope");
+    assert_eq!(healed.author_id, Some(user_id.0));
 }

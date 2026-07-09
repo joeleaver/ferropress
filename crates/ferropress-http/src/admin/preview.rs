@@ -58,6 +58,7 @@ pub async fn preview(
         &state.theme,
         state.custom.as_ref(),
         &state.settings.current(),
+        &state.authors.current(),
         POST_TYPE,
         &obj,
     )

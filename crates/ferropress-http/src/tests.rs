@@ -18,9 +18,12 @@ use ferropress_core::hook::{HookDispatcher, HookEvent};
 use ferropress_core::query::Edge;
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
-use ferropress_core::{Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, POST_TYPE, Status};
+use ferropress_core::{
+    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, POST_TYPE, Status, USER_TYPE,
+};
 
 use ferropress_blob_localfs::LocalFsBlobStore;
+use ferropress_serve::{AuthorDirectory, AuthorsHandle, load_author_directory};
 use ferropress_store_embedded::EmbeddedStore;
 
 use crate::{AppState, router};
@@ -609,5 +612,94 @@ async fn filter_status_readback_is_fail_closed_and_honest() {
     assert_eq!(
         resp["status"], "approved",
         "auto-approve is reflected honestly"
+    );
+}
+
+// --- Cross-entity byline resolution through the real HTTP read path ----------
+
+/// Seed a `User` with a unique uuid + display name; return its id.
+async fn seed_user(store: &Arc<dyn RhypeStore>, uuid: &str, display_name: &str) -> ObjectId {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("uuid".to_owned(), Value::String(uuid.to_owned()));
+    fields.insert(
+        "display_name".to_owned(),
+        Value::String(display_name.to_owned()),
+    );
+    store
+        .create(&TypeName::from(USER_TYPE), fields)
+        .await
+        .expect("seeding a user must succeed")
+}
+
+/// Seed a published post whose `author` to-one relation is linked to `user_id`.
+async fn seed_authored_post(store: &Arc<dyn RhypeStore>, slug: &str, user_id: ObjectId) {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(Status::Published.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String("Hello World".to_owned()));
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert(
+        "block_tree".to_owned(),
+        Value::Json(paragraph_block_tree_json()),
+    );
+    let post_id = store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .expect("seeding a post must succeed");
+    let edge = Edge {
+        type_name: TypeName::from(POST_TYPE),
+        id: post_id,
+        field: "author".to_owned(),
+    };
+    store
+        .link(&edge, user_id, HashMap::new())
+        .await
+        .expect("linking the post author must succeed");
+}
+
+/// The full HTTP read path (`router -> serve_page -> serve_path -> compose`) resolves a
+/// post's byline LIVE from the shared author directory: renaming the author — as the
+/// regen loop does on a `User` change, swapping the SAME `AuthorsHandle` `AppState`
+/// holds — updates the byline on the ALREADY-CACHED page with NO regeneration.
+#[tokio::test]
+async fn serve_page_resolves_byline_live_from_the_author_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+
+    let user_id = seed_user(&store, "user-ada", "Ada Lovelace").await;
+    seed_authored_post(&store, PUBLISHED_SLUG, user_id).await;
+
+    // Wire the live author directory into the state exactly as the composition root does.
+    let authors = AuthorsHandle::new(load_author_directory(&store).await.unwrap());
+    let state = state.with_authors(authors.clone());
+
+    // First GET (a cache MISS): the byline renders the author's current name.
+    let (status, body) = get(&state, &format!("/{PUBLISHED_SLUG}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("By Ada Lovelace"),
+        "the byline must render the author's name; was:\n{body}"
+    );
+
+    // Rename the author by swapping the shared handle (what the regen loop does on a
+    // `User` change off the feed). No page cache is touched.
+    authors.set(AuthorDirectory::from_pairs([(
+        user_id.0,
+        "Ada, Countess of Lovelace".to_owned(),
+    )]));
+
+    // Second GET: a cache HIT, yet the byline reflects the NEW name — composed live.
+    let (status2, body2) = get(&state, &format!("/{PUBLISHED_SLUG}")).await;
+    assert_eq!(status2, StatusCode::OK);
+    assert!(
+        body2.contains("By Ada, Countess of Lovelace"),
+        "the renamed byline must show live on the cached page; was:\n{body2}"
+    );
+    assert!(
+        !body2.contains("By Ada Lovelace"),
+        "the stale byline must be gone; was:\n{body2}"
     );
 }
