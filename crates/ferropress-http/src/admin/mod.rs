@@ -38,6 +38,7 @@ pub mod media;
 pub mod plugins;
 pub mod posts;
 pub mod preview;
+mod setting_refs;
 mod setting_store;
 pub mod settings;
 
@@ -295,12 +296,15 @@ pub fn api_routes() -> Router<AppState> {
         // the REAL public theme, uncached, in a new tab. Under `/admin` so the session
         // cookie (Path=/admin) is sent; returns HTML (not JSON). See [`preview`].
         .route("/admin/preview/{id}", get(preview::preview))
-        // Media upload (multipart). axum's default 2 MiB body limit would reject a
-        // real image, so this route carries its own limit sized to the handler's
-        // per-file cap plus multipart-framing headroom.
+        // Media: `GET` the library (browse existing uploads for a picker), `POST` a
+        // multipart upload. axum's default 2 MiB body limit would reject a real image,
+        // so this route carries its own limit sized to the handler's per-file cap plus
+        // multipart-framing headroom (harmless on the bodyless GET).
         .route(
             "/admin/api/media",
-            post(media::upload).layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + (1 << 20))),
+            get(media::list)
+                .post(media::upload)
+                .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + (1 << 20))),
         )
 }
 

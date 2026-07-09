@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
-use ferropress_core::SETTING_TYPE;
 use ferropress_core::error::Result;
 use ferropress_core::store::RhypeStore;
-use ferropress_core::value::{TypeName, Value};
+use ferropress_core::value::{ObjectId, TypeName, Value};
+use ferropress_core::{MEDIA_TYPE, SETTING_TYPE, is_media_token, media_url};
 use ferropress_render_form::{SiteSettings, schema_for_settings};
 use parking_lot::RwLock;
 use serde_json::{Map, Value as JsonValue};
@@ -79,8 +79,36 @@ where
 
 /// Read the settings and project them into the typed [`SiteSettings`] the theme
 /// consumes.
+///
+/// One field can't be projected by [`SiteSettings::from_values`] alone: `site.logo`
+/// stores a `Media` object id, and the theme needs its `/media/{uuid}` URL. That
+/// needs a store lookup, so it is resolved HERE (once per load) and stashed on
+/// [`SiteSettings::logo_url`]. Because the snapshot is rebuilt on every `Setting`
+/// change (the regen loop calls this), the resolved URL stays current, and the read
+/// path composes chrome without a per-request media lookup. A dangling/missing id
+/// simply leaves the logo unset (the masthead falls back to the text title).
 pub async fn load_site_settings(store: &Arc<dyn RhypeStore>) -> Result<SiteSettings> {
-    Ok(SiteSettings::from_values(&load_values(store).await?))
+    let values = load_values(store).await?;
+    let mut settings = SiteSettings::from_values(&values);
+    if let Some(id) = values.get("site.logo").and_then(JsonValue::as_u64) {
+        settings.logo_url = media_url_by_id(store, id).await;
+    }
+    Ok(settings)
+}
+
+/// Resolve a `Media` object id to its public `/media/{uuid}` URL, or `None` if the
+/// media is missing or lacks a uuid-shaped token. Mirrors the serve layer's
+/// `featured_image_url`, but keyed by a raw id (a settings value) rather than a
+/// relation.
+async fn media_url_by_id(store: &Arc<dyn RhypeStore>, id: u64) -> Option<String> {
+    let media = store
+        .get(&TypeName::from(MEDIA_TYPE), ObjectId(id))
+        .await
+        .ok()?;
+    match media.get("uuid") {
+        Some(Value::String(uuid)) if is_media_token(uuid) => Some(media_url(uuid)),
+        _ => None,
+    }
 }
 
 /// A cheaply-cloneable handle to the current live [`SiteSettings`], shared

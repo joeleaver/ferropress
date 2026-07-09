@@ -88,6 +88,19 @@ pub fn schema_for_settings() -> FormSchema {
                         "The public base URL of your site.",
                         TextFormat::Url,
                     ),
+                    Field {
+                        key: "site.logo".to_owned(),
+                        label: "Site logo".to_owned(),
+                        help: Some(
+                            "Shown in the masthead in place of the site title. Leave unset to \
+                             show the title as text."
+                                .to_owned(),
+                        ),
+                        // Null = "no logo"; a set value is the chosen Media's object id.
+                        default: Value::Null,
+                        widget: WidgetKind::MediaPicker,
+                        visible_when: None,
+                    },
                 ],
             },
             FormSection {
@@ -95,6 +108,37 @@ pub fn schema_for_settings() -> FormSchema {
                 title: "Reading".to_owned(),
                 help: None,
                 fields: vec![
+                    Field {
+                        key: "reading.show_on_front".to_owned(),
+                        label: "Your homepage displays".to_owned(),
+                        help: None,
+                        default: Value::String("posts".to_owned()),
+                        widget: WidgetKind::Radio {
+                            options: vec![
+                                choice("posts", "Your latest posts"),
+                                choice("page", "A static page"),
+                            ],
+                        },
+                        visible_when: None,
+                    },
+                    Field {
+                        key: "reading.page_on_front".to_owned(),
+                        label: "Homepage".to_owned(),
+                        help: Some(
+                            "The published page to show as the front page. If unset (or the page \
+                             is unpublished), the latest-posts galley is shown instead."
+                                .to_owned(),
+                        ),
+                        // Null = "no page chosen"; a set value is the chosen Page's object id.
+                        default: Value::Null,
+                        widget: WidgetKind::EntityRef {
+                            entity: "page".to_owned(),
+                        },
+                        visible_when: Some(Condition {
+                            key: "reading.show_on_front".to_owned(),
+                            equals: Value::String("page".to_owned()),
+                        }),
+                    },
                     Field {
                         key: "reading.posts_per_page".to_owned(),
                         label: "Posts per page".to_owned(),

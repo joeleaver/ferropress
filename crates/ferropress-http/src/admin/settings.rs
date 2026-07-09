@@ -19,19 +19,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use ferropress_core::role::Capability;
-use ferropress_render_form::{FormSchema, schema_for_settings};
+use ferropress_render_form::{FormSchema, SettingRefs, schema_for_settings};
 
+use super::setting_refs::build_settings_dto;
 use super::setting_store::upsert_setting;
 use super::{AdminError, AdminJson, AuthedUser};
 use crate::AppState;
 
-/// `GET`/`PUT` response: the declarative schema plus the current value for every
-/// key (defaults overlaid with whatever is stored). Returning both on write lets
-/// the client re-sync from one round-trip.
+/// `GET`/`PUT` response: the declarative schema, the current value for every key
+/// (defaults overlaid with whatever is stored), and the resolved `refs` the
+/// id-valued widgets (`MediaPicker`/`EntityRef`) need to render (see
+/// [`SettingRefs`]). Returning all three on write lets the client re-sync from one
+/// round-trip. `refs` is empty for a schema that uses neither widget.
 #[derive(Serialize)]
 pub struct SettingsDto {
     pub schema: FormSchema,
     pub values: serde_json::Map<String, JsonValue>,
+    pub refs: SettingRefs,
 }
 
 /// `PUT` body: a sparse map of `key -> value` edits. Unknown keys are ignored (the
@@ -50,7 +54,7 @@ pub async fn get(
     who.require(Capability::ManageSettings)?;
     let schema = schema_for_settings();
     let values = read_values(&state).await?;
-    Ok(Json(SettingsDto { schema, values }))
+    Ok(Json(build_settings_dto(&state, schema, values).await?))
 }
 
 /// `PUT /admin/api/settings` — validate a submission against the schema and persist
@@ -80,7 +84,7 @@ pub async fn put(
     }
 
     let values = read_values(&state).await?;
-    Ok(Json(SettingsDto { schema, values }))
+    Ok(Json(build_settings_dto(&state, schema, values).await?))
 }
 
 /// The current value for every schema key: the schema defaults overlaid with any

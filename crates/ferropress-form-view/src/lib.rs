@@ -21,4 +21,4 @@ mod values;
 mod view;
 
 pub use values::FormValues;
-pub use view::SchemaForm;
+pub use view::{MediaChosen, OnPickMedia, SchemaForm};

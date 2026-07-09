@@ -198,6 +198,33 @@ async fn seed_media(store: &Arc<dyn RhypeStore>, uuid: &str) -> ObjectId {
         .expect("seed media")
 }
 
+/// Link a media row's `uploaded_by` to a user (mirrors the upload handler's edge), so
+/// a test can exercise the media library's authorship scoping.
+async fn link_uploader(store: &Arc<dyn RhypeStore>, media_id: ObjectId, user_id: ObjectId) {
+    let edge = Edge {
+        type_name: TypeName::from(MEDIA_TYPE),
+        id: media_id,
+        field: "uploaded_by".to_owned(),
+    };
+    store
+        .link(&edge, user_id, FieldMap::new())
+        .await
+        .expect("link uploaded_by");
+}
+
+/// GET /admin/api/media with a cookie; return (status, body json).
+async fn do_media_list(state: &AppState, cookie: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/api/media")
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
 /// POST /admin/api/posts (create) with the given cookie + JSON body; return
 /// (status, body json).
 async fn do_create(
@@ -2250,4 +2277,52 @@ async fn plugin_config_requires_manage_plugins_capability() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "put gated on ManagePlugins");
+}
+
+/// The media library is authorship-scoped like the post list: an Author sees only the
+/// media they uploaded, while an Editor (`EditOthersContent`) sees the whole library.
+#[tokio::test]
+async fn media_list_is_scoped_to_the_uploader_for_authors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+
+    let author_a = seed_user(&store, "aya", "passwordpassword", "author").await;
+    let author_b = seed_user(&store, "ben", "passwordpassword", "author").await;
+    seed_user(&store, "edi", "passwordpassword", "editor").await;
+
+    let media_a = seed_media(&store, "aaaaaaaa").await;
+    let media_b = seed_media(&store, "bbbbbbbb").await;
+    link_uploader(&store, media_a, author_a).await;
+    link_uploader(&store, media_b, author_b).await;
+
+    // Author A sees ONLY their own upload.
+    let (_, cookie_a, _) = do_login(&state, "aya", "passwordpassword").await;
+    let (status, body) = do_media_list(&state, &session_pair(&cookie_a.unwrap())).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<u64> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![media_a.0],
+        "an author must see only their own uploaded media"
+    );
+
+    // The editor sees the WHOLE library.
+    let (_, cookie_e, _) = do_login(&state, "edi", "passwordpassword").await;
+    let (status, body) = do_media_list(&state, &session_pair(&cookie_e.unwrap())).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut ids: Vec<u64> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_u64().unwrap())
+        .collect();
+    ids.sort_unstable();
+    let mut want = vec![media_a.0, media_b.0];
+    want.sort_unstable();
+    assert_eq!(ids, want, "an editor must see the whole media library");
 }

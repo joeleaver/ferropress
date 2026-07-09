@@ -307,6 +307,39 @@ pub async fn upload_media(form: FormData) -> Result<UploadResponse, ApiError> {
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
+/// One row of `GET /admin/api/media` — the media library, for the picker grid. `url`
+/// (`/media/{uuid}`) is the thumbnail src; `id` is the Media handle a picker writes
+/// back into a `MediaPicker` value. (`Default` exists only to satisfy the rinch
+/// `#[component]` macro — `MediaCell` takes a `MediaSummary` prop.)
+#[derive(Clone, PartialEq, Default, Deserialize)]
+pub struct MediaSummary {
+    pub id: u64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub alt: String,
+    #[serde(default)]
+    pub uploaded_at: Option<i64>,
+}
+
+/// `GET /admin/api/media` — the media library, newest first (Author+; a 401 routes
+/// back to login, a 403 surfaces as a message).
+pub async fn list_media() -> Result<Vec<MediaSummary>, ApiError> {
+    let resp = Request::get("/admin/api/media")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<Vec<MediaSummary>>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
 /// `GET`/`PUT /admin/api/settings` response: the declarative schema (rendered by
 /// `ferropress-form-view`) + the current `key -> value` map. `FormSchema` is the
 /// shared rinch-free type from `ferropress-render-form`.
@@ -316,6 +349,10 @@ pub struct SettingsDto {
     pub schema: ferropress_render_form::FormSchema,
     #[serde(default)]
     pub values: serde_json::Map<String, serde_json::Value>,
+    /// Resolved references the id-valued widgets need to render: `EntityRef` dropdown
+    /// options + `MediaPicker` thumbnail URLs. Empty for a schema that uses neither.
+    #[serde(default)]
+    pub refs: ferropress_render_form::SettingRefs,
 }
 
 /// `PUT /admin/api/settings` body — a sparse map of edits (the server whitelists to

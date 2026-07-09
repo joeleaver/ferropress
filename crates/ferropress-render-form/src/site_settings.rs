@@ -40,6 +40,18 @@ pub struct SiteSettings {
     pub feed_items: u32,
     pub timezone: String,
     pub date_format: String,
+    /// The object id of the `Page` to show as the front page, or `None` for the
+    /// latest-posts galley. Resolved from `reading.show_on_front` + `reading.page_on_front`:
+    /// only `Some` when the author picked "A static page" *and* named one. The serve
+    /// layer still checks the page is published before rendering it (a dangling or
+    /// unpublished id falls back to the galley).
+    pub front_page_id: Option<u64>,
+    /// The `/media/{uuid}` URL of the site logo, or `None`. Unlike every other field,
+    /// this is NOT projected from the values map — `site.logo` stores a media object
+    /// id, and resolving it to a URL needs a store lookup. [`from_values`](Self::from_values)
+    /// leaves it `None`; the serve layer ([`ferropress_serve::load_site_settings`])
+    /// fills it after resolving the id. The theme reads it directly for the masthead.
+    pub logo_url: Option<String>,
 }
 
 impl SiteSettings {
@@ -70,6 +82,14 @@ impl SiteSettings {
             choice
         };
 
+        // A static front page only applies when "A static page" is selected AND a
+        // page id is stored; otherwise the front page is the latest-posts galley.
+        let front_page_id = if string("reading.show_on_front").as_deref() == Some("page") {
+            values.get("reading.page_on_front").and_then(Value::as_u64)
+        } else {
+            None
+        };
+
         SiteSettings {
             title: string("site.title").unwrap_or_default(),
             tagline: string("site.tagline").unwrap_or_default(),
@@ -80,6 +100,10 @@ impl SiteSettings {
             feed_items: count("reading.feed_items", 10),
             timezone: string("site.timezone").unwrap_or_else(|| "UTC".to_owned()),
             date_format,
+            front_page_id,
+            // Not projectable from the values map (a store lookup on the id); the
+            // serve layer fills it. See the field doc.
+            logo_url: None,
         }
     }
 
@@ -162,6 +186,42 @@ mod tests {
         blank.insert("site.date_format".into(), json!("custom"));
         blank.insert("site.date_format_custom".into(), json!("   "));
         assert_eq!(SiteSettings::from_values(&blank).date_format, "F j, Y");
+    }
+
+    #[test]
+    fn front_page_id_resolves_only_when_static_page_selected() {
+        // Default: latest posts, no static front page.
+        assert_eq!(SiteSettings::defaults().front_page_id, None);
+
+        // A page id is stored but "latest posts" is selected → still the galley.
+        let mut latest = Map::new();
+        latest.insert("reading.show_on_front".into(), json!("posts"));
+        latest.insert("reading.page_on_front".into(), json!(42));
+        assert_eq!(SiteSettings::from_values(&latest).front_page_id, None);
+
+        // "A static page" selected with an id → that page.
+        let mut static_page = Map::new();
+        static_page.insert("reading.show_on_front".into(), json!("page"));
+        static_page.insert("reading.page_on_front".into(), json!(42));
+        assert_eq!(
+            SiteSettings::from_values(&static_page).front_page_id,
+            Some(42)
+        );
+
+        // "A static page" selected but no page chosen (null) → galley fallback.
+        let mut unset = Map::new();
+        unset.insert("reading.show_on_front".into(), json!("page"));
+        unset.insert("reading.page_on_front".into(), Value::Null);
+        assert_eq!(SiteSettings::from_values(&unset).front_page_id, None);
+    }
+
+    #[test]
+    fn logo_url_is_not_projected_from_values() {
+        // `site.logo` stores an id; resolving it to a URL is the serve layer's job,
+        // so from_values always leaves logo_url None (never reads the id as a URL).
+        let mut m = Map::new();
+        m.insert("site.logo".into(), json!(7));
+        assert_eq!(SiteSettings::from_values(&m).logo_url, None);
     }
 
     #[test]

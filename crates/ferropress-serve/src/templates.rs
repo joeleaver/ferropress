@@ -78,6 +78,9 @@ a { color: inherit; }
   font-size: clamp(2rem, 6vw, 3.1rem); line-height: 1; letter-spacing: .04em;
   text-transform: uppercase; color: var(--ink); margin: 0; text-decoration: none; display: inline-block; }
 .nameplate:hover { color: var(--minium-deep); }
+.nameplate--logo { padding: 0; line-height: 0; }
+.nameplate--logo img { display: block; width: auto; height: auto;
+  max-height: 4.5rem; max-width: min(100%, 22rem); }
 .tagline { font-family: var(--ff-mono); font-size: .74rem; letter-spacing: .26em;
   text-transform: uppercase; color: var(--steel); margin: .85rem 0 0; }
 .tagline::before, .tagline::after { content: "—"; margin: 0 .6rem; color: var(--steel-2); }
@@ -186,8 +189,9 @@ main { padding: 2.4rem 0 3rem; }
     <div class="masthead__mark" aria-hidden="true">
       <span class="regmark"><svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="6.2" stroke="currentColor" stroke-width="1.4"/><path d="M10 0v6.2M10 13.8V20M0 10h6.2M13.8 10H20" stroke="currentColor" stroke-width="1.4"/></svg></span>
     </div>
-    <a href="/" class="nameplate">{{ site.title }}</a>
-    {% if site.tagline %}<p class="tagline">{{ site.tagline }}</p>{% endif %}
+    {% if site.logo %}<a href="/" class="nameplate nameplate--logo"><img src="{{ site.logo }}" alt="{{ site.title }}"></a>
+    {% else %}<a href="/" class="nameplate">{{ site.title }}</a>
+    {% endif %}{% if site.tagline %}<p class="tagline">{{ site.tagline }}</p>{% endif %}
     <nav class="mastnav" aria-label="Primary">
       <a href="/" {% if is_home %}aria-current="page"{% endif %}>Front page</a>
       <div id="fp-search"></div>

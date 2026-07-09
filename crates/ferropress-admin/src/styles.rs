@@ -358,6 +358,49 @@ const ADMIN_CSS: &str = r#"
 .radio { display: inline-flex; align-items: center; gap: .6rem; cursor: pointer; font-size: .95rem; color: var(--ink-2); }
 .radio input { accent-color: var(--minium); width: 1rem; height: 1rem; margin: 0; }
 
+.fp-admin .is-hidden { display: none !important; }
+
+/* MediaPicker widget — a proof thumbnail + Choose/Replace/Remove (mirrors the
+   editor's featured control at a larger size). */
+.mediapick { display: inline-flex; align-items: center; gap: .9rem; flex-wrap: wrap; }
+.mediapick__thumb { width: 72px; height: 72px; object-fit: cover; display: block;
+  border: 1px solid var(--rule); border-radius: 2px; background: var(--paper-sink); }
+.mediapick__thumb.is-empty { display: grid; place-items: center; border-style: dashed;
+  border-color: #C6C7C0; color: var(--steel-2); font-size: 1.4rem; }
+.mediapick__actions { display: inline-flex; align-items: center; gap: .4rem; }
+
+/* Media library modal — a paper plate over an ink scrim, ruled like a forms drawer. */
+.media-modal { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center;
+  padding: 2rem; background: rgba(23,25,28,.55); }
+.media-modal__plate { width: 100%; max-width: 46rem; max-height: 82vh; display: flex;
+  flex-direction: column; background: var(--paper-raise); border: 1px solid var(--rule);
+  border-radius: var(--radius); box-shadow: 0 24px 60px -18px rgba(0,0,0,.55); }
+.media-modal__head { display: flex; align-items: baseline; justify-content: space-between;
+  gap: 1rem; padding: 1.2rem 1.4rem .7rem; border-bottom: 2px solid var(--ink); }
+.media-modal__title { font-family: var(--ff-display); font-weight: 600; font-size: 1.3rem;
+  color: var(--ink); margin: 0; }
+.media-modal__sub { font-family: var(--ff-mono); font-size: .72rem; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--steel); }
+.media-modal__body { padding: 1.2rem 1.4rem; overflow: auto; }
+.media-modal__foot { display: flex; align-items: center; justify-content: flex-end;
+  gap: .6rem; padding: .9rem 1.4rem; border-top: 1px solid var(--rule); }
+.media-modal__state { padding: 2.4rem .25rem; text-align: center; font-family: var(--ff-mono);
+  font-size: .8rem; letter-spacing: .08em; text-transform: uppercase; color: var(--steel-2); }
+.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); gap: .9rem; }
+.media-cell { display: flex; flex-direction: column; gap: .4rem; padding: .5rem;
+  background: var(--paper); border: 1px solid var(--rule); border-radius: var(--radius);
+  text-align: left; color: inherit; transition: border-color .12s, background .12s; }
+.media-cell:hover { border-color: var(--minium); background: var(--paper-raise); }
+.media-cell__thumb { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block;
+  border: 1px solid var(--rule); border-radius: 2px; background: var(--paper-sink); }
+.media-cell__name { font-family: var(--ff-mono); font-size: .72rem; color: var(--steel);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.media-cell--upload { align-items: center; justify-content: center; gap: .5rem;
+  border-style: dashed; border-color: #C6B27A; color: var(--ochre); min-height: 100%;
+  font-family: var(--ff-mono); font-size: .78rem; letter-spacing: .06em; text-transform: uppercase; }
+.media-cell--upload:hover { border-color: var(--minium); color: var(--minium-deep); background: var(--paper-raise); }
+.media-cell--upload .plus { font-size: 1.6rem; line-height: 1; }
+
 @media (max-width: 640px) {
   .row { grid-template-columns: 36px 1fr auto; }
   .row__time, .row__edit { display: none; }

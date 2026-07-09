@@ -23,9 +23,45 @@ use std::rc::Rc;
 use rinch::prelude::*;
 use serde_json::Value;
 
-use ferropress_render_form::{Field, FormSchema, FormSection, TextFormat, WidgetKind};
+use ferropress_render_form::{Field, FormSchema, FormSection, SettingRefs, TextFormat, WidgetKind};
 
 use crate::values::FormValues;
+
+/// The sink the host invokes with a picked media's `(object id, /media/{uuid} URL)`.
+pub type MediaChosen = Rc<dyn Fn(u64, String)>;
+
+/// A host-provided media picker. The `MediaPicker` widget can't open a file dialog or
+/// upload — this crate is deliberately free of `web-sys`/`gloo-net` (see the crate
+/// doc) — so the admin supplies this: given a [`MediaChosen`] sink, it opens its
+/// picker (library + upload) and calls the sink with the chosen media's id + URL.
+/// Threading it as a prop is what keeps form-view a pure DOM projection.
+///
+/// It is a plain struct — not a bare `Rc<dyn Fn>` and never wrapped in `Option` as a
+/// prop — because `rsx!` routes both callable and `Option<_>` prop values through an
+/// event-handler coercion that recurses without terminating. A default (no-op) picker
+/// stands in for "no host picker" so the prop can stay a non-`Option` struct.
+#[derive(Clone)]
+pub struct OnPickMedia(Rc<dyn Fn(MediaChosen)>);
+
+impl OnPickMedia {
+    /// Wrap a picker closure (called with the field's sink when the user clicks Choose).
+    pub fn new(open_picker: impl Fn(MediaChosen) + 'static) -> Self {
+        Self(Rc::new(open_picker))
+    }
+
+    /// Open the picker for `sink` (invoked by the `MediaPicker` widget on Choose).
+    fn open(&self, sink: MediaChosen) {
+        (self.0)(sink)
+    }
+}
+
+impl Default for OnPickMedia {
+    /// A no-op picker: the `MediaPicker` "Choose" button does nothing. Used when a form
+    /// is mounted without a host picker (a test, or a schema that has no `MediaPicker`).
+    fn default() -> Self {
+        Self(Rc::new(|_sink| {}))
+    }
+}
 
 /// Shared context handed to every field row.
 #[derive(Clone, Default)]
@@ -35,6 +71,13 @@ struct FormContext {
     /// One reactive `Signal<Value>` per field key, mirroring the live value so the
     /// reactive controls can track it without re-rendering text inputs.
     states: Rc<HashMap<String, Signal<Value>>>,
+    /// Resolved references for the id-valued widgets: `EntityRef` dropdown options
+    /// and `MediaPicker` thumbnail URLs (see [`SettingRefs`]).
+    refs: Rc<SettingRefs>,
+    /// The host's media picker; drives the `MediaPicker` "Choose" button (a no-op
+    /// default when the host provides none). NOT named `on_*` — `rsx!` treats any
+    /// `on*` prop as an event handler and mis-coerces it.
+    media_picker: OnPickMedia,
 }
 
 /// Build a 0-or-1 `Vec<NodeHandle>` from an optional string + a node builder — the
@@ -44,10 +87,18 @@ fn opt_node(value: Option<String>, build: impl FnOnce(String) -> NodeHandle) -> 
     value.map(build).into_iter().collect()
 }
 
-/// Render a whole declarative form. Mount this in the admin SPA with the schema +
-/// current values from `GET /admin/api/settings`; read `values.snapshot()` on Save.
+/// Render a whole declarative form. Mount this in the admin SPA with the schema,
+/// current values, and resolved `refs` from `GET /admin/api/settings`; read
+/// `values.snapshot()` on Save. `on_pick_media` wires the `MediaPicker` widget to the
+/// host's file-dialog + upload + library modal (see [`OnPickMedia`]); pass `None`
+/// when a schema uses no `MediaPicker` (the button then no-ops).
 #[component]
-pub fn SchemaForm(schema: FormSchema, values: FormValues) -> NodeHandle {
+pub fn SchemaForm(
+    schema: FormSchema,
+    values: FormValues,
+    refs: SettingRefs,
+    media_picker: OnPickMedia,
+) -> NodeHandle {
     // One reactive state signal per field, seeded from the current value. Created at
     // build time (a component body is a reactive scope). Drives radio/toggle checked
     // and visible_when WITHOUT making text inputs reactive.
@@ -58,6 +109,8 @@ pub fn SchemaForm(schema: FormSchema, values: FormValues) -> NodeHandle {
     let ctx = FormContext {
         values,
         states: Rc::new(states),
+        refs: Rc::new(refs),
+        media_picker,
     };
 
     rsx! {
@@ -281,8 +334,83 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 }
             }
         }
-        // Forward-declared widgets not wired into the settings surface yet.
-        WidgetKind::MediaPicker | WidgetKind::EntityRef { .. } | WidgetKind::BlockEditor => {
+        // Picks a Media object id: a thumbnail of the current selection (resolved via
+        // `refs.media`) plus Choose/Replace/Remove. The dialog + upload + library live
+        // in the host (via `on_pick_media`); this widget only shows + writes the id.
+        WidgetKind::MediaPicker => {
+            // The current selection's thumbnail URL, empty when unset (an `Option` prop
+            // trips the rsx event-handler coercion, so "" stands in for "no thumbnail").
+            let initial_url = state
+                .get()
+                .as_u64()
+                .and_then(|id| ctx.refs.media_url(id))
+                .map(str::to_owned)
+                .unwrap_or_default();
+            rsx! {
+                MediaField {
+                    field_key: field.key.clone(),
+                    state: state,
+                    values: ctx.values.clone(),
+                    initial_url: initial_url,
+                    media_picker: ctx.media_picker.clone(),
+                }
+            }
+        }
+        // Picks an object id of a named entity (a `Page` today) from a dropdown of the
+        // candidates the server resolved into `refs.entity_options`. Stores a `u64` id
+        // or null (the empty option) — the shape `WidgetKind::coerce` validates.
+        WidgetKind::EntityRef { entity } => {
+            let key = field.key.clone();
+            let values = ctx.values.clone();
+            let options = ctx.refs.options_for(&entity);
+            let current_id = state.get().as_u64();
+            let current_key = current_id.map(|id| id.to_string()).unwrap_or_default();
+
+            // (value, label) entries: a placeholder for "none", each candidate, and —
+            // if the stored id is no longer a candidate (e.g. a page since unpublished)
+            // — the stored id itself, so the control still reflects the real value.
+            let mut entries: Vec<(String, String)> = Vec::with_capacity(options.len() + 2);
+            entries.push((String::new(), "\u{2014} Select a page \u{2014}".to_owned()));
+            for o in options {
+                entries.push((o.id.to_string(), o.label.clone()));
+            }
+            if let Some(id) = current_id
+                && !options.iter().any(|o| o.id == id)
+            {
+                entries.push((id.to_string(), format!("Page #{id} (not published)")));
+            }
+            // Current-first so the uncontrolled <select> shows the stored value (rinch
+            // emits `selected` even when false, so ordering — not a per-option attr —
+            // marks the selection; mirrors the `Select` arm).
+            if let Some(pos) = entries.iter().position(|(v, _)| *v == current_key) {
+                let cur = entries.remove(pos);
+                entries.insert(0, cur);
+            }
+            let opts: Vec<NodeHandle> = entries
+                .into_iter()
+                .map(|(v, l)| rsx! { option { value: v, {l} } })
+                .collect();
+            rsx! {
+                select {
+                    class: "select",
+                    oninput: move |v: String| {
+                        // Empty option → null; else parse the id (a malformed value
+                        // can't occur from our own options, but fall back to null).
+                        let val = if v.is_empty() {
+                            Value::Null
+                        } else {
+                            v.parse::<u64>().ok().map(Value::from).unwrap_or(Value::Null)
+                        };
+                        state.set(val.clone());
+                        values.set(&key, val);
+                    },
+                    {opts}
+                }
+            }
+        }
+        // The rich block-tree body editor isn't mounted through this form (the post
+        // editor mounts the rinch editor directly).
+        WidgetKind::BlockEditor => {
             rsx! { p { class: "setrow__help", "This field type isn\u{2019}t editable here yet." } }
         }
     };
@@ -349,6 +477,110 @@ fn RadioOption(
                 },
             }
             {label}
+        }
+    }
+}
+
+/// The `MediaPicker` control: a thumbnail of the current selection (or a neutral
+/// placeholder) plus Choose/Replace + Remove. Its own component so its click handlers
+/// can OWN their non-`Copy` captures (`values`, the field key, the host callback) —
+/// the component body runs once, so each is moved into exactly one handler, while the
+/// reactive bits (thumbnail visibility + button labels) read only the `Copy` `thumb`
+/// signal (mirroring how [`RadioOption`] isolates its captures).
+///
+/// The stored VALUE is the media object id; `thumb` is the local view of its URL,
+/// seeded from the server-resolved `refs` and updated when the host reports a pick.
+/// All browser work (file dialog, upload, library) is the host's, reached through
+/// [`OnPickMedia`] — this widget only shows the selection and writes the id.
+#[component]
+fn MediaField(
+    field_key: String,
+    state: Signal<Value>,
+    values: FormValues,
+    initial_url: String,
+    media_picker: OnPickMedia,
+) -> NodeHandle {
+    // Local reactive view of the selected media's URL (`None` = unset). A Copy signal,
+    // so the reactive class/src/label closures below read it without moving anything.
+    let thumb = Signal::new(if initial_url.is_empty() {
+        None
+    } else {
+        Some(initial_url)
+    });
+
+    // The sink the host calls after a pick: write the id into both the live value map
+    // and this field's state signal, and show the new thumbnail.
+    let chosen: MediaChosen = {
+        let values = values.clone();
+        let key = field_key.clone();
+        Rc::new(move |id: u64, url: String| {
+            let val = Value::from(id);
+            state.set(val.clone());
+            values.set(&key, val);
+            thumb.set(Some(url));
+        })
+    };
+
+    // Choose/Replace: hand the host our sink; it opens its picker and calls back (the
+    // default picker is a no-op, so this is safe even with no host picker).
+    let choose = move || media_picker.open(chosen.clone());
+
+    // Remove: clear the value + state + thumbnail (a null id = "no media").
+    let remove = {
+        let values = values.clone();
+        let key = field_key.clone();
+        move || {
+            state.set(Value::Null);
+            values.set(&key, Value::Null);
+            thumb.set(None);
+        }
+    };
+
+    rsx! {
+        div { class: "mediapick",
+            // Placeholder (shown when unset) and thumbnail (shown when set) are both
+            // present; a reactive class toggles which is visible, so there is never a
+            // broken <img> with an empty src.
+            span {
+                class: {
+                    move || if thumb.get().is_some() {
+                        "mediapick__thumb is-hidden"
+                    } else {
+                        "mediapick__thumb is-empty"
+                    }
+                },
+                "\u{2295}"
+            }
+            img {
+                class: {
+                    move || if thumb.get().is_some() {
+                        "mediapick__thumb"
+                    } else {
+                        "mediapick__thumb is-hidden"
+                    }
+                },
+                src: { move || thumb.get().unwrap_or_default() },
+                alt: "",
+            }
+            div { class: "mediapick__actions",
+                button {
+                    class: "btn btn--ghost", style: "width:auto",
+                    onclick: choose,
+                    { move || if thumb.get().is_some() { "Replace\u{2026}" } else { "Choose image\u{2026}" } }
+                }
+                button {
+                    class: {
+                        move || if thumb.get().is_some() {
+                            "btn btn--quiet"
+                        } else {
+                            "btn btn--quiet is-hidden"
+                        }
+                    },
+                    style: "width:auto",
+                    onclick: remove,
+                    "Remove"
+                }
+            }
         }
     }
 }

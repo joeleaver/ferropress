@@ -139,13 +139,10 @@ pub async fn resolve_path(
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
-        return match render_home(store, theme, settings).await {
-            Ok(html) => Resolved::Found(html),
-            Err(e) => Resolved::Error(e),
-        };
+        return front_page(store, theme, custom, settings).await;
     }
     match build_page(store, custom, path).await {
-        Ok(Some(page)) => match compose_single(theme, settings, &page, None) {
+        Ok(Some(page)) => match compose_single(theme, settings, &page, false, None) {
             Ok(html) => Resolved::Found(html),
             Err(e) => Resolved::Error(e),
         },
@@ -179,13 +176,10 @@ pub async fn serve_path(
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
-        // The front page is composed live from the current post set + settings;
-        // it is not blob-cached in v1 (a later increment can cache + invalidate it
-        // on the same change feed).
-        return match render_home(store, theme, settings).await {
-            Ok(html) => Resolved::Found(html),
-            Err(e) => Resolved::Error(e),
-        };
+        // The front page is composed live from the current settings (a static page or
+        // the post galley); it is not blob-cached in v1 (a later increment can cache +
+        // invalidate it on the same change feed).
+        return front_page(store, theme, custom, settings).await;
     }
 
     let key = cache_key(path);
@@ -196,7 +190,7 @@ pub async fn serve_path(
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedPage>(&bytes) {
             Ok(page) => {
-                return match compose_single(theme, settings, &page, None) {
+                return match compose_single(theme, settings, &page, false, None) {
                     Ok(html) => Resolved::Found(html),
                     Err(e) => Resolved::Error(e),
                 };
@@ -231,7 +225,7 @@ pub async fn serve_path(
                     tracing::warn!(%path, error = %e, "could not serialize page envelope for the cache; serving uncached render");
                 }
             }
-            match compose_single(theme, settings, &page, None) {
+            match compose_single(theme, settings, &page, false, None) {
                 Ok(html) => Resolved::Found(html),
                 Err(e) => Resolved::Error(e),
             }
@@ -288,7 +282,7 @@ pub async fn render_preview(
 ) -> Resolved {
     let label = status_label(obj);
     match cached_page_from_object(store, custom, RenderMode::Preview, type_name, obj).await {
-        Ok(page) => match compose_single(theme, settings, &page, Some(&label)) {
+        Ok(page) => match compose_single(theme, settings, &page, false, Some(&label)) {
             Ok(html) => Resolved::Found(html),
             Err(e) => Resolved::Error(e),
         },
@@ -368,6 +362,10 @@ pub(crate) async fn cached_page_from_object(
 /// Compose the final single-page HTML: frame the cached envelope in chrome, with
 /// the dateline formatted live per `settings.date_format` + `settings.timezone`.
 ///
+/// `is_home` is `true` only when this page is standing in as the static front page
+/// (the masthead marks the Front-page nav link current); an ordinary permalink or
+/// preview passes `false`.
+///
 /// `preview_status` distinguishes the two callers: `None` is the ordinary public
 /// render; `Some(label)` is the authenticated draft preview, which surfaces the
 /// preview banner (the template reads `preview_status`) and forces `noindex`
@@ -377,6 +375,7 @@ fn compose_single(
     theme: &ThemeEngine,
     settings: &SiteSettings,
     page: &CachedPage,
+    is_home: bool,
     preview_status: Option<&str>,
 ) -> Result<String, CoreError> {
     let dateline = page
@@ -401,7 +400,7 @@ fn compose_single(
         page_description: meta_description(page),
         canonical: page.seo.as_ref().and_then(|s| s.canonical_url.as_deref()),
         site,
-        is_home: false,
+        is_home,
         preview_status,
         title: &page.title,
         dateline,
@@ -417,6 +416,65 @@ fn compose_single(
         // ThemeError does not convert to CoreError; carry its message so the HTTP
         // layer can log it and return a generic 500.
         .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
+}
+
+/// Resolve the site root: a configured static front page if one is set (and
+/// published), otherwise the latest-posts galley. Shared by both read paths
+/// ([`resolve_path`] + [`serve_path`]) so the empty-slug decision lives in one place.
+///
+/// A configured static page that is missing / unpublished / trashed FALLS BACK to the
+/// galley rather than 404ing or leaking an unpublished page — the front page is never
+/// a dead end.
+async fn front_page(
+    store: &Arc<dyn RhypeStore>,
+    theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
+    settings: &SiteSettings,
+) -> Resolved {
+    if let Some(page_id) = settings.front_page_id {
+        match render_static_front_page(store, theme, custom, settings, page_id).await {
+            Ok(Some(html)) => return Resolved::Found(html),
+            // Missing / unpublished target — fall through to the galley below.
+            Ok(None) => {}
+            Err(e) => return Resolved::Error(e),
+        }
+    }
+    match render_home(store, theme, settings).await {
+        Ok(html) => Resolved::Found(html),
+        Err(e) => Resolved::Error(e),
+    }
+}
+
+/// Render a specific published `Page` as the static front page, reusing the exact
+/// single-page pipeline ([`cached_page_from_object`] + [`compose_single`]) so the body
+/// is byte-for-byte what the page's own permalink shows — only the chrome differs
+/// (`is_home` marks the Front-page nav link current). `Ok(None)` means "no such
+/// published page" (a dangling id, or one that has since been unpublished/trashed), so
+/// the caller can fall back to the galley.
+///
+/// The by-id lookup deliberately bypasses the slug publish gate (the id came from a
+/// trusted setting, not a public slug), so this re-checks [`is_published`] itself — an
+/// unpublished page must never surface publicly, even as the home page.
+async fn render_static_front_page(
+    store: &Arc<dyn RhypeStore>,
+    theme: &ThemeEngine,
+    custom: &dyn CustomBlockRenderer,
+    settings: &SiteSettings,
+    page_id: u64,
+) -> Result<Option<String>, CoreError> {
+    let obj = match store
+        .get(&TypeName::from(PAGE_TYPE), ObjectId(page_id))
+        .await
+    {
+        Ok(obj) => obj,
+        Err(CoreError::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !is_published(&obj) {
+        return Ok(None);
+    }
+    let page = cached_page_from_object(store, custom, RenderMode::Publish, PAGE_TYPE, &obj).await?;
+    Ok(Some(compose_single(theme, settings, &page, true, None)?))
 }
 
 /// Render the front-page galley: the most-recent published posts (up to
@@ -702,6 +760,9 @@ struct SiteCtx<'a> {
     title: &'a str,
     tagline: &'a str,
     url: &'a str,
+    /// The site logo's `/media/{uuid}` URL, if one is set — the masthead shows it in
+    /// place of the text title. Resolved live from the settings snapshot.
+    logo: Option<&'a str>,
     /// `true` when search-engine indexing is off → the chrome emits a `noindex`
     /// robots meta.
     noindex: bool,
@@ -713,6 +774,7 @@ impl<'a> From<&'a SiteSettings> for SiteCtx<'a> {
             title: s.title_or_default(),
             tagline: &s.tagline,
             url: &s.url,
+            logo: s.logo_url.as_deref(),
             noindex: !s.search_engine_visible,
         }
     }

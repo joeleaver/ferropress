@@ -111,6 +111,64 @@ async fn seed_setting(store: &Arc<dyn RhypeStore>, key: &str, json_encoded_value
         .expect("seeding a setting must succeed");
 }
 
+/// Seed one Page with the given slug + status + a single-paragraph body carrying
+/// `text`, so a test can tell the page's render apart from the galley. Returns its id.
+async fn seed_page(
+    store: &Arc<dyn RhypeStore>,
+    slug: &str,
+    status: Status,
+    text: &str,
+) -> ObjectId {
+    let tree = BlockTree::from_blocks(vec![Block {
+        uid: "01J0000000000000000000PAGE".to_owned(),
+        kind: BlockKind::Paragraph {
+            runs: vec![InlineRun {
+                text: text.to_owned(),
+                marks: Vec::new(),
+                href: None,
+            }],
+        },
+        children: Vec::new(),
+    }]);
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(status.as_str().to_owned()),
+    );
+    fields.insert(
+        "title".to_owned(),
+        Value::String("About the Press".to_owned()),
+    );
+    fields.insert(
+        "block_tree".to_owned(),
+        Value::Json(tree.to_json_value().expect("page block tree serializes")),
+    );
+    store
+        .create(&TypeName::from(PAGE_TYPE), fields)
+        .await
+        .expect("seeding a page must succeed")
+}
+
+/// Seed one Media row with the given uuid (a valid media token), enough for the logo
+/// resolution to map its id -> `/media/{uuid}`. Returns its id.
+async fn seed_media(store: &Arc<dyn RhypeStore>, uuid: &str) -> ObjectId {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("uuid".to_owned(), Value::String(uuid.to_owned()));
+    fields.insert(
+        "blob_key".to_owned(),
+        Value::String(format!("media/{uuid}.png")),
+    );
+    fields.insert(
+        "mime_type".to_owned(),
+        Value::String("image/png".to_owned()),
+    );
+    store
+        .create(&TypeName::from("Media"), fields)
+        .await
+        .expect("seeding a media must succeed")
+}
+
 /// A `Setting`-typed change, as the loop sees it on the feed.
 fn settings_change(kind: ChangeKind) -> Change {
     Change {
@@ -929,4 +987,124 @@ async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
         !blobs.exists(&key).await.unwrap(),
         "rendering a preview must never write the prerender cache"
     );
+}
+
+/// With a static front page configured (show_on_front = "page" + a published page id),
+/// the site root renders THAT page's body — not the latest-posts galley.
+#[tokio::test]
+async fn front_page_renders_configured_static_page() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, theme) = boot(tmp.path());
+
+    let page_id = seed_page(&store, "about", Status::Published, "About the Press body.").await;
+    // A published post too, so the galley would have content to render if we hit it.
+    seed_post(&store, "a-post", Status::Published).await;
+    seed_setting(&store, "reading.show_on_front", "\"page\"").await;
+    seed_setting(&store, "reading.page_on_front", &page_id.0.to_string()).await;
+
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+    assert_eq!(settings.front_page_id, Some(page_id.0));
+
+    match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, "/").await {
+        crate::Resolved::Found(html) => {
+            assert!(
+                html.contains("About the Press body."),
+                "the front page must render the static page's body; was:\n{html}"
+            );
+            assert!(
+                !html.contains("Latest from the galley"),
+                "a static front page must NOT show the posts galley"
+            );
+        }
+        other => panic!("expected Found rendering the static front page, got {other:?}"),
+    }
+}
+
+/// A configured static front page that is NOT published (draft/pending/…) must never
+/// render publicly — the site root falls back to the latest-posts galley instead.
+#[tokio::test]
+async fn front_page_falls_back_to_galley_for_unpublished_target() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, theme) = boot(tmp.path());
+
+    let page_id = seed_page(&store, "draft-home", Status::Draft, "Secret draft body.").await;
+    seed_post(&store, "a-post", Status::Published).await;
+    seed_setting(&store, "reading.show_on_front", "\"page\"").await;
+    seed_setting(&store, "reading.page_on_front", &page_id.0.to_string()).await;
+
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+    // The id is still resolved (from the setting), but rendering must gate on publish.
+    assert_eq!(settings.front_page_id, Some(page_id.0));
+
+    match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, "/").await {
+        crate::Resolved::Found(html) => {
+            assert!(
+                !html.contains("Secret draft body."),
+                "an unpublished page must never render as the public front page; was:\n{html}"
+            );
+            assert!(
+                html.contains("Latest from the galley"),
+                "the front page must fall back to the galley when the target is unpublished"
+            );
+        }
+        other => panic!("expected Found (galley fallback), got {other:?}"),
+    }
+}
+
+/// `site.logo` (a Media object id) resolves to its `/media/{uuid}` URL on the typed
+/// settings, and the masthead renders it as an `<img>` in place of the text title.
+#[tokio::test]
+async fn logo_resolves_and_renders_in_masthead() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, theme) = boot(tmp.path());
+
+    let uuid = "0192abcd-0000-7000-8000-000000000001";
+    let media_id = seed_media(&store, uuid).await;
+    seed_post(&store, SLUG, Status::Published).await;
+    seed_setting(&store, "site.logo", &media_id.0.to_string()).await;
+
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+    assert_eq!(
+        settings.logo_url.as_deref(),
+        Some(format!("/media/{uuid}").as_str())
+    );
+
+    // The chrome (composed live from the settings) renders the logo image. The URL's
+    // slashes are HTML-entity-escaped by the theme's autoescape (`&#x2f;`, as for every
+    // other chrome URL — canonical, featured image), which the browser decodes back to
+    // `/`; assert on the logo variant + the (unescaped, hex-only) uuid instead.
+    match content::resolve_path(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &format!("/{SLUG}"),
+    )
+    .await
+    {
+        crate::Resolved::Found(html) => {
+            assert!(
+                html.contains("class=\"nameplate nameplate--logo\""),
+                "the masthead must use the logo nameplate variant; was:\n{html}"
+            );
+            assert!(
+                html.contains(uuid),
+                "the logo <img> must point at the media uuid; was:\n{html}"
+            );
+        }
+        other => panic!("expected Found, got {other:?}"),
+    }
+}
+
+/// A dangling `site.logo` id (no such Media) leaves the logo unset — the masthead
+/// falls back to the text title rather than emitting a broken image.
+#[tokio::test]
+async fn dangling_logo_id_falls_back_to_text_title() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, _theme) = boot(tmp.path());
+
+    // An id that no Media has.
+    seed_setting(&store, "site.logo", "999999").await;
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+    assert_eq!(settings.logo_url, None);
 }

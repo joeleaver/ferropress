@@ -15,8 +15,8 @@ use rinch_web::{Editor, EditorHandle, create_editor};
 use wasm_bindgen_futures::spawn_local;
 
 use ferropress_editor_bridge as bridge;
-use ferropress_form_view::{FormValues, SchemaForm};
-use ferropress_render_form::FormSchema;
+use ferropress_form_view::{FormValues, MediaChosen, OnPickMedia, SchemaForm};
+use ferropress_render_form::{FormSchema, SettingRefs};
 
 use crate::api::{self, PostSummary, UserDto};
 
@@ -32,7 +32,7 @@ enum View {
     Plugins,
 }
 
-/// Load state of the post list.
+/// Load state of a fetched list.
 #[derive(Clone, Copy, PartialEq)]
 enum Load {
     Loading,
@@ -115,6 +115,18 @@ pub fn app() -> NodeHandle {
     // What the settings form is currently editing (site vs a plugin), so its chrome,
     // load, and save target the right endpoint.
     let settings_target = Signal::new(SettingsTarget::Site);
+    // The resolved references for the form's id-valued widgets (EntityRef options +
+    // MediaPicker thumbnail URLs), set alongside the schema + values on load/save.
+    let settings_refs = Signal::new(SettingRefs::default());
+
+    // The media-library picker modal (opened by a MediaPicker "Choose" button).
+    // `media_pick_sink` holds the callback the active MediaPicker field handed us — it
+    // is invoked with the chosen media's (id, url); `media_pick_open` toggles the
+    // modal; the library list + its load-state feed the grid.
+    let media_pick_sink = Signal::new(Option::<MediaChosen>::None);
+    let media_pick_open = Signal::new(false);
+    let media_library = Signal::new(Vec::<api::MediaSummary>::new());
+    let media_library_state = Signal::new(Load::Loading);
 
     // Plugins view (Administrator only): the list of installed plugins.
     let plugins_list = Signal::new(Vec::<api::PluginDescriptor>::new());
@@ -126,6 +138,16 @@ pub fn app() -> NodeHandle {
         me_user,
         login_error,
     };
+
+    // The host media picker handed to every settings form: open the library modal and,
+    // on selection, invoke the field's sink with the chosen media. Held in a Signal
+    // (Copy) so the render closure captures it without moving the non-Copy value; the
+    // picker closure captures only Copy signals + the Copy auth bundle.
+    let on_pick_media = Signal::new(OnPickMedia::new(move |sink: MediaChosen| {
+        media_pick_sink.set(Some(sink));
+        media_pick_open.set(true);
+        load_media(media_library, media_library_state, auth);
+    }));
 
     // Boot: pick login vs list from the session cookie (`GET /admin/api/me`).
     spawn_local(async move {
@@ -246,7 +268,7 @@ pub fn app() -> NodeHandle {
                                 button {
                                     class: "btn btn--quiet",
                                     onclick: move || open_settings(
-                                        settings_load, settings_schema, settings_values,
+                                        settings_load, settings_schema, settings_values, settings_refs,
                                         settings_target, notice, view, auth,
                                     ),
                                     "Settings"
@@ -490,7 +512,7 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || save_settings(
-                                    settings_values, settings_saving, notice, toast,
+                                    settings_values, settings_refs, settings_saving, notice, toast,
                                     settings_target.get(), auth,
                                 ),
                                 {move || if settings_saving.get() { "Saving\u{2026}" } else { "Save changes" }}
@@ -525,7 +547,12 @@ pub fn app() -> NodeHandle {
                         // `match` (Rule 14) so it builds when the async GET resolves; the
                         // same `FormValues` handle is read back by Save.
                         match (settings_load.get(), settings_schema.get(), settings_values.get()) {
-                            (Load::Ready, Some(schema), Some(values)) => SchemaForm { schema: schema, values: values },
+                            (Load::Ready, Some(schema), Some(values)) => SchemaForm {
+                                schema: schema,
+                                values: values,
+                                refs: settings_refs.get(),
+                                media_picker: on_pick_media.get(),
+                            },
                             _ => span {},
                         }
                     }
@@ -581,7 +608,7 @@ pub fn app() -> NodeHandle {
                                             open_plugin_config(
                                                 id.clone(), name.clone(), settings_target,
                                                 settings_load, settings_schema, settings_values,
-                                                notice, view, auth,
+                                                settings_refs, notice, view, auth,
                                             );
                                         } else {
                                             notice.set(
@@ -605,10 +632,98 @@ pub fn app() -> NodeHandle {
                 },
             }
 
+            // The media-library picker modal (a MediaPicker "Choose" button opens it).
+            // A fixed overlay, mounted only while open AND on the Settings view (so a
+            // session-expiry or any navigation that flips the view also dismisses it —
+            // it can only ever be opened from the settings form). Inlined here (not a
+            // component) so its handlers capture the Copy `auth` bundle directly.
+            // Selecting an image invokes the field's sink + closes.
+            if media_pick_open.get() && matches!(view.get(), View::Settings) {
+                div { class: "media-modal",
+                    div { class: "media-modal__plate",
+                        div { class: "media-modal__head",
+                            h3 { class: "media-modal__title", "Media library" }
+                            span { class: "media-modal__sub", "choose an image" }
+                        }
+                        div { class: "media-modal__body",
+                            if matches!(media_library_state.get(), Load::Loading) {
+                                div { class: "media-modal__state", "Opening the drawer\u{2026}" }
+                            }
+                            if matches!(media_library_state.get(), Load::Error) {
+                                div { class: "media-modal__state", "The media library is unavailable right now." }
+                            }
+                            if matches!(media_library_state.get(), Load::Ready) {
+                                div { class: "media-grid",
+                                    button {
+                                        class: "media-cell media-cell--upload",
+                                        onclick: move || upload_via_picker(media_pick_sink, media_pick_open, notice, auth),
+                                        span { class: "plus", "\u{FF0B}" }
+                                        "Upload new"
+                                    }
+                                    for item in media_library.get() {
+                                        MediaCell {
+                                            key: item.id,
+                                            item: item,
+                                            sink: media_pick_sink,
+                                            open: media_pick_open,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "media-modal__foot",
+                            button {
+                                class: "btn btn--quiet", style: "width:auto",
+                                onclick: move || media_pick_open.set(false),
+                                "Cancel"
+                            }
+                        }
+                    }
+                }
+            }
+
             div { class: {move || if toast.get() { "toast is-shown" } else { "toast" }},
                 span { class: "regmark", style: "font-size:.85rem", "\u{2295}" }
                 "Saved"
             }
+        }
+    }
+}
+
+/// One thumbnail in the media-library grid. Its own component so its click handler can
+/// own the row's `id`/`url` (a reactive `for` body can't move a non-`Copy` value into
+/// a closure). Selecting it invokes the picker `sink` and closes the modal.
+#[component]
+fn MediaCell(
+    item: api::MediaSummary,
+    sink: Signal<Option<MediaChosen>>,
+    open: Signal<bool>,
+) -> NodeHandle {
+    let id = item.id;
+    let url = item.url.clone();
+    let thumb = item.url.clone();
+    let name = if item.filename.is_empty() {
+        format!("media #{id}")
+    } else {
+        item.filename.clone()
+    };
+    let title = if item.alt.is_empty() {
+        name.clone()
+    } else {
+        item.alt.clone()
+    };
+    rsx! {
+        button {
+            class: "media-cell",
+            title: title,
+            onclick: move || {
+                if let Some(chosen) = sink.get() {
+                    chosen(id, url.clone());
+                }
+                open.set(false);
+            },
+            img { class: "media-cell__thumb", src: thumb, alt: "" }
+            span { class: "media-cell__name", {name} }
         }
     }
 }
@@ -741,6 +856,7 @@ fn open_settings(
     load: Signal<Load>,
     schema: Signal<Option<FormSchema>>,
     values: Signal<Option<FormValues>>,
+    refs: Signal<SettingRefs>,
     target: Signal<SettingsTarget>,
     notice: Signal<String>,
     view: Signal<View>,
@@ -749,7 +865,7 @@ fn open_settings(
     notice.set(String::new());
     target.set(SettingsTarget::Site);
     view.set(View::Settings);
-    load_settings(load, schema, values, SettingsTarget::Site, auth);
+    load_settings(load, schema, values, refs, SettingsTarget::Site, auth);
 }
 
 /// Switch to the Settings view for a specific PLUGIN's config and (re)load it. Reuses
@@ -762,6 +878,7 @@ fn open_plugin_config(
     load: Signal<Load>,
     schema: Signal<Option<FormSchema>>,
     values: Signal<Option<FormValues>>,
+    refs: Signal<SettingRefs>,
     notice: Signal<String>,
     view: Signal<View>,
     auth: AuthCtx,
@@ -770,16 +887,18 @@ fn open_plugin_config(
     let t = SettingsTarget::Plugin { id, name };
     target.set(t.clone());
     view.set(View::Settings);
-    load_settings(load, schema, values, t, auth);
+    load_settings(load, schema, values, refs, t, auth);
 }
 
 /// Fetch the schema + current values for `target` (site or a plugin). On success
 /// stores the schema + a fresh `FormValues` handle (the live map the form writes and
 /// Save reads). A 401 routes back to login; any other failure shows the error state.
+#[allow(clippy::too_many_arguments)]
 fn load_settings(
     load: Signal<Load>,
     schema: Signal<Option<FormSchema>>,
     values: Signal<Option<FormValues>>,
+    refs: Signal<SettingRefs>,
     target: SettingsTarget,
     auth: AuthCtx,
 ) {
@@ -791,6 +910,9 @@ fn load_settings(
         };
         match result {
             Ok(dto) => {
+                // Set refs + schema BEFORE flipping to Ready so the form mounts with
+                // its picker options in place (the mount reads all three).
+                refs.set(dto.refs);
                 schema.set(Some(dto.schema));
                 values.set(Some(FormValues::new(dto.values)));
                 load.set(Load::Ready);
@@ -808,6 +930,7 @@ fn load_settings(
 #[allow(clippy::too_many_arguments)]
 fn save_settings(
     values: Signal<Option<FormValues>>,
+    refs: Signal<SettingRefs>,
     saving: Signal<bool>,
     notice: Signal<String>,
     toast: Signal<bool>,
@@ -832,7 +955,10 @@ fn save_settings(
         match result {
             Ok(dto) => {
                 // Re-seed from the server's normalized values so the form shows the
-                // authoritative result (a clamped number, a dropped unknown key).
+                // authoritative result (a clamped number, a dropped unknown key). Refs
+                // are re-seeded too (a newly-referenced media resolves its thumbnail);
+                // set refs before values so the re-mount has them.
+                refs.set(dto.refs);
                 values.set(Some(FormValues::new(dto.values)));
                 toast.set(true);
                 TimeoutFuture::new(1600).await;
@@ -842,6 +968,87 @@ fn save_settings(
             Err(api::ApiError::Message(e)) => notice.set(e),
         }
     });
+}
+
+/// Fetch the media library into `library` for the picker grid. A 401 routes back to
+/// login; any other failure shows the modal's error state.
+fn load_media(library: Signal<Vec<api::MediaSummary>>, state: Signal<Load>, auth: AuthCtx) {
+    state.set(Load::Loading);
+    spawn_local(async move {
+        match api::list_media().await {
+            Ok(items) => {
+                library.set(items);
+                state.set(Load::Ready);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(_)) => state.set(Load::Error),
+        }
+    });
+}
+
+/// The media picker's "Upload new" tile: open the OS image picker, upload the file,
+/// and on success hand the new media to the picker `sink` and close the modal.
+///
+/// Like the editor's featured-image picker, the `<input type=file>` is created and
+/// `.click()`ed SYNCHRONOUSLY inside this trusted click handler (a file dialog must be
+/// opened within a user gesture); the upload runs async. The `sink` is captured up
+/// front, so even if the modal is later reused for another field, this upload's result
+/// lands on the field it was started for.
+fn upload_via_picker(
+    sink: Signal<Option<MediaChosen>>,
+    open: Signal<bool>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+
+    // Capture the active field's sink NOW, before any async work.
+    let Some(chosen) = sink.get() else {
+        return;
+    };
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(input) = document
+        .create_element("input")
+        .ok()
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    input.set_type("file");
+    let _ = input.set_attribute("accept", "image/*");
+
+    let picker = input.clone();
+    let on_change = Closure::<dyn FnMut()>::new(move || {
+        let Some(file) = picker.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        // A file was chosen — the picker's job is done, so close the modal NOW (not
+        // after the async upload). This keeps a slow upload from later tearing down a
+        // modal the user has since reopened for another field; the captured `chosen`
+        // still lands the result on the right field when the upload resolves.
+        open.set(false);
+        // Clone the sink into the async task (the outer closure is `FnMut`).
+        let chosen = chosen.clone();
+        spawn_local(async move {
+            let Ok(form) = web_sys::FormData::new() else {
+                notice.set("Your browser blocked the upload form.".to_owned());
+                return;
+            };
+            let _ = form.append_with_blob_and_filename("file", &file, &file.name());
+            let _ = form.append_with_str("alt", "");
+            match api::upload_media(form).await {
+                Ok(resp) => chosen(resp.id, resp.url),
+                Err(api::ApiError::Unauthorized) => auth.session_expired(),
+                Err(api::ApiError::Message(e)) => notice.set(format!("Upload failed: {e}")),
+            }
+        });
+    });
+    input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
+    on_change.forget();
+    input.click();
 }
 
 /// Open a post in the editor: fetch it, populate the meta fields, bridge its

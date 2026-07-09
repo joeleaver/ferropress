@@ -29,9 +29,9 @@ use ferropress_core::media_url;
 use ferropress_core::ports::BlobKey;
 use ferropress_core::query::Edge;
 use ferropress_core::role::Capability;
-use ferropress_core::value::{FieldMap, TypeName, Value, now_millis};
+use ferropress_core::value::{FieldMap, Object, ObjectId, TypeName, Value, now_millis};
 
-use super::{AdminError, AuthedUser};
+use super::{AdminError, AuthedUser, datetime_field, str_field};
 use crate::AppState;
 
 /// Max accepted image size, per file. The upload route sets a body limit a little
@@ -229,6 +229,96 @@ pub async fn upload(
         height,
         mime_type: mime.to_owned(),
     }))
+}
+
+/// One row in the media library (`GET /admin/api/media`): the object `id` (echoed
+/// back by a picker to set a media reference) and its served `url` (`/media/{uuid}`,
+/// for the thumbnail), plus enough metadata to label the grid. The unguessable uuid
+/// lives only inside `url`, keeping the id an authenticated-admin handle — the same
+/// posture as the featured-image DTO.
+#[derive(Serialize)]
+pub struct MediaSummary {
+    pub id: u64,
+    pub url: String,
+    pub filename: String,
+    pub alt: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub uploaded_at: Option<i64>,
+}
+
+/// `GET /admin/api/media` — the media library: the stored images this user may
+/// browse, newest first, for a picker to choose from. Gated on
+/// [`Capability::UploadMedia`] (Author+) — the same bar as uploading — and then scoped
+/// to authorship exactly like the post list: Editor+ (`EditOthersContent`) sees the
+/// whole library; a lower role sees only media they uploaded. So an Author can never
+/// enumerate another author's `/media/{uuid}` URLs (which the un-authenticated public
+/// route protects only by the uuid being unguessable), matching WordPress's
+/// per-author media visibility.
+///
+/// Scans the `Media` table and sorts in Rust (v1 has no compound "ORDER BY created_at
+/// DESC" primitive; `Media.created_at` is `@indexed`, and the table is small). This is
+/// an admin handle to media metadata, not the public `/media` route.
+pub async fn list(
+    State(state): State<AppState>,
+    who: AuthedUser,
+) -> Result<Json<Vec<MediaSummary>>, AdminError> {
+    who.require(Capability::UploadMedia)?;
+
+    let objs: Vec<Object> = state.store.scan(&TypeName::from(MEDIA_TYPE)).await?;
+
+    // Scope to the uploader. `uploaded_by` has no `@inverse`, so ownership is resolved
+    // with ONE batched link read over the scanned ids (the id-only `get_links_many`
+    // fast path — a single round-trip, not N+1), mirroring `posts::list`. A media row
+    // with no `uploaded_by` (a legacy/CLI upload) belongs to no one, so it is hidden
+    // from the own-only view.
+    let objs: Vec<Object> = if who.can_edit_others() {
+        objs
+    } else {
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id).collect();
+        let uploaders = state
+            .store
+            .get_links_many(&TypeName::from(MEDIA_TYPE), &ids, "uploaded_by")
+            .await?;
+        objs.into_iter()
+            .zip(uploaders)
+            .filter(|(_, uploaders)| uploaders.contains(&who.id))
+            .map(|(obj, _)| obj)
+            .collect()
+    };
+
+    let mut media: Vec<MediaSummary> = objs.iter().map(media_summary).collect();
+    // Newest first; untimed rows (which shouldn't exist — created_at is always set on
+    // upload) sink to the bottom.
+    media.sort_by_key(|m| std::cmp::Reverse(m.uploaded_at));
+    Ok(Json(media))
+}
+
+/// Project a `Media` object into a [`MediaSummary`]. The public URL is keyed by the
+/// unguessable uuid; an object missing its uuid yields an empty `url` (it can't be
+/// served) rather than erroring the whole listing.
+fn media_summary(obj: &Object) -> MediaSummary {
+    MediaSummary {
+        id: obj.id.0,
+        url: str_field(obj, "uuid")
+            .map(|uuid| media_url(&uuid))
+            .unwrap_or_default(),
+        filename: str_field(obj, "filename").unwrap_or_default(),
+        alt: str_field(obj, "alt_text").unwrap_or_default(),
+        mime_type: str_field(obj, "mime_type").unwrap_or_default(),
+        width: u32_field(obj, "width"),
+        height: u32_field(obj, "height"),
+        uploaded_at: datetime_field(obj, "created_at"),
+    }
+}
+
+/// Read a `U32` field off an object (media dimensions), or `0` if absent / wrong type.
+fn u32_field(obj: &Object, field: &str) -> u32 {
+    match obj.get(field) {
+        Some(Value::U32(n)) => *n,
+        _ => 0,
+    }
 }
 
 /// Map a sniffed image type to its canonical `(mime_type, file extension)`, or `None`

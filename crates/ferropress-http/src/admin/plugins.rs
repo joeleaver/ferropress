@@ -26,6 +26,7 @@ use ferropress_core::entity::{plugin_setting_key, plugin_setting_prefix};
 use ferropress_core::role::Capability;
 use ferropress_render_form::{FormSchema, PluginDescriptor};
 
+use super::setting_refs::build_settings_dto;
 use super::setting_store::upsert_setting;
 use super::settings::{PutSettingsRequest, SettingsDto};
 use super::{AdminError, AdminJson, AuthedUser};
@@ -57,7 +58,7 @@ pub async fn get(
         .settings_schema(&id)
         .ok_or(AdminError::NotFound)?;
     let values = read_plugin_values(&state, &id, &schema).await?;
-    Ok(Json(SettingsDto { schema, values }))
+    Ok(Json(build_settings_dto(&state, schema, values).await?))
 }
 
 /// `PUT /admin/api/plugins/{id}/settings` — validate a submission against the
@@ -94,7 +95,7 @@ pub async fn put(
     }
 
     let values = read_plugin_values(&state, &id, &schema).await?;
-    Ok(Json(SettingsDto { schema, values }))
+    Ok(Json(build_settings_dto(&state, schema, values).await?))
 }
 
 /// The current value for every schema key of plugin `id`: the schema defaults (BARE
