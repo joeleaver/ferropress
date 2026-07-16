@@ -26,7 +26,7 @@ use ferropress_core::ports::{BlobKey, BlobStore};
 use ferropress_core::query::{Change, ChangeKind, SubscribeFilter};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::Value;
-use ferropress_core::{PAGE_TYPE, POST_TYPE, USER_TYPE};
+use ferropress_core::{PAGE_TYPE, POST_TYPE, REDIRECT_TYPE, USER_TYPE};
 use ferropress_render::CustomBlockRenderer;
 
 pub mod authors;
@@ -34,6 +34,7 @@ pub mod content;
 pub mod datefmt;
 pub mod hierarchy;
 pub mod hook_bridge;
+pub mod redirects;
 pub mod settings;
 pub mod templates;
 
@@ -44,6 +45,7 @@ pub use content::{
 };
 pub use hierarchy::{BackfillReport, backfill_page_paths, join_page_path};
 pub use hook_bridge::HookBridge;
+pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects};
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
@@ -150,6 +152,12 @@ pub struct ServeEngine {
     /// like chrome). `None` (tests, a boot without authors wired) skips the refresh;
     /// unresolved ids simply render as no byline. Same handle the read path holds.
     authors: Option<AuthorsHandle>,
+    /// The live redirect table the HTTP read path 301s a moved URL from. When present, a
+    /// `Redirect` change on the feed fully reloads it (see [`apply_change`](Self::apply_change))
+    /// — so a rename's 301 takes effect on every instance with no page regeneration. `None`
+    /// (tests, a boot without redirects wired) skips the reload; the table stays empty. Same
+    /// handle the HTTP read path holds.
+    redirects: Option<RedirectHandle>,
 }
 
 impl ServeEngine {
@@ -167,6 +175,7 @@ impl ServeEngine {
             custom,
             settings: None,
             authors: None,
+            redirects: None,
         }
     }
 
@@ -185,6 +194,14 @@ impl ServeEngine {
     /// without regenerating a single cached page (the byline name is composed live).
     pub fn with_authors(mut self, authors: AuthorsHandle) -> Self {
         self.authors = Some(authors);
+        self
+    }
+
+    /// Wire the live [`RedirectHandle`] so the regen loop reloads it whenever a `Redirect`
+    /// changes on the feed. Pass the SAME handle the HTTP read path holds, so a rename's 301
+    /// is honored on the public site without any page regeneration.
+    pub fn with_redirects(mut self, redirects: RedirectHandle) -> Self {
+        self.redirects = Some(redirects);
         self
     }
 
@@ -290,6 +307,25 @@ impl ServeEngine {
                     user_id = change.object_id.0,
                     "refreshed author directory from change feed",
                 );
+            }
+            return Ok(());
+        }
+
+        // A `Redirect` change reloads the live redirect table the HTTP read path 301s a moved
+        // URL from — NOT a page-cache eviction. A rename records a `Redirect` row whose
+        // create/delete rides the feed to EVERY instance, so each node honors (or retires) the
+        // 301 with no page regeneration. Full reload (not incremental): redirects are
+        // low-volume, so a rescan is cheap and immune to from-path-edit staleness — the same
+        // discipline the settings snapshot uses.
+        if change.type_name.as_str() == REDIRECT_TYPE {
+            if let Some(redirects) = &self.redirects {
+                match redirects::load_redirects(&self.store).await {
+                    Ok(next) => {
+                        redirects.set(next);
+                        tracing::debug!("reloaded redirect table from change feed");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to reload redirect table"),
+                }
             }
             return Ok(());
         }

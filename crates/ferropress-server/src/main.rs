@@ -39,8 +39,8 @@ use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{
-    AuthorsHandle, HookBridge, ServeEngine, SettingsHandle, backfill_page_paths, default_theme,
-    load_author_directory, load_site_settings,
+    AuthorsHandle, HookBridge, RedirectHandle, ServeEngine, SettingsHandle, backfill_page_paths,
+    default_theme, load_author_directory, load_redirects, load_site_settings,
 };
 use ferropress_store_embedded::EmbeddedStore;
 
@@ -136,6 +136,12 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
             .context("loading author directory")?,
     );
 
+    // Seed the live redirect table from the store ONCE at boot. The SAME handle is shared with
+    // the HTTP read path (`AppState`, which 301s a moved URL) and the regen loop (`ServeEngine`,
+    // which reloads it on a `Redirect` change) — so a page rename's 301 is honored on the public
+    // site with NO page regeneration.
+    let redirects = RedirectHandle::new(load_redirects(&store).await.context("loading redirects")?);
+
     // 2. Build the owned subsystems over the ports.
     // Build the page-chrome theme once (its templates registered) for the HTTP read
     // path (`AppState`). The regen loop does NOT need it: it caches per-object
@@ -170,7 +176,8 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // renderer for both the regen loop and the read path).
     let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), plugins.clone())
         .with_settings(settings.clone())
-        .with_authors(authors.clone());
+        .with_authors(authors.clone())
+        .with_redirects(redirects.clone());
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
     // The same plugin host is the custom-block renderer AND the hook dispatcher
@@ -179,6 +186,7 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let mut app_state = AppState::new(Arc::clone(&store), Arc::clone(&blobs), theme)
         .with_settings(settings.clone())
         .with_authors(authors.clone())
+        .with_redirects(redirects.clone())
         .with_islands_dir(cfg.islands_dir.clone())
         .with_custom_renderer(plugins.clone())
         .with_hook_dispatcher(plugins.clone())
