@@ -86,6 +86,9 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> O
 async fn seed_page(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> ObjectId {
     let mut fields: FieldMap = HashMap::new();
     fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    // A top-level page's materialized `path` equals its slug — the nested-permalink
+    // resolver keys pages on `path`, so a page fixture must carry it to be resolvable.
+    fields.insert("path".to_owned(), Value::String(slug.to_owned()));
     fields.insert(
         "status".to_owned(),
         Value::String(status.as_str().to_owned()),

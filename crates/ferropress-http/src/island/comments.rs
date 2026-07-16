@@ -1,11 +1,13 @@
 //! The **live-comments** island API: list the approved comments on a published
 //! page, and accept a new comment (held for moderation).
 //!
-//! Both endpoints key off the public **slug** and resolve it through
-//! [`ferropress_serve::resolve_published_entity`] — the SAME published-Post-then-
-//! Page rule the page read path uses. A comment can therefore only ever attach to
-//! (or be listed for) content that is actually publicly served; drafts and
-//! unknown slugs are a clean 404.
+//! Both endpoints key off the public **path key** (the `slug` query param — a flat
+//! post slug like `hello`, or a nested page path like `about/team`; the island sends
+//! the full trimmed `location.pathname`) and resolve it through
+//! [`ferropress_serve::resolve_published_entity`] — the SAME published-Post-then-Page
+//! rule the page read path uses. A comment can therefore only ever attach to (or be
+//! listed for) content that is actually publicly served; drafts and unknown keys are a
+//! clean 404.
 //!
 //! ## Moderation
 //!
