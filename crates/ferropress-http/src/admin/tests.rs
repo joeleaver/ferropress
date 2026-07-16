@@ -16,8 +16,8 @@ use ferropress_auth::{SigningKey, hash_password};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, now_millis};
 use ferropress_core::{
-    Block, BlockKind, BlockTree, Edge, InlineRun, MEDIA_TYPE, POST_TYPE, SETTING_TYPE, Status,
-    USER_TYPE,
+    Block, BlockKind, BlockTree, Edge, InlineRun, MEDIA_TYPE, PAGE_TYPE, POST_TYPE, REDIRECT_TYPE,
+    SETTING_TYPE, Status, USER_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
@@ -2325,4 +2325,415 @@ async fn media_list_is_scoped_to_the_uploader_for_authors() {
     let mut want = vec![media_a.0, media_b.0];
     want.sort_unstable();
     assert_eq!(ids, want, "an editor must see the whole media library");
+}
+
+// ---------------------------------------------------------------------------
+// Pages: hierarchy, cascade + redirects, cross-entity uniqueness, preview
+// ---------------------------------------------------------------------------
+
+/// Drive one admin request (optional JSON body) with a cookie; return (status, body json).
+async fn req(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, cookie);
+    let body = match body {
+        Some(j) => {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+            Body::from(j.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = router(state.clone())
+        .oneshot(b.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+/// Create a page via the API; return its id (panics on non-200 with the body).
+async fn create_page(
+    state: &AppState,
+    cookie: &str,
+    slug: &str,
+    parent: Option<u64>,
+    status: &str,
+) -> u64 {
+    let (code, body) = req(
+        state,
+        "POST",
+        "/admin/api/pages",
+        cookie,
+        Some(serde_json::json!({
+            "title": format!("Page {slug}"),
+            "slug": slug,
+            "status": status,
+            "block_tree": one_paragraph("body"),
+            "parent": parent,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "create page {slug}: {body}");
+    body["id"].as_u64().expect("create returns an id")
+}
+
+/// The stored `path` scalar of a page.
+async fn page_path(store: &Arc<dyn RhypeStore>, id: u64) -> String {
+    match store
+        .get(&TypeName::from(PAGE_TYPE), ObjectId(id))
+        .await
+        .expect("get page")
+        .get("path")
+    {
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// All `(from_path, to_path)` redirect rows in the store.
+async fn all_redirects(store: &Arc<dyn RhypeStore>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = store
+        .scan(&TypeName::from(REDIRECT_TYPE))
+        .await
+        .expect("scan redirects")
+        .iter()
+        .filter_map(|o| {
+            let from = match o.get("from_path") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return None,
+            };
+            let to = match o.get("to_path") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return None,
+            };
+            Some((from, to))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn page_create_get_save_roundtrip_and_nested_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // A top-level page: path == slug.
+    let about = create_page(&state, &cookie, "about", None, "published").await;
+    assert_eq!(page_path(&store, about).await, "about");
+
+    // A child: path == parent/child.
+    let team = create_page(&state, &cookie, "team", Some(about), "published").await;
+    assert_eq!(page_path(&store, team).await, "about/team");
+
+    // GET the child back with its hierarchy meta.
+    let (code, detail) = req(
+        &state,
+        "GET",
+        &format!("/admin/api/pages/{team}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(detail["path"], "about/team");
+    assert_eq!(detail["parent"], about);
+
+    // Save an edit that doesn't move the page (title only) — path unchanged, no redirect.
+    let (code, _) = req(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{team}"),
+        &cookie,
+        Some(serde_json::json!({
+            "title": "The Team, Renamed",
+            "slug": "team",
+            "status": "published",
+            "block_tree": one_paragraph("body"),
+            "parent": about,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(page_path(&store, team).await, "about/team");
+    assert!(
+        all_redirects(&store).await.is_empty(),
+        "a non-move save writes no redirect"
+    );
+}
+
+#[tokio::test]
+async fn renaming_a_parent_cascades_descendant_paths_and_records_redirects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // about -> team -> history (three deep), all published.
+    let about = create_page(&state, &cookie, "about", None, "published").await;
+    let team = create_page(&state, &cookie, "team", Some(about), "published").await;
+    let history = create_page(&state, &cookie, "history", Some(team), "published").await;
+    assert_eq!(page_path(&store, history).await, "about/team/history");
+
+    // Rename the ROOT about -> company. Descendants must re-path.
+    let (code, body) = req(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{about}"),
+        &cookie,
+        Some(serde_json::json!({
+            "title": "Company",
+            "slug": "company",
+            "status": "published",
+            "block_tree": one_paragraph("body"),
+            "parent": null,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "rename: {body}");
+    assert_eq!(body["path"], "company");
+    assert_eq!(page_path(&store, team).await, "company/team");
+    assert_eq!(page_path(&store, history).await, "company/team/history");
+
+    // A 301 is recorded for the root AND each descendant's old→new path.
+    let redirects = all_redirects(&store).await;
+    assert!(
+        redirects.contains(&("/about".to_owned(), "/company".to_owned())),
+        "{redirects:?}"
+    );
+    assert!(
+        redirects.contains(&("/about/team".to_owned(), "/company/team".to_owned())),
+        "{redirects:?}"
+    );
+    assert!(
+        redirects.contains(&(
+            "/about/team/history".to_owned(),
+            "/company/team/history".to_owned()
+        )),
+        "{redirects:?}"
+    );
+}
+
+#[tokio::test]
+async fn self_parent_and_cycle_are_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    let a = create_page(&state, &cookie, "a", None, "draft").await;
+    let b = create_page(&state, &cookie, "b", Some(a), "draft").await;
+
+    // Self-parent → 400.
+    let (code, _) = req(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{a}"),
+        &cookie,
+        Some(serde_json::json!({
+            "title": "A", "slug": "a", "status": "draft",
+            "block_tree": one_paragraph("x"), "parent": a,
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "a page can't be its own parent"
+    );
+
+    // Re-parent a under its own descendant b → cycle → 400.
+    let (code, _) = req(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{a}"),
+        &cookie,
+        Some(serde_json::json!({
+            "title": "A", "slug": "a", "status": "draft",
+            "block_tree": one_paragraph("x"), "parent": b,
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "re-parenting into a cycle is rejected"
+    );
+}
+
+#[tokio::test]
+async fn slug_charset_and_template_are_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // A slug with a '/' forges hierarchy → 400.
+    let (code, _) = req(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &cookie,
+        Some(serde_json::json!({
+            "title": "X", "slug": "a/b", "status": "draft", "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "a slug with '/' is rejected");
+
+    // An unknown template → 400.
+    let (code, _) = req(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &cookie,
+        Some(serde_json::json!({
+            "title": "X", "slug": "good", "status": "draft",
+            "block_tree": one_paragraph("x"), "template": "no-such-template",
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "an unknown template is rejected"
+    );
+
+    // The registered full-width template is accepted + stored.
+    let (code, body) = req(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &cookie,
+        Some(serde_json::json!({
+            "title": "Wide", "slug": "wide", "status": "draft",
+            "block_tree": one_paragraph("x"), "template": "page-wide",
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "a registered template is accepted: {body}"
+    );
+    let id = body["id"].as_u64().unwrap();
+    let (_, detail) = req(
+        &state,
+        "GET",
+        &format!("/admin/api/pages/{id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(detail["template"], "page-wide");
+}
+
+#[tokio::test]
+async fn cross_entity_slug_and_path_collisions_are_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // A post already owns the slug "team".
+    seed_post(&store, "team", Status::Published).await;
+    // Creating a top-level PAGE at path "team" collides → 409.
+    let (code, _) = req(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &cookie,
+        Some(serde_json::json!({
+            "title": "Team", "slug": "team", "status": "draft", "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::CONFLICT,
+        "a page path can't collide with a post slug"
+    );
+
+    // A page owns path "docs". Creating a POST with slug "docs" collides → 409 (symmetric).
+    create_page(&state, &cookie, "docs", None, "published").await;
+    let (code, _) = req(
+        &state,
+        "POST",
+        "/admin/api/posts",
+        &cookie,
+        Some(serde_json::json!({
+            "title": "Docs", "slug": "docs", "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::CONFLICT,
+        "a post slug can't collide with a page path"
+    );
+}
+
+#[tokio::test]
+async fn page_access_is_404_for_a_non_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let admin = admin_cookie(&state, &store).await;
+    // The admin creates a page.
+    let page = create_page(&state, &admin, "secret", None, "draft").await;
+
+    // A contributor (edits only their OWN content) must get 404 — not 403 — on someone else's
+    // page, so the id endpoint isn't an existence oracle.
+    seed_user(&store, "carol", "hunter2hunter2", "contributor").await;
+    let (_, cookie, _) = do_login(&state, "carol", "hunter2hunter2").await;
+    let cookie = session_pair(&cookie.unwrap());
+    let (code, _) = req(
+        &state,
+        "GET",
+        &format!("/admin/api/pages/{page}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "a non-owner sees 404, not 403");
+}
+
+#[tokio::test]
+async fn page_preview_renders_a_draft_uncached_and_noindex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+    let page = create_page(&state, &cookie, "draft-page", None, "draft").await;
+
+    let req_p = Request::builder()
+        .method("GET")
+        .uri(format!("/admin/preview/page/{page}"))
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req_p).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a draft page previews");
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert_eq!(
+        resp.headers().get("X-Robots-Tag").unwrap(),
+        "noindex, nofollow"
+    );
+    let html = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains("<!doctype html>"),
+        "the real theme chrome renders"
+    );
+    assert!(html.contains("Preview"), "the preview banner shows");
 }

@@ -34,7 +34,9 @@ use ferropress_core::value::{Object, ObjectId, Value, now_millis};
 use crate::AppState;
 
 pub mod auth;
+mod content_ops;
 pub mod media;
+pub mod pages;
 pub mod plugins;
 pub mod posts;
 pub mod preview;
@@ -282,6 +284,14 @@ pub fn api_routes() -> Router<AppState> {
             "/admin/api/posts/{id}",
             get(posts::get_one).put(posts::save),
         )
+        // Pages: the hierarchical content editor surface (nested permalinks + templates).
+        .route("/admin/api/pages", get(pages::list).post(pages::create))
+        .route(
+            "/admin/api/pages/{id}",
+            get(pages::get_one).put(pages::save),
+        )
+        // The theme's page templates, for the editor's Template picker.
+        .route("/admin/api/templates", get(pages::templates))
         // Site settings: read the schema + values, write a validated submission.
         // Both gated on `ManageSettings` (Administrator).
         .route("/admin/api/settings", get(settings::get).put(settings::put))
@@ -296,6 +306,8 @@ pub fn api_routes() -> Router<AppState> {
         // the REAL public theme, uncached, in a new tab. Under `/admin` so the session
         // cookie (Path=/admin) is sent; returns HTML (not JSON). See [`preview`].
         .route("/admin/preview/{id}", get(preview::preview))
+        // Page draft preview (nested/templated), same authed + no-store/noindex contract.
+        .route("/admin/preview/page/{id}", get(preview::preview_page))
         // Media: `GET` the library (browse existing uploads for a picker), `POST` a
         // multipart upload. axum's default 2 MiB body limit would reject a real image,
         // so this route carries its own limit sized to the handler's per-file cap plus
