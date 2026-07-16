@@ -15,12 +15,13 @@
 //! cached page" guardrail. [`serve_path`] deserializes the envelope and composes;
 //! the regen loop caches the envelope.
 //!
-//! ## Permalinks (v1)
+//! ## Permalinks
 //!
-//! Flat, published-only: a path `"/<slug>"` resolves to a **published** `Post`
-//! with that slug, falling back to a **published** `Page`. The site root `"/"`
-//! (empty slug) is the cached front page — a static page or the post galley (see
-//! [`serve_front`] / [`build_front`]); nested paths are a later increment.
+//! Published-only. A single-segment path `"/<slug>"` resolves a **published** `Post`
+//! by slug first, then a top-level **published** `Page` by its materialized `path`. A
+//! **nested** path `"/parent/child"` resolves a published `Page` by its full `path`
+//! (posts are always flat). The site root `"/"` (empty key) is the cached front page —
+//! a static page or the post galley (see [`serve_front`] / [`build_front`]).
 //!
 //! ## No block -> HTML logic here
 //!
@@ -172,13 +173,13 @@ pub(crate) struct CachedHomePost {
     pub author_id: Option<u64>,
 }
 
-/// Derive the lookup slug from a request path (permalinks v1: flat `/<slug>`).
+/// Derive the lookup **path key** from a request path.
 ///
-/// Strips a single leading `'/'` and any trailing `'/'`; the remainder is the
-/// slug. `"/"` (the site root) yields an empty slug, which the read paths route to
-/// the front-page galley. Nested paths (`"/a/b"`) are passed through verbatim as
-/// the slug, so they simply will not match a flat slug today; nested permalinks
-/// are a later increment.
+/// Strips a single leading `'/'` and any trailing `'/'`; the remainder is the key.
+/// `"/"` (the site root) yields an empty key, which the read paths route to the
+/// front-page galley. A single segment (`"about"`) keys a Post slug or a top-level
+/// Page path; a nested key (`"about/team"`) keys a nested Page's materialized `path`
+/// (see [`resolve_published_entity`]).
 pub fn slug_from_path(path: &str) -> &str {
     path.trim_start_matches('/').trim_end_matches('/')
 }
@@ -724,51 +725,67 @@ async fn build_galley(
         .collect())
 }
 
-/// Resolve a request slug to the PUBLISHED entity behind it, returning its store
+/// Resolve a request path key to the PUBLISHED entity behind it, returning its store
 /// type-name ([`POST_TYPE`] or [`PAGE_TYPE`]) and the materialized object.
 ///
-/// This is the single definition of the v1 permalink rule: a published `Post` by
-/// slug takes precedence, then a published `Page`. `Ok(None)` means no published
-/// entity matched (callers map that to a 404). An empty slug never matches (no
-/// flat entity has an empty slug; the site root is the front page, not a permalink).
+/// The `path_key` is the request path with its leading/trailing `/` trimmed (see
+/// [`slug_from_path`]) — a single segment (`"about"`) or a nested page path
+/// (`"about/team"`). The resolution rule:
 ///
-/// Shared by [`build_page`] (page rendering) and the island comment API, so a
-/// comment can only ever attach to — and be listed for — content that is actually
-/// publicly served, under ONE definition of "published at this slug".
+///   * A **nested** path (contains `/`) can only be a `Page`: posts are always flat
+///     (served at a single-segment `/<slug>`), and a page's full public path is stored
+///     in its `path` scalar (materialized from its ancestor-slug chain).
+///   * A **single-segment** path resolves a published `Post` by `slug` FIRST (the v1
+///     precedence), then a top-level published `Page` by `path` (whose `path` equals
+///     its own slug).
+///
+/// `Ok(None)` means no published entity matched (callers map that to a 404). An empty
+/// key never matches (the site root is the front page, not a permalink).
+///
+/// Shared by [`build_page`] (page rendering) and the island comment API, so a comment
+/// can only ever attach to — and be listed for — content that is actually publicly
+/// served, under ONE definition of "published at this path".
 pub async fn resolve_published_entity(
     store: &Arc<dyn RhypeStore>,
-    slug: &str,
+    path_key: &str,
 ) -> Result<Option<(&'static str, Object)>, CoreError> {
-    if slug.is_empty() {
+    if path_key.is_empty() {
         return Ok(None);
     }
-    if let Some(obj) = find_published(store, POST_TYPE, slug).await? {
+    // Posts are flat: only a single-segment path can name a Post, and it wins over a
+    // top-level page at the same key (the established precedence).
+    if !path_key.contains('/')
+        && let Some(obj) = find_published(store, POST_TYPE, "slug", path_key).await?
+    {
         return Ok(Some((POST_TYPE, obj)));
     }
-    if let Some(obj) = find_published(store, PAGE_TYPE, slug).await? {
+    // A page (top-level or nested) is addressed by its materialized `path`.
+    if let Some(obj) = find_published(store, PAGE_TYPE, "path", path_key).await? {
         return Ok(Some((PAGE_TYPE, obj)));
     }
     Ok(None)
 }
 
-/// Look up a single PUBLISHED object of `type_name` by exact slug.
+/// Look up a single PUBLISHED object of `type_name` by an exact indexed `field` value
+/// (`"slug"` for a Post, `"path"` for a Page).
 ///
-/// Runs the indexed single-predicate `filter` (`slug == slug`, limit 1) the
-/// engine fast-paths, then gates on `status == "published"` in Rust. The status
-/// gate is a second Rust check rather than a second predicate because the engine
-/// filter is single-predicate (compound predicates are caller-composed); for a
-/// `limit 1` slug hit a one-row post-filter is cheaper than a second scan.
+/// Runs the indexed single-predicate `filter` (`field == value`, limit 1) the engine
+/// fast-paths, then gates on `status == "published"` in Rust. The status gate is a
+/// second Rust check rather than a second predicate because the engine filter is
+/// single-predicate (compound predicates are caller-composed); for a `limit 1` hit a
+/// one-row post-filter is cheaper than a second scan.
 async fn find_published(
     store: &Arc<dyn RhypeStore>,
     type_name: &str,
-    slug: &str,
+    field: &str,
+    value: &str,
 ) -> Result<Option<Object>, CoreError> {
     let hits = store
         .filter(FilterSpec {
             type_name: TypeName::from(type_name),
-            field: "slug".to_owned(),
+            field: field.to_owned(),
             op: Compare::Eq,
-            value: Value::String(slug.to_owned()),
+            value: Value::String(value.to_owned()),
             limit: Some(1),
         })
         .await?;

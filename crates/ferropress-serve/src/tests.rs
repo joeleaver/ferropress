@@ -2513,3 +2513,129 @@ async fn children_inverse_edge_traverses() {
     want.sort();
     assert_eq!(kids, want, "the children inverse returns both children");
 }
+
+// --- Nested-permalink resolution + regen path-keying (Phase 2) ---
+
+/// A synthetic Page change carrying its full nested `path` in `fields`, matching what the
+/// embedded adapter publishes for a page write — so the regen loop keys the cache off the
+/// nested path directly (no re-`get`).
+fn page_change(kind: ChangeKind, id: ObjectId, path: &str) -> Change {
+    Change {
+        version: 1,
+        kind,
+        type_name: TypeName::from(PAGE_TYPE),
+        object_id: id,
+        fields: Some(serde_json::json!({ "path": path })),
+        origin: None,
+    }
+}
+
+#[tokio::test]
+async fn nested_page_resolves_at_its_full_path_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(dir.path());
+    let _about = seed_page(&store, "about", Status::Published, "About.").await;
+    let team = seed_page(&store, "team", Status::Published, "The team.").await;
+    link_parent(&store, team, _about).await;
+    crate::backfill_page_paths(&store).await.expect("backfill");
+
+    let serve = |path: &'static str| {
+        let (store, blobs, theme) = (store.clone(), blobs.clone(), theme.clone());
+        async move {
+            serve_path(
+                &store,
+                &blobs,
+                &theme,
+                &NoCustomBlocks,
+                &SiteSettings::defaults(),
+                &AuthorDirectory::default(),
+                path,
+            )
+            .await
+        }
+    };
+
+    // The nested page is served at /about/team AND cached at the NESTED blob key.
+    assert!(
+        matches!(serve("/about/team").await, crate::Resolved::Found(_)),
+        "nested page resolves at its full path",
+    );
+    assert!(
+        blobs.exists(&cache_key("/about/team")).await.unwrap(),
+        "nested page is cached at the nested permalink key",
+    );
+
+    // It is NOT reachable at its bare leaf slug — posts own the flat namespace; a nested
+    // page has no flat /team URL.
+    assert!(
+        matches!(serve("/team").await, crate::Resolved::NotFound),
+        "a nested page is not served at its leaf slug",
+    );
+
+    // The parent still resolves at its own top-level path.
+    assert!(
+        matches!(serve("/about").await, crate::Resolved::Found(_)),
+        "the parent resolves at /about",
+    );
+}
+
+#[tokio::test]
+async fn single_segment_post_wins_over_a_top_level_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _blobs, _theme) = boot(dir.path());
+    // A published Post AND a published top-level Page both claim the flat key "x".
+    seed_post(&store, "x", Status::Published).await;
+    seed_page(&store, "x", Status::Published, "Page x.").await;
+    crate::backfill_page_paths(&store).await.expect("backfill");
+
+    let resolved = content::resolve_published_entity(&store, "x")
+        .await
+        .expect("resolve");
+    assert_eq!(
+        resolved.map(|(ty, _)| ty),
+        Some(POST_TYPE),
+        "a single-segment path resolves the Post first (established precedence)",
+    );
+}
+
+#[tokio::test]
+async fn regen_keys_a_page_on_its_nested_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, blobs, _theme) = boot(dir.path());
+    let _about = seed_page(&store, "about", Status::Published, "About.").await;
+    let team = seed_page(&store, "team", Status::Published, "The team.").await;
+    link_parent(&store, team, _about).await;
+    crate::backfill_page_paths(&store).await.expect("backfill");
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    );
+    let nested = cache_key("/about/team");
+    let leaf = cache_key("/team");
+
+    // Update: the regen step writes the envelope through to the NESTED key, never the slug.
+    engine
+        .apply_change(&page_change(ChangeKind::Update, team, "about/team"))
+        .await
+        .expect("regen a published nested page");
+    assert!(
+        blobs.exists(&nested).await.unwrap(),
+        "regen writes the nested key",
+    );
+    assert!(
+        !blobs.exists(&leaf).await.unwrap(),
+        "regen must NOT key a page on its bare slug",
+    );
+
+    // Delete: the regen step evicts the NESTED key (the old slug-keyed path would miss it).
+    engine
+        .apply_change(&page_change(ChangeKind::Delete, team, "about/team"))
+        .await
+        .expect("evict a deleted nested page");
+    assert!(
+        !blobs.exists(&nested).await.unwrap(),
+        "delete evicts the nested key",
+    );
+}

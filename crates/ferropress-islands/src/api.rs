@@ -50,9 +50,10 @@ pub struct NewComment<'a> {
     pub body: &'a str,
 }
 
-/// The slug of the current page, derived from the URL path (permalinks v1 are
-/// flat `/<slug>`, the same trim `ferropress_serve::slug_from_path` applies
-/// server-side). Empty when at the site root.
+/// The path key of the current page, derived from the URL path — the same trim
+/// `ferropress_serve::slug_from_path` applies server-side, so it is the full key
+/// (a flat post slug like `hello`, or a nested page path like `about/team`) that
+/// `resolve_published_entity` matches. Empty when at the site root.
 pub fn current_slug() -> String {
     web_sys::window()
         .and_then(|w| w.location().pathname().ok())

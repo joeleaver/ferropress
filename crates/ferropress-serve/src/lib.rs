@@ -104,15 +104,22 @@ fn page_blob_key(page: &OutputPage) -> BlobKey {
     cache_key(&page.path)
 }
 
-/// The slug carried on a change's JSON `fields` (the engine publishes the changed
-/// scalar fields, incl. on delete), if present and non-empty. Lets the regen loop
-/// derive a page path straight from the change — no extra store read, and the only
-/// way to know a *deleted* object's slug.
-fn slug_from_change(change: &Change) -> Option<String> {
+/// The cache PATH KEY carried on a change's JSON `fields`: for a `Page` its full nested
+/// materialized `path` (`fields.path`), else the `slug` (`fields.slug`, a flat `Post`).
+/// The engine publishes the changed scalar fields (incl. on delete), so the regen loop
+/// derives a page's cache path straight from the change — no extra store read, and the
+/// only way to know a *deleted* object's path. A Page keys on `path` because its public
+/// URL is nested (`/parent/child`), not `/<slug>`.
+fn cache_path_key_from_change(change: &Change) -> Option<String> {
+    let field = if change.type_name.as_str() == PAGE_TYPE {
+        "path"
+    } else {
+        "slug"
+    };
     change
         .fields
         .as_ref()
-        .and_then(|f| f.get("slug"))
+        .and_then(|f| f.get(field))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
@@ -185,16 +192,17 @@ impl ServeEngine {
     /// committed change, write-through (regenerate) or evict exactly the affected
     /// prerendered pages. Never a full rebuild.
     ///
-    /// Per change (the slug comes off the change feed's `fields` — the engine
-    /// publishes the changed scalar fields, so no extra read is needed; a re-`get`
-    /// is only a fallback when the feed somehow carried no slug):
-    ///   * **Create / Update** of a `Post`/`Page`: derive its `/<slug>` path and
+    /// Per change (the cache path key comes off the change feed's `fields` — the engine
+    /// publishes the changed scalar fields, so no extra read is needed; a re-`get` is only
+    /// a fallback when the feed somehow carried no key). A `Post` keys on its `slug`
+    /// (`/<slug>`); a `Page` keys on its full nested `path` (`/parent/child`):
+    ///   * **Create / Update** of a `Post`/`Page`: derive its path and
     ///     [`build_page`](Self::build_page) its envelope. `Some(_)` -> `put`
     ///     (regenerate); `None` (the entity is no longer published) -> `delete`
     ///     (evict). This makes an unpublish/trash a cache eviction, not a stale
     ///     page.
     ///   * **Delete**: the object is gone, but the change carries its (pre-delete)
-    ///     scalar `fields`, so we read the slug from there and evict the cached
+    ///     scalar `fields`, so we read the path key from there and evict the cached
     ///     page. This closes the previously-unfixable "deleted page stays cached"
     ///     gap (which needed either this engine feature or a reverse index).
     ///
@@ -302,21 +310,27 @@ impl ServeEngine {
 
         match change.kind {
             ChangeKind::Create | ChangeKind::Update => {
-                // Prefer the slug off the change feed (no extra read). Fall back to
-                // re-`get`ting the object only if the event carried no slug.
-                let slug = match slug_from_change(change) {
-                    Some(slug) => slug,
+                // Prefer the cache path key off the change feed (no extra read): a Page's
+                // full nested `path`, else a Post's `slug`. Fall back to re-`get`ting the
+                // object only if the event carried no usable key.
+                let key_path = match cache_path_key_from_change(change) {
+                    Some(key) => key,
                     None => {
                         let obj = self.store.get(&change.type_name, change.object_id).await?;
-                        match obj.get("slug") {
+                        let field = if change.type_name.as_str() == PAGE_TYPE {
+                            "path"
+                        } else {
+                            "slug"
+                        };
+                        match obj.get(field) {
                             Some(Value::String(s)) if !s.is_empty() => s.clone(),
-                            // No usable slug -> no permalink to (in)validate; skip.
+                            // No usable key -> no permalink to (in)validate; skip.
                             _ => return Ok(()),
                         }
                     }
                 };
                 let page = OutputPage {
-                    path: format!("/{slug}"),
+                    path: format!("/{key_path}"),
                 };
 
                 // `build_page` applies the publish gate: `Some` envelope for a
@@ -350,22 +364,22 @@ impl ServeEngine {
                 // case (a deleted page, or a slug-collision sibling, served stale
                 // from cache with no event able to dislodge it). `delete` is
                 // idempotent (no-op if never cached).
-                match slug_from_change(change) {
-                    Some(slug) => {
+                match cache_path_key_from_change(change) {
+                    Some(key_path) => {
                         let page = OutputPage {
-                            path: format!("/{slug}"),
+                            path: format!("/{key_path}"),
                         };
                         self.blobs.delete(&page_blob_key(&page)).await?;
                         tracing::debug!(path = %page.path, "evicted prerender cache entry (deleted)");
                     }
                     None => {
-                        // No slug on the event (e.g. a type without a slug field) ->
-                        // nothing to key the cache on. Safe to skip: such an entity
-                        // has no permalink to go stale.
+                        // No path key on the event (e.g. a type without a slug/path field)
+                        // -> nothing to key the cache on. Safe to skip: such an entity has
+                        // no permalink to go stale.
                         tracing::debug!(
                             type_name = %change.type_name.as_str(),
                             object_id = change.object_id.0,
-                            "delete change carried no slug; nothing to evict",
+                            "delete change carried no path key; nothing to evict",
                         );
                     }
                 }
