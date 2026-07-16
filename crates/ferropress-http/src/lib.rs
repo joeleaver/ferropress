@@ -31,7 +31,7 @@ use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
 use ferropress_render_form::{NoPlugins, PluginCatalog};
-use ferropress_serve::{AuthorsHandle, Resolved, SettingsHandle};
+use ferropress_serve::{AuthorsHandle, RedirectHandle, Resolved, SettingsHandle};
 use ferropress_theme::ThemeEngine;
 
 pub mod admin;
@@ -68,6 +68,11 @@ pub struct AppState {
     /// render as no byline) until the composition root seeds it via
     /// [`with_authors`](Self::with_authors).
     pub authors: AuthorsHandle,
+    /// The live redirect table the page fallback 301s a moved URL from. The SAME handle is
+    /// given to the `ServeEngine` regen loop, which reloads it on a `Redirect` change — so a
+    /// rename's 301 is honored without page regeneration. Defaults to an empty table (no path
+    /// redirects) until the composition root seeds it via [`with_redirects`](Self::with_redirects).
+    pub redirects: RedirectHandle,
     /// Directory holding the built wasm island bundle (the `wasm-bindgen` output
     /// of `ferropress-islands`). When set, it is served at `/_fp/islands`; `None`
     /// (e.g. in tests) simply omits that route.
@@ -106,6 +111,7 @@ impl AppState {
             theme,
             settings: SettingsHandle::default(),
             authors: AuthorsHandle::default(),
+            redirects: RedirectHandle::default(),
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
             hooks: Arc::new(NoHooks),
@@ -129,6 +135,15 @@ impl AppState {
     /// an author rename refreshed by the loop is immediately visible here.
     pub fn with_authors(mut self, authors: AuthorsHandle) -> Self {
         self.authors = authors;
+        self
+    }
+
+    /// Share the live [`RedirectHandle`] the page fallback 301s a moved URL from. The
+    /// composition root creates ONE handle (seeded from the store) and gives the same handle to
+    /// both this state and the `ServeEngine` regen loop, so a rename's 301 reloaded by the loop
+    /// is immediately visible here.
+    pub fn with_redirects(mut self, redirects: RedirectHandle) -> Self {
+        self.redirects = redirects;
         self
     }
 
@@ -280,6 +295,15 @@ async fn healthz() -> impl IntoResponse {
 /// 500. The real cause of a 500 is logged but never leaked.
 async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_owned();
+
+    // A moved URL 301s to its new home BEFORE the cache is consulted, so a renamed/re-parented
+    // page's old path forwards instead of serving a stale blob or 404ing. The shadow-guard (the
+    // admin handler deletes a redirect when a live page later takes that path) keeps a redirect
+    // from masking a real page; the table itself never redirects the site root.
+    if let Some(target) = state.redirects.lookup(&path) {
+        let status = StatusCode::from_u16(target.status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
+        return (status, [(axum::http::header::LOCATION, target.to)]).into_response();
+    }
 
     match ferropress_serve::serve_path(
         &state.store,

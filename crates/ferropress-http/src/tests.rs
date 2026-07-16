@@ -19,7 +19,8 @@ use ferropress_core::query::Edge;
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
-    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, POST_TYPE, Status, USER_TYPE,
+    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, POST_TYPE, REDIRECT_TYPE, Status,
+    USER_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
@@ -162,6 +163,73 @@ async fn serves_published_post_end_to_end() {
     let (status, body) = get(&state, "/healthz").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "ok");
+}
+
+/// Seed one `Redirect` row (from_path/to_path, 301), as the admin handler records on a rename.
+async fn seed_redirect(store: &Arc<dyn RhypeStore>, from: &str, to: &str) {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("from_path".to_owned(), Value::String(from.to_owned()));
+    fields.insert("to_path".to_owned(), Value::String(to.to_owned()));
+    fields.insert("status_code".to_owned(), Value::U32(301));
+    store
+        .create(&TypeName::from(REDIRECT_TYPE), fields)
+        .await
+        .expect("seeding a redirect must succeed");
+}
+
+/// Drive one GET and return `(status, Location header)` — for asserting a redirect.
+async fn get_redirect(state: &AppState, path: &str) -> (StatusCode, Option<String>) {
+    let request = Request::builder()
+        .uri(path)
+        .body(Body::empty())
+        .expect("request builds");
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router is infallible");
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    (status, location)
+}
+
+#[tokio::test]
+async fn a_moved_url_301s_to_its_new_home() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+    // Record a redirect as the admin handler would after renaming /about -> /company.
+    seed_redirect(&store, "/about", "/company").await;
+    let redirects = ferropress_serve::RedirectHandle::new(
+        ferropress_serve::load_redirects(&store)
+            .await
+            .expect("load redirects"),
+    );
+    let state = state.with_redirects(redirects);
+
+    // The old path 301s to the new one, BEFORE the cache/resolver is consulted.
+    let (status, location) = get_redirect(&state, "/about").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY, "moved URL must 301");
+    assert_eq!(
+        location.as_deref(),
+        Some("/company"),
+        "301 points at the new path"
+    );
+
+    // A trailing slash on the old path still forwards (normalized keying).
+    let (status, location) = get_redirect(&state, "/about/").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(location.as_deref(), Some("/company"));
+
+    // A path with no redirect falls through to the normal serve path (404 here).
+    let (status, _) = get(&state, "/no-such").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a non-redirected path serves normally"
+    );
 }
 
 #[tokio::test]

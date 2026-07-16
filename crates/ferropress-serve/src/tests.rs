@@ -15,8 +15,8 @@ use ferropress_core::query::{Change, ChangeKind, Edge};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
-    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, PAGE_TYPE, POST_TYPE, SETTING_TYPE,
-    Status, USER_TYPE,
+    Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, PAGE_TYPE, POST_TYPE, REDIRECT_TYPE,
+    SETTING_TYPE, Status, USER_TYPE,
 };
 use ferropress_render_form::SiteSettings;
 
@@ -2637,5 +2637,62 @@ async fn regen_keys_a_page_on_its_nested_path() {
     assert!(
         !blobs.exists(&nested).await.unwrap(),
         "delete evicts the nested key",
+    );
+}
+
+// --- Redirect table live reload (Phase 3) ---
+
+/// Seed one `Redirect` row (from_path/to_path/status_code), matching the admin handler shape.
+async fn seed_redirect(store: &Arc<dyn RhypeStore>, from: &str, to: &str, status: u32) {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("from_path".to_owned(), Value::String(from.to_owned()));
+    fields.insert("to_path".to_owned(), Value::String(to.to_owned()));
+    fields.insert("status_code".to_owned(), Value::U32(status));
+    store
+        .create(&TypeName::from(REDIRECT_TYPE), fields)
+        .await
+        .expect("seeding a redirect must succeed");
+}
+
+#[tokio::test]
+async fn regen_reloads_the_redirect_table_on_a_redirect_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, blobs, _theme) = boot(dir.path());
+    let handle = crate::RedirectHandle::default();
+    assert!(
+        handle.lookup("/about").is_none(),
+        "empty before any redirect"
+    );
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_redirects(handle.clone());
+
+    // A rename records a Redirect; the change feed reloads the whole table off the store.
+    seed_redirect(&store, "/about", "/company", 301).await;
+    engine
+        .apply_change(&Change {
+            version: 1,
+            kind: ChangeKind::Create,
+            type_name: TypeName::from(REDIRECT_TYPE),
+            object_id: ObjectId(1),
+            fields: None,
+            origin: None,
+        })
+        .await
+        .expect("reload the redirect table");
+
+    let hit = handle
+        .lookup("/about")
+        .expect("redirect now present after the feed reload");
+    assert_eq!(hit.to, "/company");
+    assert_eq!(hit.status, 301);
+    // A trailing slash still matches (normalized keying).
+    assert_eq!(
+        handle.lookup("/about/").map(|t| t.to),
+        Some("/company".to_owned())
     );
 }
