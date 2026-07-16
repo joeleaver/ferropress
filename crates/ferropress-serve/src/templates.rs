@@ -16,10 +16,33 @@
 
 /// Template name for the shared chrome.
 pub const BASE_TEMPLATE: &str = "base.html";
-/// Template name for a single post/page.
+/// Template name for a single post/page (the default).
 pub const SINGLE_TEMPLATE: &str = "single.html";
 /// Template name for the front-page galley (post list).
 pub const HOME_TEMPLATE: &str = "home.html";
+/// Template name for the full-width **page** template (an alternate a Page may select).
+pub const PAGE_WIDE_TEMPLATE: &str = "page-wide.html";
+
+/// The page templates a Page author may choose from, as `(value, label)`. The empty value is
+/// the default (the shared [`SINGLE_TEMPLATE`]); each other value is a registered alternate.
+/// The admin editor renders these in its Template `<select>`, the page save validates the
+/// submitted value against this set, and [`template_name_for`] maps a stored value to the
+/// MiniJinja template to render. Adding a theme template means adding a row here + registering
+/// it in [`default_theme`](crate::content::default_theme) + mapping it in [`template_name_for`].
+pub fn page_templates() -> &'static [(&'static str, &'static str)] {
+    &[("", "Default"), ("page-wide", "Full width")]
+}
+
+/// Map a stored Page `template` value to the registered MiniJinja template NAME to render.
+/// The empty value, `None`, OR an unknown value all fall back to the default single template —
+/// so a theme change that drops a template degrades gracefully (a stale `template` scalar
+/// becomes a harmless dead reference) rather than erroring at compose time.
+pub fn template_name_for(value: Option<&str>) -> &'static str {
+    match value {
+        Some("page-wide") => PAGE_WIDE_TEMPLATE,
+        _ => SINGLE_TEMPLATE,
+    }
+}
 
 /// The shared chrome: `<head>` (title/description/robots/canonical), the letterpress
 /// masthead (live `site.title`/`site.tagline` + the `#fp-search` island mount), the
@@ -129,6 +152,12 @@ main { padding: 2.4rem 0 3rem; }
   font-size: .8rem; letter-spacing: .1em; text-transform: uppercase; color: var(--steel-2); }
 /* Single post — the proof */
 .article { max-width: var(--measure); margin: 0 auto; }
+/* Full-width page template: the article breaks out of the reading gauge to span the
+   viewport, then re-centers its body at a wider comfortable measure. */
+.article--wide { width: 100vw; max-width: 100vw; margin-left: calc(50% - 50vw);
+  margin-right: calc(50% - 50vw); padding: 0 1.5rem; }
+.article--wide .article__head, .article--wide .figure, .article--wide .proof-body,
+.article--wide .article__foot { max-width: 60rem; margin-left: auto; margin-right: auto; }
 .article__head { margin-bottom: 1.8rem; }
 .article__title { font-family: var(--ff-display); font-weight: 700;
   font-size: clamp(2rem, 5vw, 2.7rem); line-height: 1.1; letter-spacing: .004em;
@@ -260,5 +289,28 @@ pub const HOME_SRC: &str = r##"{% extends "base.html" %}
     {% else %}
     <p class="empty">Nothing set in type yet.</p>
     {% endif %}
+{% endblock %}
+"##;
+
+/// The full-width **page** template ([`PAGE_WIDE_TEMPLATE`]): structurally identical to
+/// [`SINGLE_SRC`] and consuming the IDENTICAL `SingleCtx`, differing only in the article's
+/// `article--wide` class — so a Page that selects it breaks out of the reading gauge to a
+/// full-width layout while every context variable (`is_home`, `preview_status`, byline,
+/// dateline, featured image) composes exactly as on the default template.
+pub const PAGE_WIDE_SRC: &str = r##"{% extends "base.html" %}
+{% block main %}
+    <article class="article--wide">
+      <header class="article__head">
+        {% if dateline or kicker %}<span class="slugline">{% if dateline %}<b>{{ dateline }}</b>{% endif %}{% if dateline and kicker %}<span class="dot"></span>{% endif %}{% if kicker %}{{ kicker }}{% endif %}</span>{% endif %}
+        <h1 class="article__title">{{ title }}</h1>
+        {% if author %}<div class="byline"><span class="byline__avatar" aria-hidden="true">{{ author_initials }}</span> By {{ author }}</div>{% endif %}
+      </header>
+      {% if featured_image %}<figure class="figure"><img src="{{ featured_image }}" alt="{{ title }}" loading="lazy"></figure>{% endif %}
+      <div class="proof-body">{{ body | safe }}</div>
+      <div class="article__foot">
+        <div class="press-rule" aria-hidden="true"></div>
+        {% if not preview_status %}<div id="fp-comments"></div>{% endif %}
+      </div>
+    </article>
 {% endblock %}
 "##;

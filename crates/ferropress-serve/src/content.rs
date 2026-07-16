@@ -49,7 +49,8 @@ use crate::authors::AuthorDirectory;
 use crate::cache_key;
 use crate::datefmt;
 use crate::templates::{
-    BASE_SRC, BASE_TEMPLATE, HOME_SRC, HOME_TEMPLATE, SINGLE_SRC, SINGLE_TEMPLATE,
+    BASE_SRC, BASE_TEMPLATE, HOME_SRC, HOME_TEMPLATE, PAGE_WIDE_SRC, PAGE_WIDE_TEMPLATE,
+    SINGLE_SRC, SINGLE_TEMPLATE, template_name_for,
 };
 
 /// Build the v1 [`ThemeEngine`] with the built-in public theme registered (shared
@@ -62,6 +63,7 @@ pub fn default_theme() -> Result<ThemeEngine, ThemeError> {
     theme.add_template(BASE_TEMPLATE.to_owned(), BASE_SRC.to_owned())?;
     theme.add_template(SINGLE_TEMPLATE.to_owned(), SINGLE_SRC.to_owned())?;
     theme.add_template(HOME_TEMPLATE.to_owned(), HOME_SRC.to_owned())?;
+    theme.add_template(PAGE_WIDE_TEMPLATE.to_owned(), PAGE_WIDE_SRC.to_owned())?;
     Ok(theme)
 }
 
@@ -123,6 +125,16 @@ pub(crate) struct CachedPage {
     pub featured_image: Option<String>,
     /// Whether this is a `Post` (shows a byline) vs a `Page` (does not).
     pub is_post: bool,
+    /// The chosen theme template VALUE for a page (e.g. `"page-wide"`), or `None` for the
+    /// default single template. Content-stable (a template edit is a Page save that
+    /// regenerates this envelope), so it is cached rather than resolved live. Posts never set
+    /// it. Composed at request time via
+    /// [`template_name_for`](crate::templates::template_name_for), which falls back to the
+    /// default on an unknown/absent value — so a legacy envelope with no `template` key
+    /// deserializes to `None` (serde defaults a missing `Option`) and renders the default with
+    /// NO re-render.
+    #[serde(default)]
+    pub template: Option<String>,
     /// Stored SEO metadata (canonical/description), if present.
     pub seo: Option<Seo>,
     /// The rendered, media-rewritten block body (emitted `| safe`).
@@ -493,6 +505,12 @@ pub(crate) async fn cached_page_from_object(
         },
         featured_image: featured_image_url(store, type_name, obj.id).await,
         is_post,
+        // The page's chosen template value (posts carry no `template` field → None). An empty
+        // string is treated as the default (None), matching the "" default in `page_templates`.
+        template: match obj.get("template") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        },
         seo: obj
             .get("seo")
             .and_then(Value::as_json)
@@ -558,8 +576,10 @@ fn compose_single(
         body: &page.body,
     };
 
+    // Pick the page's chosen template (default single for a post, an unset page, or an
+    // unknown/dropped value — `template_name_for` is the membership-checked fallback).
     theme
-        .render(SINGLE_TEMPLATE, &ctx)
+        .render(template_name_for(page.template.as_deref()), &ctx)
         // ThemeError does not convert to CoreError; carry its message so the HTTP
         // layer can log it and return a generic 500.
         .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))

@@ -320,6 +320,7 @@ async fn serve_path_cache_hit_composes_from_stored_envelope() {
         author_id: None,
         featured_image: None,
         is_post: true,
+        template: None,
         seo: None,
         body: SENTINEL_BODY.to_owned(),
     };
@@ -2694,5 +2695,118 @@ async fn regen_reloads_the_redirect_table_on_a_redirect_change() {
     assert_eq!(
         handle.lookup("/about/").map(|t| t.to),
         Some("/company".to_owned())
+    );
+}
+
+// --- Page theme templates (Phase 5) ---
+
+/// Set a page's `template` scalar (as the admin save does).
+async fn set_template(store: &Arc<dyn RhypeStore>, id: ObjectId, template: &str) {
+    let mut patch: HashMap<String, Value> = HashMap::new();
+    patch.insert("template".to_owned(), Value::String(template.to_owned()));
+    store
+        .update(&TypeName::from(PAGE_TYPE), id, patch)
+        .await
+        .expect("setting a page template must succeed");
+}
+
+#[tokio::test]
+async fn a_page_template_renders_a_different_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(dir.path());
+    let _plain = seed_page(&store, "about", Status::Published, "About.").await;
+    let wide = seed_page(&store, "showcase", Status::Published, "Showcase.").await;
+    set_template(&store, wide, "page-wide").await;
+    crate::backfill_page_paths(&store).await.expect("backfill");
+
+    let render = |path: &'static str| {
+        let (store, blobs, theme) = (store.clone(), blobs.clone(), theme.clone());
+        async move {
+            match serve_path(
+                &store,
+                &blobs,
+                &theme,
+                &NoCustomBlocks,
+                &SiteSettings::defaults(),
+                &AuthorDirectory::default(),
+                path,
+            )
+            .await
+            {
+                crate::Resolved::Found(html) => html,
+                other => panic!("expected Found, got {other:?}"),
+            }
+        }
+    };
+
+    let default_html = render("/about").await;
+    let wide_html = render("/showcase").await;
+    // Match the class USAGE, not the substring — `.article--wide` also appears as a CSS
+    // selector in every page's inlined stylesheet.
+    assert!(
+        !default_html.contains("class=\"article--wide\""),
+        "the default page uses the single template",
+    );
+    assert!(
+        wide_html.contains("class=\"article--wide\""),
+        "the page-wide page renders through the full-width template",
+    );
+}
+
+#[test]
+fn legacy_envelope_without_template_deserializes_to_none() {
+    // An envelope written before `template` existed carries no `template` key.
+    // `deny_unknown_fields` rejects only EXTRA keys, and serde defaults a missing `Option` to
+    // `None` — so a legacy envelope loads cleanly with `template: None` and renders the
+    // default, with NO re-render herd.
+    let json = serde_json::json!({
+        "title": "Legacy",
+        "excerpt": "",
+        "published_at": null,
+        "author_id": null,
+        "featured_image": null,
+        "is_post": false,
+        "seo": null,
+        "body": "<p>x</p>"
+    });
+    let page: crate::content::CachedPage =
+        serde_json::from_value(json).expect("a pre-template envelope must still deserialize");
+    assert_eq!(page.template, None);
+}
+
+#[tokio::test]
+async fn front_page_that_is_a_page_honors_its_template() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(dir.path());
+    let front = seed_page(&store, "landing", Status::Published, "Welcome.").await;
+    set_template(&store, front, "page-wide").await;
+    crate::backfill_page_paths(&store).await.expect("backfill");
+
+    // Configure this page as the static front page.
+    let mut settings = SiteSettings::defaults();
+    settings.front_page_id = Some(front.0);
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(html) => html,
+        other => panic!("expected Found at the front page, got {other:?}"),
+    };
+    assert!(
+        html.contains("class=\"article--wide\""),
+        "a page set as the front page renders with its chosen template (is_home)",
+    );
+    // And it is framed as the home page (the nav marks the front-page link current).
+    assert!(
+        html.contains("aria-current=\"page\""),
+        "the front page still marks the home nav current",
     );
 }
