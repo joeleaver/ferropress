@@ -32,6 +32,7 @@ use ferropress_render::CustomBlockRenderer;
 pub mod authors;
 pub mod content;
 pub mod datefmt;
+pub mod hierarchy;
 pub mod hook_bridge;
 pub mod settings;
 pub mod templates;
@@ -41,6 +42,7 @@ pub use content::{
     Resolved, default_theme, render_preview, resolve_path, resolve_published_entity, serve_path,
     slug_from_path,
 };
+pub use hierarchy::{BackfillReport, backfill_page_paths, join_page_path};
 pub use hook_bridge::HookBridge;
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
 

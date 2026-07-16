@@ -39,8 +39,8 @@ use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{
-    AuthorsHandle, HookBridge, ServeEngine, SettingsHandle, default_theme, load_author_directory,
-    load_site_settings,
+    AuthorsHandle, HookBridge, ServeEngine, SettingsHandle, backfill_page_paths, default_theme,
+    load_author_directory, load_site_settings,
 };
 use ferropress_store_embedded::EmbeddedStore;
 
@@ -89,6 +89,30 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // (a plugin reads its OWN config via `fp_get_setting`).
     let plugin_settings_reader: Arc<dyn PluginSettingsReader> = store.clone();
     let store: Arc<dyn RhypeStore> = store;
+
+    // Backfill every page's materialized `path` scalar from its parent chain BEFORE the
+    // read path + regen loop go live — the nested-permalink resolver keys pages on `path`,
+    // so a page that predates the field (or one a partially-applied re-parent cascade left
+    // drifted) would 404 until repaired. Idempotent: a steady-state boot writes nothing.
+    // A collision (legacy duplicate slugs → duplicate paths) or a cycle is logged, not
+    // fatal — the site still boots and serves the reachable pages.
+    match backfill_page_paths(&store)
+        .await
+        .context("backfilling page paths")?
+    {
+        report if report.updated > 0 || !report.collisions.is_empty() || report.cyclic > 0 => {
+            tracing::info!(
+                scanned = report.scanned,
+                updated = report.updated,
+                cyclic = report.cyclic,
+                collisions = ?report.collisions,
+                "page-path backfill applied",
+            );
+        }
+        report => {
+            tracing::debug!(scanned = report.scanned, "page paths already consistent");
+        }
+    }
 
     // Seed the live site-settings snapshot from the store ONCE at boot. The SAME
     // handle is shared with the HTTP read path (`AppState`) and the regen loop

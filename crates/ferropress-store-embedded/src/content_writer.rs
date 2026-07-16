@@ -58,6 +58,11 @@ impl ContentWriter for EmbeddedStore {
         let empty_body = BlockTree::from_blocks(Vec::new()).to_json_value()?;
         let mut fields: FieldMap = FieldMap::new();
         fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+        // A stub is always a top-level page (no `parent`), so its materialized public
+        // `path` equals its slug. Setting it here keeps a plugin-created stub reachable
+        // immediately (the nested-permalink resolver keys pages on `path`); without it
+        // the page would 404 until the next boot's path backfill.
+        fields.insert("path".to_owned(), Value::String(slug.to_owned()));
         fields.insert("title".to_owned(), Value::String(title.to_owned()));
         fields.insert(
             "status".to_owned(),

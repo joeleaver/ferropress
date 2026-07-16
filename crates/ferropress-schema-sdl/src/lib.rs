@@ -155,6 +155,7 @@ type Post {
 type Page {
     uuid: String @unique
     slug: String @indexed
+    path: String @indexed
     title: String
     status: String @indexed
     block_tree: Json
@@ -176,6 +177,7 @@ type Page {
 
     author: User @on_delete(deny)
     parent: Page @on_delete(remove)
+    children: [Page] @inverse(Page.parent)
     featured_media: Media @on_delete(remove)
     comments: [Comment] @inverse(Comment.page)
     revisions: [Revision] @inverse(Revision.parent_page)
