@@ -94,6 +94,12 @@ pub struct AppState {
     /// `None`, NO `/admin*` route is mounted — a public-only deployment. Injected by
     /// the composition root via [`with_admin`](Self::with_admin).
     pub admin: Option<AdminConfig>,
+    /// Serializes page-hierarchy-mutating admin writes (create/save that touch `parent`/`slug`
+    /// → the materialized `path`). Held across the cycle-check + path-uniqueness pre-flight and
+    /// the writes so two concurrent re-parents can't race into a cycle or a duplicate path. A
+    /// process-wide lock shared by every cloned handler; page edits are infrequent, so the
+    /// contention is negligible (posts are unaffected — they have no hierarchy).
+    pub hierarchy_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -117,6 +123,7 @@ impl AppState {
             hooks: Arc::new(NoHooks),
             plugins: Arc::new(NoPlugins),
             admin: None,
+            hierarchy_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

@@ -23,11 +23,11 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, header};
 use axum::response::{Html, IntoResponse, Response};
 
-use ferropress_core::POST_TYPE;
-use ferropress_core::value::{ObjectId, TypeName};
+use ferropress_core::value::{Object, ObjectId, TypeName};
+use ferropress_core::{PAGE_TYPE, POST_TYPE};
 use ferropress_serve::Resolved;
 
-use super::{AdminError, AuthedUser, posts};
+use super::{AdminError, AuthedUser, pages, posts};
 use crate::AppState;
 
 /// `GET /admin/preview/{id}` — render post `id` (any status) through the public theme
@@ -52,15 +52,42 @@ pub async fn preview(
         .await?;
     let author = posts::author_of(&state, ObjectId(id)).await?;
     who.require_post_access(author)?;
+    render(&state, POST_TYPE, &obj).await
+}
 
+/// `GET /admin/preview/page/{id}` — the page analogue of [`preview`]: render page `id` (any
+/// status) through the public theme in preview mode. Same authed + 404-masking + no-store/noindex
+/// contract; `render_preview` is already type-generic (a page renders with no byline, and honors
+/// its chosen template), so only the load + author check differ.
+pub async fn preview_page(
+    State(state): State<AppState>,
+    who: AuthedUser,
+    Path(id): Path<u64>,
+) -> Result<Response, AdminError> {
+    let obj = state
+        .store
+        .get(&TypeName::from(PAGE_TYPE), ObjectId(id))
+        .await?;
+    let author = pages::author_of(&state, ObjectId(id)).await?;
+    who.require_post_access(author)?;
+    render(&state, PAGE_TYPE, &obj).await
+}
+
+/// Render `obj` (type `type_name`) through the public theme in preview mode and stamp the
+/// `no-store` + `X-Robots-Tag: noindex` headers. Shared by the post + page preview routes.
+async fn render(
+    state: &AppState,
+    type_name: &'static str,
+    obj: &Object,
+) -> Result<Response, AdminError> {
     match ferropress_serve::render_preview(
         &state.store,
         &state.theme,
         state.custom.as_ref(),
         &state.settings.current(),
         &state.authors.current(),
-        POST_TYPE,
-        &obj,
+        type_name,
+        obj,
     )
     .await
     {

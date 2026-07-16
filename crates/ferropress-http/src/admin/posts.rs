@@ -19,13 +19,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use ferropress_core::block::BlockTree;
-use ferropress_core::query::{Compare, Edge, FilterSpec};
+use ferropress_core::query::Edge;
 use ferropress_core::role::Capability;
 use ferropress_core::status::Status;
 use ferropress_core::value::{FieldMap, Object, ObjectId, TypeName, Value, now_millis};
 use ferropress_core::{CoreError, MEDIA_TYPE, POST_TYPE, media_url};
 
-use super::{AdminError, AdminJson, AuthedUser, datetime_field, json_field, str_field};
+use super::{
+    AdminError, AdminJson, AuthedUser, content_ops, datetime_field, json_field, str_field,
+};
 use crate::AppState;
 
 /// A post's featured image, resolved for the client: the Media's `id` (echoed back
@@ -188,11 +190,9 @@ pub async fn save(
     Path(id): Path<u64>,
     AdminJson(body): AdminJson<SaveRequest>,
 ) -> Result<Json<SaveResponse>, AdminError> {
-    // Validate the request shape (independent of the stored resource) first.
-    let slug = body.slug.trim();
-    if slug.is_empty() {
-        return Err(AdminError::BadRequest("slug must not be empty".to_owned()));
-    }
+    // Validate the request shape (independent of the stored resource) first. A post slug must be
+    // a single flat path segment (the resolver's flat-vs-nested split assumes it).
+    let slug = content_ops::validate_slug(&body.slug)?;
     let new_status = parse_status(&body.status)
         .ok_or_else(|| AdminError::BadRequest(format!("unknown status {:?}", body.status)))?;
     let tree = BlockTree::from_json_value(body.block_tree.clone())
@@ -205,6 +205,7 @@ pub async fn save(
         .store
         .get(&TypeName::from(POST_TYPE), ObjectId(id))
         .await?;
+    let old_slug = str_field(&current, "slug").unwrap_or_default();
     let current_status =
         parse_status(&str_field(&current, "status").unwrap_or_default()).unwrap_or(Status::Draft);
     let author = author_of(&state, ObjectId(id)).await?;
@@ -226,10 +227,11 @@ pub async fn save(
         ensure_media_exists(&state, mid).await?;
     }
 
-    // Reject a slug already held by a DIFFERENT post (see [`slug_taken`]).
-    if slug_taken(&state, slug, Some(ObjectId(id))).await? {
+    // Reject a slug already held in the permalink namespace by ANOTHER entity — a different
+    // post OR a page at the same path (cross-entity: both share one cache key + resolver slot).
+    if content_ops::is_taken(&state, &slug, &[ObjectId(id)]).await? {
         return Err(AdminError::Conflict(format!(
-            "the slug {slug:?} is already used by another post"
+            "the slug {slug:?} is already in use"
         )));
     }
 
@@ -262,6 +264,12 @@ pub async fn save(
     // Reconcile the to-one `featured_media` relation to match the request (validated
     // above): drop whatever was featured, then link the new target if any.
     set_featured(&state, ObjectId(id), body.featured_media).await?;
+
+    // The slug (hence the post's permalink) may have moved. The slug scalar is now the new
+    // value, so evict the stale cache blob at the old path and record a 301 old→new (a no-op
+    // when the slug is unchanged) — closing the renamed-post-serves-stale gap symmetrically
+    // with pages.
+    content_ops::record_move(&state, &old_slug, &slug).await?;
 
     // A legacy null-author post that was just successfully edited is now attributed to
     // its editor (backfill-on-touch); best-effort so it never fails the save.
@@ -310,10 +318,7 @@ pub async fn create(
     // is forbidden.
     who.require(Capability::EditOwnContent)?;
 
-    let slug = body.slug.trim();
-    if slug.is_empty() {
-        return Err(AdminError::BadRequest("slug must not be empty".to_owned()));
-    }
+    let slug = content_ops::validate_slug(&body.slug)?;
     let status = initial_status(body.status.as_deref())?;
     // A new post born directly into a published state is a publish act — gate it. The
     // creator is the post's author, so authorize as the owner: a Contributor may create
@@ -329,17 +334,17 @@ pub async fn create(
         ensure_media_exists(&state, mid).await?;
     }
 
-    // No self to exclude on create: ANY post already at this slug is a clash.
-    if slug_taken(&state, slug, None).await? {
+    // No self to exclude on create: ANY post OR page already at this slug/path is a clash.
+    if content_ops::is_taken(&state, &slug, &[]).await? {
         return Err(AdminError::Conflict(format!(
-            "the slug {slug:?} is already used by another post"
+            "the slug {slug:?} is already in use"
         )));
     }
 
     let now = now_millis();
     let mut fields: FieldMap = HashMap::new();
     fields.insert("uuid".to_owned(), Value::String(Uuid::now_v7().to_string()));
-    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert("slug".to_owned(), Value::String(slug.clone()));
     fields.insert("title".to_owned(), Value::String(body.title));
     fields.insert(
         "status".to_owned(),
@@ -396,6 +401,10 @@ pub async fn create(
         return Err(e.into());
     }
 
+    // Shadow-guard: a live post now occupies this slug → drop any stale 301 FROM it (e.g. a
+    // path freed by an earlier rename that this new post reuses).
+    content_ops::retire_redirects_at(&state, &slug).await?;
+
     Ok(Json(CreateResponse {
         id: id.0,
         created_at: now,
@@ -405,7 +414,7 @@ pub async fn create(
 /// Validate the initial status of a NEW post. A post is born a `Draft`; an
 /// explicit status must be a legal departure from `Draft` (so `Published`,
 /// `Pending`, `Scheduled` are allowed) and never `Trashed`. Absent/empty → `Draft`.
-fn initial_status(raw: Option<&str>) -> Result<Status, AdminError> {
+pub(super) fn initial_status(raw: Option<&str>) -> Result<Status, AdminError> {
     match raw.map(str::trim) {
         None | Some("") => Ok(Status::Draft),
         Some(s) => {
@@ -423,31 +432,6 @@ fn initial_status(raw: Option<&str>) -> Result<Status, AdminError> {
             Ok(status)
         }
     }
-}
-
-/// Whether `slug` is already held by a post OTHER than `exclude` (or by ANY post
-/// when `exclude` is `None`). `Post.slug` is `@indexed`, NOT `@unique`, so the DB
-/// won't reject a duplicate — but the public router resolves a slug to exactly ONE
-/// post (`filter(slug ==, limit 1)`), so a collision would make one permanently
-/// unreachable. `save` excludes the post being edited; `create` has no self.
-async fn slug_taken(
-    state: &AppState,
-    slug: &str,
-    exclude: Option<ObjectId>,
-) -> Result<bool, AdminError> {
-    // limit 2 so that `self` plus one other are both visible to the exclusion.
-    Ok(state
-        .store
-        .filter(FilterSpec {
-            type_name: TypeName::from(POST_TYPE),
-            field: "slug".to_owned(),
-            op: Compare::Eq,
-            value: Value::String(slug.to_owned()),
-            limit: Some(2),
-        })
-        .await?
-        .iter()
-        .any(|o| Some(o.id) != exclude))
 }
 
 /// Build a list-row summary from a post object + its resolved featured image.
@@ -573,7 +557,7 @@ async fn resolve_featured(
 
 /// Fail with a `BadRequest` if no `Media` has id `media_id` (so an author can't
 /// feature a non-existent image, and a bad id is caught BEFORE any mutation).
-async fn ensure_media_exists(state: &AppState, media_id: u64) -> Result<(), AdminError> {
+pub(super) async fn ensure_media_exists(state: &AppState, media_id: u64) -> Result<(), AdminError> {
     match state
         .store
         .get(&TypeName::from(MEDIA_TYPE), ObjectId(media_id))
@@ -609,7 +593,10 @@ async fn set_featured(
         return Ok(());
     }
     if let Some(mid) = media_id {
-        state.store.link(&edge, ObjectId(mid), FieldMap::new()).await?;
+        state
+            .store
+            .link(&edge, ObjectId(mid), FieldMap::new())
+            .await?;
     }
     for (old, _) in existing {
         if Some(old.0) != media_id {
@@ -620,11 +607,11 @@ async fn set_featured(
 }
 
 /// `updated_at` if present, else `created_at` — the instant the list sorts on.
-fn effective_time(obj: &Object) -> Option<i64> {
+pub(super) fn effective_time(obj: &Object) -> Option<i64> {
     datetime_field(obj, "updated_at").or_else(|| datetime_field(obj, "created_at"))
 }
 
 /// Parse a snake_case status string into a [`Status`] via serde.
-fn parse_status(s: &str) -> Option<Status> {
+pub(super) fn parse_status(s: &str) -> Option<Status> {
     serde_json::from_value::<Status>(serde_json::Value::String(s.to_owned())).ok()
 }
