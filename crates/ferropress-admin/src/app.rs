@@ -389,8 +389,13 @@ pub fn app() -> NodeHandle {
                                 label { "Slug" }
                                 span { class: "slugbox",
                                     span { class: "slugbox__host", "/" }
+                                    // Controlled: a reactive `value` binding keeps the input
+                                    // in sync with the signal (an `open_post`/`new_post` load
+                                    // reflects here) without fighting the caret — rinch writes
+                                    // the DOM *property* only when it differs (pin `2ea7625`,
+                                    // upstream #100), so the type→oninput→signal echo is a no-op.
                                     input {
-                                        value: slug.get(),
+                                        value: {move || slug.get()},
                                         spellcheck: "false",
                                         oninput: move |v: String| slug.set(v),
                                     }
@@ -398,16 +403,22 @@ pub fn app() -> NodeHandle {
                             }
                             div { class: "metaitem",
                                 label { "Status" }
-                                // Native <select> (rinch#95 now delivers its change via
-                                // `oninput`). Uncontrolled: the current status is rendered
-                                // first so the browser shows it as the default — rinch emits
-                                // a boolean `selected` attr even when false, so a per-option
-                                // `selected` can't mark just one.
+                                // Controlled <select>: each option marks itself selected when
+                                // it matches the signal (`selected: {|| …}`). rinch reflects the
+                                // `selected` *property* and maps the stringified `false` to unset
+                                // (pin `2ea7625`, upstream #100), so exactly one option is marked
+                                // regardless of DOM order — no "render the current option first"
+                                // trick, and `oninput` writes edits straight back.
                                 select {
                                     class: "select",
                                     oninput: move |v: String| status.set(v),
-                                    for entry in status_options(&status.get()) {
-                                        option { key: entry.0.clone(), value: entry.0, {entry.1} }
+                                    for entry in api::STATUSES.iter().copied() {
+                                        option {
+                                            key: entry.0,
+                                            value: entry.0,
+                                            selected: {move || status.get() == entry.0},
+                                            {entry.1}
+                                        }
                                     }
                                 }
                             }
@@ -462,14 +473,14 @@ pub fn app() -> NodeHandle {
                         div { class: "sheet",
                             div { class: "sheet__inner",
                                 // The title is the headline set on the sheet (per the
-                                // mockup). Uncontrolled like the slug field: `value` is
-                                // read once at arm-build — after `open_post`/`new_post`
-                                // set the signal — and `oninput` feeds edits back (a
-                                // reactive `value` would fight the caret). Typing here
-                                // live-updates the masthead, which reads the same signal.
+                                // mockup). Controlled like the slug field: the reactive
+                                // `value` reflects an `open_post`/`new_post` load and stays
+                                // caret-safe (rinch writes the property only on a real change).
+                                // Typing here live-updates the masthead, which reads the
+                                // same signal.
                                 input {
                                     class: "sheet__title",
-                                    value: title.get(),
+                                    value: {move || title.get()},
                                     placeholder: "Untitled",
                                     spellcheck: "false",
                                     oninput: move |v: String| title.set(v),
@@ -1627,21 +1638,6 @@ fn avatar_initial(user: &Option<UserDto>) -> String {
         })
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_default()
-}
-
-/// The status options with the current one FIRST — an uncontrolled `<select>` shows
-/// its first option, so this makes the dropdown default to the post's current status
-/// (a per-option `selected` attr can't work: rinch emits it even when false). Owned
-/// `String`s so a status outside [`api::STATUSES`] is still shown + preserved.
-fn status_options(current: &str) -> Vec<(String, String)> {
-    let mut opts = Vec::with_capacity(api::STATUSES.len() + 1);
-    opts.push((current.to_owned(), api::status_label(current)));
-    for (value, label) in api::STATUSES {
-        if *value != current {
-            opts.push(((*value).to_owned(), (*label).to_owned()));
-        }
-    }
-    opts
 }
 
 /// The signed-in user's display name (falls back to the username).
