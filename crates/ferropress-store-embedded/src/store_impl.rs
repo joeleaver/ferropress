@@ -49,14 +49,51 @@ fn join<T>(
     }
 }
 
+/// Run a synchronous engine WRITE, retrying a bounded number of times on the
+/// transient [`WriteConflict`](rhypedb_engine::error::EngineError::WriteConflict) the
+/// storage layer returns when an optimistic commit races another writer. The common
+/// source is rhypedb's ASYNC cover-refresh worker: a `link`/`unlink` enqueues a
+/// background cover refresh for the edge target, whose commit can collide with a
+/// foreground write to the same object moments later (e.g. save-then-set-featured, or
+/// the page-path cascade linking a parent then updating its path). A `WriteConflict`
+/// means the commit did NOT land, so re-running the verb is safe for every mutating
+/// op — create/update/delete/link/unlink alike (a conflicted create committed nothing,
+/// so a retry mints exactly one object). Non-conflict errors return immediately.
+///
+/// Runs entirely inside the caller's `spawn_blocking` thread (a short `thread::sleep`
+/// backoff is a blocking sleep, which is correct here). Bounded so a genuinely
+/// persistent conflict still surfaces rather than spinning forever.
+fn retry_write<T>(
+    mut op: impl FnMut() -> rhypedb_engine::error::EngineResult<T>,
+) -> rhypedb_engine::error::EngineResult<T> {
+    use rhypedb_engine::error::EngineError;
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut attempt: u32 = 0;
+    loop {
+        match op() {
+            Err(EngineError::WriteConflict) if attempt + 1 < MAX_ATTEMPTS => {
+                attempt += 1;
+                // Linear backoff to let the racing (cover-refresh) commit land before
+                // we re-read + re-commit. Worst case ~56ms total across 8 attempts.
+                std::thread::sleep(std::time::Duration::from_millis(2 * u64::from(attempt)));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[async_trait]
 impl RhypeStore for EmbeddedStore {
     async fn create(&self, type_: &TypeName, fields: FieldMap) -> CoreResult<ObjectId> {
         let db = Arc::clone(self.db());
         let type_name = type_.as_str().to_owned();
         let db_fields = convert::to_db_fields(fields);
-        let obj =
-            join(tokio::task::spawn_blocking(move || db.create(&type_name, db_fields)).await)?;
+        let obj = join(
+            tokio::task::spawn_blocking(move || {
+                retry_write(|| db.create(&type_name, db_fields.clone()))
+            })
+            .await,
+        )?;
         Ok(ObjectId(obj.id))
     }
 
@@ -68,8 +105,12 @@ impl RhypeStore for EmbeddedStore {
         let db = Arc::clone(self.db());
         let type_name = type_.as_str().to_owned();
         let db_rows: Vec<_> = rows.into_iter().map(convert::to_db_fields).collect();
-        let objs =
-            join(tokio::task::spawn_blocking(move || db.create_batch(&type_name, db_rows)).await)?;
+        let objs = join(
+            tokio::task::spawn_blocking(move || {
+                retry_write(|| db.create_batch(&type_name, db_rows.clone()))
+            })
+            .await,
+        )?;
         Ok(objs.into_iter().map(|o| ObjectId(o.id)).collect())
     }
 
@@ -106,7 +147,12 @@ impl RhypeStore for EmbeddedStore {
         let db_patch = convert::to_db_fields(patch);
         // `update` returns the merged Object; the port contract is `()`, so the
         // merged object is discarded (callers re-`get` if they need it).
-        join(tokio::task::spawn_blocking(move || db.update(&type_name, oid, db_patch)).await)?;
+        join(
+            tokio::task::spawn_blocking(move || {
+                retry_write(|| db.update(&type_name, oid, db_patch.clone()))
+            })
+            .await,
+        )?;
         Ok(())
     }
 
@@ -114,7 +160,7 @@ impl RhypeStore for EmbeddedStore {
         let db = Arc::clone(self.db());
         let type_name = type_.as_str().to_owned();
         let ObjectId(oid) = id;
-        join(tokio::task::spawn_blocking(move || db.delete(&type_name, oid)).await)
+        join(tokio::task::spawn_blocking(move || retry_write(|| db.delete(&type_name, oid))).await)
     }
 
     async fn link(&self, from: &Edge, to: ObjectId, edge_fields: FieldMap) -> CoreResult<()> {
@@ -126,13 +172,15 @@ impl RhypeStore for EmbeddedStore {
         let db_edge = convert::to_db_fields(edge_fields);
         join(
             tokio::task::spawn_blocking(move || {
-                db.link(
-                    &source_type,
-                    source_id,
-                    &field_name,
-                    target_id,
-                    Some(db_edge),
-                )
+                retry_write(|| {
+                    db.link(
+                        &source_type,
+                        source_id,
+                        &field_name,
+                        target_id,
+                        Some(db_edge.clone()),
+                    )
+                })
             })
             .await,
         )
@@ -146,7 +194,7 @@ impl RhypeStore for EmbeddedStore {
         let ObjectId(target_id) = to;
         join(
             tokio::task::spawn_blocking(move || {
-                db.unlink(&source_type, source_id, &field_name, target_id)
+                retry_write(|| db.unlink(&source_type, source_id, &field_name, target_id))
             })
             .await,
         )

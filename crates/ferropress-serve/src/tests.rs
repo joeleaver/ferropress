@@ -2379,3 +2379,137 @@ async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
         "the cache-hit (envelope round-trip) render must equal the cache-miss render"
     );
 }
+
+// --- Page hierarchy: materialized-path backfill + the self-inverse `children` edge ---
+
+/// Link `child`'s `parent` to-one edge to `parent` (page hierarchy).
+async fn link_parent(store: &Arc<dyn RhypeStore>, child: ObjectId, parent: ObjectId) {
+    let edge = Edge {
+        type_name: TypeName::from(PAGE_TYPE),
+        id: child,
+        field: "parent".to_owned(),
+    };
+    store
+        .link(&edge, parent, HashMap::new())
+        .await
+        .expect("linking a page parent must succeed");
+}
+
+/// Read a page's stored `path` scalar (empty when unset).
+async fn page_path(store: &Arc<dyn RhypeStore>, id: ObjectId) -> String {
+    match store
+        .get(&TypeName::from(PAGE_TYPE), id)
+        .await
+        .expect("get page")
+        .get("path")
+    {
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+#[tokio::test]
+async fn backfill_computes_flat_and_nested_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _blobs, _theme) = boot(dir.path());
+
+    // A three-deep chain about -> team -> history, all created BEFORE any `path`
+    // (seed_page writes none), i.e. the legacy/pre-field state the backfill repairs.
+    let about = seed_page(&store, "about", Status::Published, "About.").await;
+    let team = seed_page(&store, "team", Status::Published, "Team.").await;
+    let history = seed_page(&store, "history", Status::Published, "History.").await;
+    link_parent(&store, team, about).await;
+    link_parent(&store, history, team).await;
+
+    assert_eq!(
+        page_path(&store, history).await,
+        "",
+        "no path before backfill"
+    );
+
+    let report = crate::backfill_page_paths(&store).await.expect("backfill");
+    assert_eq!(report.scanned, 3);
+    assert_eq!(report.updated, 3);
+    assert!(report.collisions.is_empty());
+    assert_eq!(report.cyclic, 0);
+
+    assert_eq!(page_path(&store, about).await, "about");
+    assert_eq!(page_path(&store, team).await, "about/team");
+    assert_eq!(page_path(&store, history).await, "about/team/history");
+}
+
+#[tokio::test]
+async fn backfill_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _blobs, _theme) = boot(dir.path());
+    let about = seed_page(&store, "about", Status::Published, "About.").await;
+    let team = seed_page(&store, "team", Status::Published, "Team.").await;
+    link_parent(&store, team, about).await;
+
+    let first = crate::backfill_page_paths(&store).await.expect("backfill");
+    assert_eq!(first.updated, 2);
+    let second = crate::backfill_page_paths(&store).await.expect("backfill");
+    assert_eq!(second.updated, 0, "a steady-state re-run writes nothing");
+    assert_eq!(second.scanned, 2);
+}
+
+#[tokio::test]
+async fn backfill_reports_a_cycle_without_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _blobs, _theme) = boot(dir.path());
+    // Two pages each the other's parent — a corrupt cycle. The bounded walk must report
+    // them and never spin.
+    let a = seed_page(&store, "a", Status::Published, "A.").await;
+    let b = seed_page(&store, "b", Status::Published, "B.").await;
+    link_parent(&store, a, b).await;
+    link_parent(&store, b, a).await;
+
+    let report = crate::backfill_page_paths(&store).await.expect("backfill");
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.cyclic, 2, "both pages are on the cycle");
+    assert_eq!(report.updated, 0, "no path is written for a cyclic page");
+}
+
+#[tokio::test]
+async fn backfill_detects_duplicate_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _blobs, _theme) = boot(dir.path());
+    // Two top-level pages sharing a slug (legacy: Page.slug was @indexed-not-unique) both
+    // compute path "dup" — a collision the report surfaces for reconciliation.
+    seed_page(&store, "dup", Status::Published, "One.").await;
+    seed_page(&store, "dup", Status::Published, "Two.").await;
+
+    let report = crate::backfill_page_paths(&store).await.expect("backfill");
+    assert_eq!(report.collisions, vec!["dup".to_owned()]);
+}
+
+#[tokio::test]
+async fn children_inverse_edge_traverses() {
+    // Prove the self-referential `children: [Page] @inverse(Page.parent)` edge returns a
+    // parent's children — the Phase-4 cascade relies on this reverse traversal, and there
+    // is no other self-inverse in the schema to lean on for precedent.
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _blobs, _theme) = boot(dir.path());
+    let parent = seed_page(&store, "parent", Status::Published, "P.").await;
+    let child_a = seed_page(&store, "child-a", Status::Published, "A.").await;
+    let child_b = seed_page(&store, "child-b", Status::Published, "B.").await;
+    link_parent(&store, child_a, parent).await;
+    link_parent(&store, child_b, parent).await;
+
+    let edge = Edge {
+        type_name: TypeName::from(PAGE_TYPE),
+        id: parent,
+        field: "children".to_owned(),
+    };
+    let mut kids: Vec<u64> = store
+        .get_links(&edge)
+        .await
+        .expect("children inverse traverses")
+        .into_iter()
+        .map(|(id, _)| id.0)
+        .collect();
+    kids.sort();
+    let mut want = vec![child_a.0, child_b.0];
+    want.sort();
+    assert_eq!(kids, want, "the children inverse returns both children");
+}
