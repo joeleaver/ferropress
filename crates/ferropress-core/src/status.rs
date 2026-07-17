@@ -54,7 +54,10 @@ impl Status {
     /// and `Trashed` do not. Distinct from [`can_transition_to`](Self::can_transition_to),
     /// which governs *whether* a transition is legal at all, not *who* may make it.
     pub fn is_publish_state(self) -> bool {
-        matches!(self, Status::Published | Status::Scheduled | Status::Private)
+        matches!(
+            self,
+            Status::Published | Status::Scheduled | Status::Private
+        )
     }
 
     pub fn as_str(self) -> &'static str {
