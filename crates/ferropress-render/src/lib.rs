@@ -193,7 +193,10 @@ mod tests {
 
     #[test]
     fn renders_safe_link_as_anchor() {
-        let html = render(&para(vec![linked("docs", "https://example.com/a?b=c")]), RenderMode::Publish);
+        let html = render(
+            &para(vec![linked("docs", "https://example.com/a?b=c")]),
+            RenderMode::Publish,
+        );
         assert_eq!(
             html.as_str(),
             "<p><a href=\"https://example.com/a?b=c\">docs</a></p>"
@@ -202,10 +205,19 @@ mod tests {
 
     #[test]
     fn renders_relative_and_mailto_links() {
-        let rel = render(&para(vec![linked("about", "/about#team")]), RenderMode::Publish);
+        let rel = render(
+            &para(vec![linked("about", "/about#team")]),
+            RenderMode::Publish,
+        );
         assert!(rel.as_str().contains("<a href=\"/about#team\">about</a>"));
-        let mail = render(&para(vec![linked("mail", "mailto:hi@example.com")]), RenderMode::Publish);
-        assert!(mail.as_str().contains("<a href=\"mailto:hi@example.com\">mail</a>"));
+        let mail = render(
+            &para(vec![linked("mail", "mailto:hi@example.com")]),
+            RenderMode::Publish,
+        );
+        assert!(
+            mail.as_str()
+                .contains("<a href=\"mailto:hi@example.com\">mail</a>")
+        );
     }
 
     #[test]
@@ -213,11 +225,27 @@ mod tests {
         // A `javascript:` href must NOT become an executable anchor; the visible
         // (escaped) text survives so no content is lost. This is the stored-XSS
         // guard the link toolbar directly exposes.
-        for href in ["javascript:alert(1)", "data:text/html,<script>alert(1)</script>", "vbscript:x"] {
+        for href in [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:x",
+        ] {
             let html = render(&para(vec![linked("click me", href)]), RenderMode::Publish);
-            assert!(!html.as_str().contains("<a "), "{href} must not produce an anchor: {}", html.as_str());
-            assert!(!html.as_str().contains("javascript:"), "scheme must not appear: {}", html.as_str());
-            assert!(html.as_str().contains("click me"), "link text must survive: {}", html.as_str());
+            assert!(
+                !html.as_str().contains("<a "),
+                "{href} must not produce an anchor: {}",
+                html.as_str()
+            );
+            assert!(
+                !html.as_str().contains("javascript:"),
+                "scheme must not appear: {}",
+                html.as_str()
+            );
+            assert!(
+                html.as_str().contains("click me"),
+                "link text must survive: {}",
+                html.as_str()
+            );
         }
     }
 
@@ -236,7 +264,10 @@ mod tests {
             url: "https://youtu.be/abc".to_owned(),
         })]);
         let html = render(&tree, RenderMode::Publish);
-        assert!(html.as_str().contains("<a href=\"https://youtu.be/abc\" rel=\"noopener\">"));
+        assert!(
+            html.as_str()
+                .contains("<a href=\"https://youtu.be/abc\" rel=\"noopener\">")
+        );
     }
 
     #[test]
@@ -252,8 +283,16 @@ mod tests {
             let html = render(&tree, RenderMode::Publish);
             // No anchor at all, and specifically no executable href. The url may
             // still appear as inert escaped label text — that's harmless.
-            assert!(!html.as_str().contains("<a "), "{url:?} must not produce an anchor: {}", html.as_str());
-            assert!(!html.as_str().contains("href="), "{url:?} must not emit an href: {}", html.as_str());
+            assert!(
+                !html.as_str().contains("<a "),
+                "{url:?} must not produce an anchor: {}",
+                html.as_str()
+            );
+            assert!(
+                !html.as_str().contains("href="),
+                "{url:?} must not emit an href: {}",
+                html.as_str()
+            );
         }
     }
 
@@ -264,10 +303,21 @@ mod tests {
         // angle brackets are escaped so the payload can't close the attribute and
         // inject a tag.
         let html = render(
-            &para(vec![linked("x", "https://example.com/\"><script>alert(1)</script>")]),
+            &para(vec![linked(
+                "x",
+                "https://example.com/\"><script>alert(1)</script>",
+            )]),
             RenderMode::Publish,
         );
-        assert!(!html.as_str().contains("<script"), "must not break out of href: {}", html.as_str());
-        assert!(html.as_str().contains("&quot;"), "quote must be escaped: {}", html.as_str());
+        assert!(
+            !html.as_str().contains("<script"),
+            "must not break out of href: {}",
+            html.as_str()
+        );
+        assert!(
+            html.as_str().contains("&quot;"),
+            "quote must be escaped: {}",
+            html.as_str()
+        );
     }
 }
