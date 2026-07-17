@@ -172,6 +172,69 @@ async fn seed_media(store: &Arc<dyn RhypeStore>, uuid: &str) -> ObjectId {
         .expect("seeding a media must succeed")
 }
 
+/// A one-block body whose single block is a `Custom` block owned by `plugin` (a
+/// callout, say) — so a test post/page's block tree references that plugin id and
+/// `BlockTree::referenced_plugin_ids` picks it up. The `NoCustomBlocks` renderer bakes
+/// a placeholder for it, which is irrelevant to eviction (eviction reads the block TREE
+/// from the store, not the rendered body).
+fn custom_block_tree_json(plugin: &str) -> serde_json::Value {
+    let tree = BlockTree::from_blocks(vec![Block {
+        uid: "01J0000000000000000000CUST".to_owned(),
+        kind: BlockKind::Custom {
+            plugin: plugin.to_owned(),
+            name: plugin.to_owned(),
+            data: serde_json::json!({ "text": "hi" }),
+        },
+        children: Vec::new(),
+    }]);
+    tree.to_json_value().expect("custom block tree serializes")
+}
+
+/// Seed a Post with an explicit block tree (so a test can give it a `Custom` block).
+async fn seed_post_with_block_tree(
+    store: &Arc<dyn RhypeStore>,
+    slug: &str,
+    status: Status,
+    block_tree: serde_json::Value,
+) -> ObjectId {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(status.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String("Callout Post".to_owned()));
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert("block_tree".to_owned(), Value::Json(block_tree));
+    store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .expect("seeding a post must succeed")
+}
+
+/// Seed a Page with an explicit block tree AND a materialized `path` (a Page's cache key
+/// derives from `path`, not `slug`), so a test can evict its permalink by path.
+async fn seed_page_with_block_tree(
+    store: &Arc<dyn RhypeStore>,
+    path: &str,
+    status: Status,
+    block_tree: serde_json::Value,
+) -> ObjectId {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(path.to_owned()));
+    fields.insert("path".to_owned(), Value::String(path.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(status.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String("Callout Page".to_owned()));
+    fields.insert("block_tree".to_owned(), Value::Json(block_tree));
+    store
+        .create(&TypeName::from(PAGE_TYPE), fields)
+        .await
+        .expect("seeding a page must succeed")
+}
+
 /// A `Setting`-typed change carrying its row `key` on the change fields — matching what the
 /// engine publishes (the full merged scalar snapshot). The regen loop reads `key` to decide
 /// whether the changed setting reshapes the cached front page.
@@ -430,6 +493,369 @@ async fn regen_write_through_then_eviction() {
     assert!(
         !blobs.exists(&key).await.unwrap(),
         "regen must EVICT the cache entry once the entity is unpublished",
+    );
+}
+
+/// A `plugin.{id}.*` config change EVICTS exactly the cached pages whose block tree bakes a
+/// `Custom` block owned by that plugin — and leaves pages that don't use it untouched.
+#[tokio::test]
+async fn plugin_setting_change_evicts_only_pages_using_that_plugin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    // One post BAKES a callout block; one is plain prose.
+    let callout_id = seed_post_with_block_tree(
+        &store,
+        "callout-post",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    let plain_id = seed_post(&store, "plain-post", Status::Published).await;
+    // A third post bakes a DIFFERENT plugin's block — it must survive a plugin.callout change.
+    // This pins the discrimination that the `!referenced_plugin_ids().contains(id)` guard makes:
+    // a bug like `!...is_empty()` would still evict this page (its plugin set is non-empty) and
+    // pass every other assertion here.
+    let gallery_id = seed_post_with_block_tree(
+        &store,
+        "gallery-post",
+        Status::Published,
+        custom_block_tree_json("gallery"),
+    )
+    .await;
+
+    // A galley front (default settings → front_page_id = None) so the conservative `/`
+    // eviction does NOT fire and we can assert precisely on the permalink blobs.
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()));
+
+    let callout_key = cache_key("/callout-post");
+    let plain_key = cache_key("/plain-post");
+    let gallery_key = cache_key("/gallery-post");
+
+    // Warm all three caches with a normal content write-through.
+    for id in [callout_id, plain_id, gallery_id] {
+        engine
+            .apply_change(&change(ChangeKind::Update, id))
+            .await
+            .expect("warm cache");
+    }
+    assert!(
+        blobs.exists(&callout_key).await.unwrap(),
+        "callout post cached"
+    );
+    assert!(blobs.exists(&plain_key).await.unwrap(), "plain post cached");
+    assert!(
+        blobs.exists(&gallery_key).await.unwrap(),
+        "gallery post cached"
+    );
+
+    // The callout plugin's config changes.
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("plugin-setting change applies");
+
+    assert!(
+        !blobs.exists(&callout_key).await.unwrap(),
+        "a plugin.callout.* change must EVICT the page baking a callout block",
+    );
+    assert!(
+        blobs.exists(&plain_key).await.unwrap(),
+        "a page using NO plugin must SURVIVE the plugin-config change",
+    );
+    assert!(
+        blobs.exists(&gallery_key).await.unwrap(),
+        "a page baking a DIFFERENT plugin's block must SURVIVE a plugin.callout change",
+    );
+}
+
+/// A core (non-plugin) `Setting` change must regenerate NO content pages — the plugin
+/// branch is gated on the key parsing to a valid plugin id, preserving the "a settings
+/// change regenerates no pages" guardrail for `site.*` / `reading.*` (non-front) keys.
+#[tokio::test]
+async fn non_plugin_setting_change_evicts_no_content_pages() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    let id = seed_post_with_block_tree(
+        &store,
+        "callout-post",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()));
+    let key = cache_key("/callout-post");
+    engine
+        .apply_change(&change(ChangeKind::Update, id))
+        .await
+        .expect("warm cache");
+    assert!(blobs.exists(&key).await.unwrap(), "cached");
+
+    engine
+        .apply_change(&setting_change_with_key(ChangeKind::Update, "site.title"))
+        .await
+        .expect("core setting change applies");
+
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "a core (non-plugin) setting change must not evict content pages",
+    );
+}
+
+/// The eviction fires on a plugin-config DELETE too, not only Create/Update: clearing a
+/// plugin's config reverts `fp_get_setting` to the plugin's compiled-in default, an equally
+/// stale change. (The `SETTING_TYPE` branch is deliberately kind-agnostic.)
+#[tokio::test]
+async fn plugin_setting_delete_change_also_evicts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    let id = seed_post_with_block_tree(
+        &store,
+        "callout-post",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()));
+    let key = cache_key("/callout-post");
+    engine
+        .apply_change(&change(ChangeKind::Update, id))
+        .await
+        .expect("warm cache");
+    assert!(blobs.exists(&key).await.unwrap(), "cached");
+
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Delete,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("plugin-setting delete applies");
+
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "a plugin-config DELETE must also evict pages baking that plugin's blocks",
+    );
+}
+
+/// A static front page that bakes the plugin's block: a plugin-config change must evict BOTH
+/// the page's own permalink blob AND the `/` LISTING blob (a `CachedFront::Static` bakes the
+/// page body under a different key than its permalink).
+#[tokio::test]
+async fn plugin_setting_change_evicts_the_static_front_listing_blob() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    // A published static front page that bakes a callout block.
+    let page_id = seed_page_with_block_tree(
+        &store,
+        "home",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    seed_setting(&store, "reading.show_on_front", "\"page\"").await;
+    seed_setting(&store, "reading.page_on_front", &page_id.0.to_string()).await;
+    let settings = crate::settings::load_site_settings(&store).await.unwrap();
+    assert_eq!(
+        settings.front_page_id,
+        Some(page_id.0),
+        "front page configured"
+    );
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings));
+
+    // Simulate both the `/` listing blob and the page's own permalink being cached.
+    let front_key = cache_key("/");
+    let page_key = cache_key("/home");
+    blobs
+        .put(&front_key, b"cached-front".to_vec())
+        .await
+        .unwrap();
+    blobs.put(&page_key, b"cached-page".to_vec()).await.unwrap();
+
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("plugin-setting change applies");
+
+    assert!(
+        !blobs.exists(&front_key).await.unwrap(),
+        "the static-front `/` LISTING blob must be evicted when the front page bakes the plugin",
+    );
+    assert!(
+        !blobs.exists(&page_key).await.unwrap(),
+        "the front page's own permalink blob must be evicted",
+    );
+}
+
+/// Without a settings handle the engine cannot identify the static front page, so it evicts
+/// `/` CONSERVATIVELY on a plugin-config change — parity with `invalidate_front_for_content`'s
+/// None branch (the read path caches `/` regardless of whether this engine holds a handle).
+#[tokio::test]
+async fn plugin_setting_change_without_settings_handle_evicts_front_conservatively() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    seed_post_with_block_tree(
+        &store,
+        "callout-post",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    // No `.with_settings(...)`.
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    );
+
+    let front_key = cache_key("/");
+    blobs
+        .put(&front_key, b"cached-front".to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("plugin-setting change applies");
+
+    assert!(
+        !blobs.exists(&front_key).await.unwrap(),
+        "without a settings handle, `/` must be evicted conservatively on a plugin-config change",
+    );
+}
+
+/// A nested Page (multi-segment materialized `path`) is evicted by its FULL path — the
+/// headline case for the `/parent/child` hierarchy. Its cache key derives from `path` (not
+/// `slug`), so eviction must key on `prerender/permalink/docs/guide.html`.
+#[tokio::test]
+async fn plugin_setting_change_evicts_a_nested_page_by_its_full_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    seed_page_with_block_tree(
+        &store,
+        "docs/guide",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    // Default settings (galley front) so the conservative `/` eviction does not fire.
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()));
+
+    let nested_key = cache_key("/docs/guide");
+    assert_eq!(
+        nested_key.0, "prerender/permalink/docs/guide.html",
+        "a nested page keys on its full materialized path"
+    );
+    blobs
+        .put(&nested_key, b"cached-nested".to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("plugin-setting change applies");
+
+    assert!(
+        !blobs.exists(&nested_key).await.unwrap(),
+        "a nested page baking the plugin must be evicted by its full /parent/child path",
+    );
+}
+
+/// A row whose block tree fails to PARSE must be logged-and-skipped, NEVER abort the scan —
+/// else one bad row would silently leave the rest of the plugin's pages stale (a partial miss
+/// worse than the pre-fix status quo). The corrupt row is seeded FIRST (lower id → scanned
+/// first), so a regression that `?`-propagated the parse error would abort before reaching the
+/// healthy callout page and this test would catch it.
+#[tokio::test]
+async fn a_malformed_block_tree_row_does_not_abort_the_plugin_eviction_scan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    // Valid JSON that does NOT deserialize into a BlockTree (`schema_version` must be a u32),
+    // so `BlockTree::from_json_value` returns Err on it during the eviction scan.
+    seed_post_with_block_tree(
+        &store,
+        "corrupt-post",
+        Status::Published,
+        serde_json::json!({ "schema_version": "not-a-number", "blocks": [] }),
+    )
+    .await;
+    // A healthy callout page AFTER it (higher id → scanned later).
+    let good_id = seed_post_with_block_tree(
+        &store,
+        "good-callout",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()));
+
+    let good_key = cache_key("/good-callout");
+    engine
+        .apply_change(&change(ChangeKind::Update, good_id))
+        .await
+        .expect("warm good cache");
+    assert!(blobs.exists(&good_key).await.unwrap(), "good post cached");
+
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("the plugin change must apply despite a corrupt row");
+
+    assert!(
+        !blobs.exists(&good_key).await.unwrap(),
+        "the corrupt row must be skipped (not abort the scan) so the healthy callout page is still evicted",
     );
 }
 

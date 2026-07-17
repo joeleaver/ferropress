@@ -56,9 +56,27 @@ pub fn plugin_setting_key(plugin_id: &str, bare_key: &str) -> String {
     format!("plugin.{plugin_id}.{bare_key}")
 }
 
+/// The inverse of [`plugin_setting_key`]: extract the plugin id from a fully-qualified
+/// plugin setting key, or `None` if `key` is not a well-formed one.
+///
+/// Because a plugin id is dot-free ([`is_valid_plugin_id`]), the id is unambiguously
+/// the segment between the `plugin.` prefix and the FIRST following `.`; everything
+/// after it is the (possibly dotted) bare key. A key with no bare part
+/// (`"plugin.callout"`), an empty/invalid id (`"plugin..x"`), or a non-plugin key
+/// (`"site.title"`) returns `None`.
+///
+/// This is a deliberately fail-CLOSED parse: the caller (a change-feed consumer that
+/// regenerates the pages using a plugin whose config changed) cannot act on a key it
+/// can't map to a plugin id, so `None` must mean "not a plugin setting — do nothing",
+/// never "assume all plugins". Contrast the site-front invalidation, which fails OPEN.
+pub fn plugin_id_from_setting_key(key: &str) -> Option<&str> {
+    let (id, bare) = key.strip_prefix("plugin.")?.split_once('.')?;
+    (is_valid_plugin_id(id) && !bare.is_empty()).then_some(id)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_valid_plugin_id;
+    use super::{is_valid_plugin_id, plugin_id_from_setting_key, plugin_setting_key};
 
     #[test]
     fn valid_plugin_ids_exclude_dots_and_empties() {
@@ -69,6 +87,44 @@ mod tests {
         // between a dotted-prefix id pair (`acme` + `pro.color` vs `acme.pro` + `color`).
         for bad in ["", "acme.pro", "a b", "a/b", "café", "a.", ".a"] {
             assert!(!is_valid_plugin_id(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn plugin_id_parses_from_a_well_formed_key() {
+        assert_eq!(
+            plugin_id_from_setting_key("plugin.callout.default_variant"),
+            Some("callout")
+        );
+        // A bare key MAY contain dots — only the id is dot-free, so split on the FIRST.
+        assert_eq!(
+            plugin_id_from_setting_key("plugin.foo.bar.baz"),
+            Some("foo")
+        );
+        // Round-trips with the constructor.
+        assert_eq!(
+            plugin_id_from_setting_key(&plugin_setting_key("backlink-index", "depth")),
+            Some("backlink-index"),
+        );
+    }
+
+    #[test]
+    fn plugin_id_rejects_non_plugin_and_malformed_keys() {
+        for none in [
+            "site.title",             // a core key, not a plugin key
+            "reading.posts_per_page", // "
+            "plugin.callout",         // no bare key after the id
+            "plugin.",                // no id, no bare
+            "plugin..x",              // empty id
+            "plugin.a b.x",           // invalid id (space)
+            "callout.default",        // missing the `plugin.` prefix
+            "",
+        ] {
+            assert_eq!(
+                plugin_id_from_setting_key(none),
+                None,
+                "{none:?} must be None"
+            );
         }
     }
 }

@@ -39,7 +39,10 @@ pub use page::Page;
 pub use post::Post;
 pub use redirect::Redirect;
 pub use revision::{Revision, RevisionKind};
-pub use setting::{Setting, is_valid_plugin_id, plugin_setting_key, plugin_setting_prefix};
+pub use setting::{
+    Setting, is_valid_plugin_id, plugin_id_from_setting_key, plugin_setting_key,
+    plugin_setting_prefix,
+};
 pub use taxonomy::{Taxonomy, Term};
 pub use user::User;
 
