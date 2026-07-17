@@ -274,6 +274,190 @@ pub async fn create_post(body: &CreateRequest) -> Result<u64, ApiError> {
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
+// ── pages ────────────────────────────────────────────────────────────────────────
+//
+// Pages are the hierarchical content type: each is served at a NESTED permalink built
+// from its ancestor slugs + its own slug (the materialized `path`). The editor DTOs
+// mirror `ferropress-http/src/admin/pages.rs` and add the hierarchy fields posts lack
+// (`path`, `parent`, `menu_order`, `depth`, `template`). Distinct types from the post
+// DTOs so the two surfaces can't silently drift.
+
+/// One row of `GET /admin/api/pages` — a page in the tree. `path` is the full
+/// materialized permalink; `depth` (ancestor count) drives the list indent; `parent`
+/// and `menu_order` are the hierarchy/order keys.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct PageSummary {
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+    #[serde(default)]
+    pub menu_order: i32,
+    #[serde(default)]
+    pub parent: Option<u64>,
+    /// Ancestor count (0 = top-level), for the tree indent.
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default)]
+    pub featured_media: Option<FeaturedMedia>,
+}
+
+/// `GET /admin/api/pages/{id}` — a page with its body + hierarchy meta, for the editor.
+#[derive(Deserialize)]
+pub struct PageDetail {
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub block_tree: serde_json::Value,
+    #[serde(default)]
+    pub menu_order: i32,
+    #[serde(default)]
+    pub parent: Option<u64>,
+    /// The chosen theme template value (e.g. `"page-wide"`), or `None` for the default.
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub featured_media: Option<FeaturedMedia>,
+}
+
+/// `PUT /admin/api/pages/{id}` body. Same hierarchy fields as [`CreatePageRequest`];
+/// the server recomputes the `path` + cascades to descendants on a slug/parent change.
+#[derive(Serialize)]
+pub struct SavePageRequest {
+    pub title: String,
+    pub slug: String,
+    pub status: String,
+    pub block_tree: serde_json::Value,
+    /// The featured image's Media id, or `None` to clear it.
+    pub featured_media: Option<u64>,
+    /// The parent page id, or `None` for a top-level page.
+    pub parent: Option<u64>,
+    /// Sibling ordering key.
+    pub menu_order: i32,
+    /// The theme template value, or `None`/`""` for the default.
+    pub template: Option<String>,
+}
+
+/// `POST /admin/api/pages` body — create a new page.
+#[derive(Serialize)]
+pub struct CreatePageRequest {
+    pub title: String,
+    pub slug: String,
+    pub status: String,
+    pub block_tree: serde_json::Value,
+    pub featured_media: Option<u64>,
+    pub parent: Option<u64>,
+    pub menu_order: i32,
+    pub template: Option<String>,
+}
+
+/// One theme page-template option from `GET /admin/api/templates`, for the editor's
+/// Template `<select>`. The empty `value` is the default (single) template.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct TemplateOption {
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// `GET /admin/api/pages` — every non-trashed page this user may edit, in tree order
+/// (parent before children, then `menu_order`). A 401 routes back to login.
+pub async fn list_pages() -> Result<Vec<PageSummary>, ApiError> {
+    let resp = Request::get("/admin/api/pages")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<Vec<PageSummary>>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `GET /admin/api/pages/{id}` — one page with its body + hierarchy meta.
+pub async fn get_page(id: u64) -> Result<PageDetail, ApiError> {
+    let resp = Request::get(&format!("/admin/api/pages/{id}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<PageDetail>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `PUT /admin/api/pages/{id}` — persist a page edit. On failure the server's
+/// `{ error }` message (409 path clash, 400 bad slug/status/template/parent, cycle) is
+/// surfaced verbatim; a 401 routes back to login.
+pub async fn save_page(id: u64, body: &SavePageRequest) -> Result<(), ApiError> {
+    let built = Request::put(&format!("/admin/api/pages/{id}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .json(body);
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    Ok(())
+}
+
+/// `POST /admin/api/pages` — create a new page; returns its new id. On failure the
+/// server's `{ error }` message is surfaced verbatim; a 401 routes back to login.
+pub async fn create_page(body: &CreatePageRequest) -> Result<u64, ApiError> {
+    let built = Request::post("/admin/api/pages")
+        .credentials(RequestCredentials::SameOrigin)
+        .json(body);
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<CreateResponse>()
+        .await
+        .map(|r| r.id)
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `GET /admin/api/templates` — the theme's page templates for the editor's Template
+/// picker. Any editing role may read them (theme metadata, not content).
+pub async fn list_templates() -> Result<Vec<TemplateOption>, ApiError> {
+    let resp = Request::get("/admin/api/templates")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<Vec<TemplateOption>>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
 /// `POST /admin/api/media` response. `url` (`/media/{uuid}`) is what the editor
 /// inserts as the image `src`; `id` is the Media's handle, echoed back as
 /// `featured_media` to set the relation. (The server also returns dimensions +

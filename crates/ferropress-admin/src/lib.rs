@@ -1,9 +1,10 @@
 //! # ferropress-admin
 //!
 //! The Ferropress admin + editor SPA — a rinch WASM app mounted whole-page via
-//! `rinch_web::mount`. Three views (login → post list → rich-text editor) call the
-//! rinch-free admin API in `ferropress-http` (`/admin/api/*`); the HttpOnly session
-//! cookie rides along automatically on same-origin fetches.
+//! `rinch_web::mount`. Login → a content list → the rich-text editor (shared across
+//! flat Posts and hierarchical Pages), plus Settings/Plugins; all call the rinch-free
+//! admin API in `ferropress-http` (`/admin/api/*`), and the HttpOnly session cookie
+//! rides along automatically on same-origin fetches.
 //!
 //! Content crosses the wire as Ferropress `BlockTree` JSON and is converted to/from
 //! the rinch editor's `DocNode` by `ferropress-editor-bridge`. The public site's

@@ -1,6 +1,8 @@
-//! The admin SPA: one whole-page rinch app with three views (login → post list →
-//! editor) driven by a `Signal<View>`. Ported from the letterpress "composing room"
-//! mockup (`design/mockup.html`).
+//! The admin SPA: one whole-page rinch app driven by a `Signal<View>` (login → content
+//! list → editor, plus Settings/Plugins) and a `Signal<EntityKind>` axis that shares the
+//! list + editor between flat Posts and hierarchical Pages (nested `/parent/child`
+//! permalinks + a parent/menu_order/template). Ported from the letterpress "composing
+//! room" mockup (`design/mockup.html`).
 //!
 //! The rich-text editor is rinch's `Editor` (re-exported by `rinch-web`); content
 //! crosses the wire as Ferropress `BlockTree` JSON and is converted to/from the
@@ -30,6 +32,18 @@ enum View {
     Editor,
     Settings,
     Plugins,
+}
+
+/// Which content type the shared List + Editor views are working on. Posts are flat
+/// (slug-addressed); Pages are hierarchical (nested `/parent/child` permalinks, a
+/// `parent`/`menu_order`/`template`). The two share the same editor machinery (the
+/// rinch editor, title/slug/status/featured signals, the toolbar); Pages just add the
+/// hierarchy meta controls and hit the `/admin/api/pages` endpoints. A `Signal<EntityKind>`
+/// (Copy) selects which — every List/Editor branch and dispatch reads it.
+#[derive(Clone, Copy, PartialEq)]
+enum EntityKind {
+    Post,
+    Page,
 }
 
 /// Load state of a fetched list.
@@ -74,6 +88,9 @@ impl AuthCtx {
 pub fn app() -> NodeHandle {
     let view = Signal::new(View::Boot);
     let me_user = Signal::new(Option::<UserDto>::None);
+    // Which content type the List + Editor are on (posts vs pages). Boot/login land on
+    // the Post list; the "Pages"/"Posts" nav flips it.
+    let kind = Signal::new(EntityKind::Post);
 
     // Login view.
     let username = Signal::new(String::new());
@@ -81,9 +98,15 @@ pub fn app() -> NodeHandle {
     let login_error = Signal::new(String::new());
     let signing_in = Signal::new(false);
 
-    // List view.
+    // List view. `posts`/`page_list` back the galley for their respective `kind`;
+    // `list_state` is shared (only one entity's list shows at a time). `page_list`
+    // doubles as the editor's Parent-picker source.
     let posts = Signal::new(Vec::<PostSummary>::new());
+    let page_list = Signal::new(Vec::<api::PageSummary>::new());
     let list_state = Signal::new(Load::Loading);
+    // The theme's page templates, for the editor's Template picker. Loaded once when
+    // the pages list is first opened (theme metadata, effectively static).
+    let templates = Signal::new(Vec::<api::TemplateOption>::new());
 
     // Editor view. The handle lives in a Signal (Copy) so it flows into every
     // closure freely; `.get()` returns a clone of the underlying `Rc` editor.
@@ -101,6 +124,13 @@ pub fn app() -> NodeHandle {
     // The post's featured image (Media id + thumbnail url), or None. Set on open,
     // cleared on new, echoed back on save to reconcile the `featured_media` relation.
     let featured = Signal::new(Option::<api::FeaturedMedia>::None);
+    // Page-only editor meta (unused while editing a Post): the parent page id (None =
+    // top-level), the sibling `menu_order` (held as a String for the number input,
+    // parsed on save), and the chosen theme template value ("" = default). Set on
+    // open_page/new_page, read on save_page.
+    let parent = Signal::new(Option::<u64>::None);
+    let menu_order = Signal::new(String::new());
+    let template = Signal::new(String::new());
     let saving = Signal::new(false);
     let notice = Signal::new(String::new());
     let toast = Signal::new(false);
@@ -154,6 +184,11 @@ pub fn app() -> NodeHandle {
         match api::me().await {
             api::Auth::User(user) => {
                 me_user.set(Some(user));
+                // Boot/login always land on the Post galley (the module contract). Reset
+                // `kind` explicitly so a re-login within the same app instance — after the
+                // user had switched to Pages before a logout/session-expiry — doesn't render
+                // the stale Pages surface while `load_posts` fills the hidden `posts` signal.
+                kind.set(EntityKind::Post);
                 load_posts(posts, list_state, auth);
                 view.set(View::List);
             }
@@ -217,6 +252,11 @@ pub fn app() -> NodeHandle {
                                             match api::login(&u, &p).await {
                                                 api::Auth::User(user) => {
                                                     me_user.set(Some(user));
+                                                    // Land on the Post galley; reset `kind`
+                                                    // so a re-login after visiting Pages
+                                                    // doesn't strand the user on a stale
+                                                    // Pages surface (see the boot handler).
+                                                    kind.set(EntityKind::Post);
                                                     load_posts(posts, list_state, auth);
                                                     view.set(View::List);
                                                 }
@@ -245,15 +285,48 @@ pub fn app() -> NodeHandle {
                                 "Ferropress"
                             }
                             span { class: "masthead__sep", "\u{00B7}" }
-                            span { class: "masthead__here", "Posts" }
+                            span { class: "masthead__here",
+                                {move || match kind.get() {
+                                    EntityKind::Post => "Posts",
+                                    EntityKind::Page => "Pages",
+                                }}
+                            }
                             span { class: "masthead__spacer" }
                             button {
                                 class: "btn btn--primary",
                                 style: "width:auto",
-                                onclick: move || new_post(
-                                    editor, title, slug, status, featured, current_id, editor_session, notice, auth,
-                                ),
-                                "\u{002B} New post"
+                                onclick: move || match kind.get() {
+                                    EntityKind::Post => new_post(
+                                        editor, title, slug, status, featured, current_id, editor_session, notice, auth,
+                                    ),
+                                    EntityKind::Page => new_page(
+                                        editor, kind, title, slug, status, featured, parent, menu_order, template,
+                                        current_id, editor_session, notice, auth,
+                                    ),
+                                },
+                                {move || match kind.get() {
+                                    EntityKind::Post => "\u{002B} New post",
+                                    EntityKind::Page => "\u{002B} New page",
+                                }}
+                            }
+                            // Switch between the Posts and Pages galleys. Shown to every
+                            // editing role (the server scopes what each may see); Pages is
+                            // the hierarchical content type.
+                            if matches!(kind.get(), EntityKind::Post) {
+                                button {
+                                    class: "btn btn--quiet",
+                                    onclick: move || open_pages_list(
+                                        kind, page_list, list_state, templates, notice, view, auth,
+                                    ),
+                                    "Pages"
+                                }
+                            }
+                            if matches!(kind.get(), EntityKind::Page) {
+                                button {
+                                    class: "btn btn--quiet",
+                                    onclick: move || open_posts_list(kind, posts, list_state, notice, view, auth),
+                                    "Posts"
+                                }
                             }
                             // Plugins + Settings are Administrator-only; hide the nav
                             // for lower roles (the server enforces the capability regardless).
@@ -303,10 +376,20 @@ pub fn app() -> NodeHandle {
                     }
                     div { class: "wrap",
                         div { class: "galley__head",
-                            h2 { class: "galley__title", "Posts" }
+                            h2 { class: "galley__title",
+                                {move || match kind.get() {
+                                    EntityKind::Post => "Posts",
+                                    EntityKind::Page => "Pages",
+                                }}
+                            }
                             span { class: "galley__count",
-                                {move || match list_state.get() {
-                                    Load::Ready => format!("{} in the galley", posts.get().len()),
+                                {move || match (list_state.get(), kind.get()) {
+                                    (Load::Ready, EntityKind::Post) => {
+                                        format!("{} in the galley", posts.get().len())
+                                    }
+                                    (Load::Ready, EntityKind::Page) => {
+                                        format!("{} in the tree", page_list.get().len())
+                                    }
                                     _ => String::new(),
                                 }}
                             }
@@ -320,29 +403,62 @@ pub fn app() -> NodeHandle {
                         if matches!(list_state.get(), Load::Error) {
                             div { class: "galley__state err", "The galley is unavailable right now." }
                         }
-                        for row in row_vms(&posts.get()) {
-                            button {
-                                key: row.id,
-                                class: "row",
-                                onclick: {
-                                    let id = row.id;
-                                    move || open_post(id, editor, title, slug, status, featured, current_id, editor_session, notice, auth)
-                                },
-                                // A one-shot component (built once per row) so the
-                                // thumbnail-or-crosshair choice isn't a reactive `if`,
-                                // which can't move a non-Copy String out of the row.
-                                RowLead { url: row.featured_url.clone().unwrap_or_default() }
-                                span {
-                                    span { class: "row__title", {row.title} }
-                                    span { class: "row__slug", {row.slug_path} }
+                        // Rows for the current entity. The Post galley is flat; the Page
+                        // galley is the tree — rows indented by `depth`, server-sorted so a
+                        // parent always precedes its children.
+                        match kind.get() {
+                            EntityKind::Post => div { class: "galley__rows",
+                                for row in row_vms(&posts.get()) {
+                                    button {
+                                        key: row.id,
+                                        class: "row",
+                                        onclick: {
+                                            let id = row.id;
+                                            move || open_post(id, editor, title, slug, status, featured, current_id, editor_session, notice, auth)
+                                        },
+                                        // A one-shot component (built once per row) so the
+                                        // thumbnail-or-crosshair choice isn't a reactive `if`,
+                                        // which can't move a non-Copy String out of the row.
+                                        RowLead { url: row.featured_url.clone().unwrap_or_default() }
+                                        span {
+                                            span { class: "row__title", {row.title} }
+                                            span { class: "row__slug", {row.slug_path} }
+                                        }
+                                        span { class: row.stamp_class, {row.stamp_label} }
+                                        span { class: "row__time", {row.time} }
+                                        span { class: "row__edit", "Edit \u{2192}" }
+                                    }
                                 }
-                                span { class: row.stamp_class, {row.stamp_label} }
-                                span { class: "row__time", {row.time} }
-                                span { class: "row__edit", "Edit \u{2192}" }
-                            }
-                        }
-                        if matches!(list_state.get(), Load::Ready) && posts.get().is_empty() {
-                            div { class: "galley__state", "No posts yet." }
+                                if matches!(list_state.get(), Load::Ready) && posts.get().is_empty() {
+                                    div { class: "galley__state", "No posts yet." }
+                                }
+                            },
+                            EntityKind::Page => div { class: "galley__rows",
+                                for row in page_row_vms(&page_list.get()) {
+                                    button {
+                                        key: row.id,
+                                        class: "row",
+                                        // Indent by tree depth (inline, overriding the row's
+                                        // left padding) so nesting reads at a glance.
+                                        style: row.indent,
+                                        onclick: {
+                                            let id = row.id;
+                                            move || open_page(id, editor, kind, title, slug, status, featured, parent, menu_order, template, current_id, editor_session, notice, auth)
+                                        },
+                                        RowLead { url: row.featured_url.clone().unwrap_or_default() }
+                                        span {
+                                            span { class: "row__title", {row.title} }
+                                            span { class: "row__slug", {row.path_disp} }
+                                        }
+                                        span { class: row.stamp_class, {row.stamp_label} }
+                                        span { class: "row__time", {row.time} }
+                                        span { class: "row__edit", "Edit \u{2192}" }
+                                    }
+                                }
+                                if matches!(list_state.get(), Load::Ready) && page_list.get().is_empty() {
+                                    div { class: "galley__state", "No pages yet." }
+                                }
+                            },
                         }
                     }
                 },
@@ -356,10 +472,16 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--quiet",
                                 onclick: move || {
                                     notice.set(String::new());
-                                    load_posts(posts, list_state, auth);
+                                    match kind.get() {
+                                        EntityKind::Post => load_posts(posts, list_state, auth),
+                                        EntityKind::Page => load_pages(page_list, list_state, auth),
+                                    }
                                     view.set(View::List);
                                 },
-                                "\u{2190} Posts"
+                                {move || match kind.get() {
+                                    EntityKind::Post => "\u{2190} Posts",
+                                    EntityKind::Page => "\u{2190} Pages",
+                                }}
                             }
                             span { class: "masthead__sep", "\u{00B7}" }
                             span { class: "masthead__here", {move || masthead_title(&title.get())} }
@@ -368,17 +490,29 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--quiet",
                                 style: "width:auto",
                                 title: "Save, then open this draft in the real theme (new tab)",
-                                onclick: move || preview_post(
-                                    editor, current_id, editor_session, title, slug, status, featured, saving, notice, auth,
-                                ),
+                                onclick: move || match kind.get() {
+                                    EntityKind::Post => preview_post(
+                                        editor, current_id, editor_session, title, slug, status, featured, saving, notice, auth,
+                                    ),
+                                    EntityKind::Page => preview_page(
+                                        editor, current_id, editor_session, title, slug, status, featured,
+                                        parent, menu_order, template, saving, notice, auth,
+                                    ),
+                                },
                                 "Preview"
                             }
                             button {
                                 class: "btn btn--primary",
                                 style: "width:auto",
-                                onclick: move || save_post(
-                                    editor, current_id, editor_session, title, slug, status, featured, saving, notice, toast, auth,
-                                ),
+                                onclick: move || match kind.get() {
+                                    EntityKind::Post => save_post(
+                                        editor, current_id, editor_session, title, slug, status, featured, saving, notice, toast, auth,
+                                    ),
+                                    EntityKind::Page => save_page(
+                                        editor, current_id, editor_session, title, slug, status, featured,
+                                        parent, menu_order, template, saving, notice, toast, auth,
+                                    ),
+                                },
                                 {move || if saving.get() { "Saving\u{2026}" } else { "Save" }}
                             }
                         }
@@ -441,6 +575,62 @@ pub fn app() -> NodeHandle {
                                         class: "btn btn--quiet", style: "width:auto",
                                         onclick: move || set_featured_via_picker(featured, editor_session, notice, auth),
                                         "Set featured image"
+                                    }
+                                }
+                            }
+                            // ── Page-only hierarchy meta (hidden while editing a Post) ──
+                            // Parent picker: every page except this one and its own subtree
+                            // (the server also rejects a cycle). Controlled per-option
+                            // `selected`; the empty value means top-level.
+                            if matches!(kind.get(), EntityKind::Page) {
+                                div { class: "metaitem",
+                                    label { "Parent" }
+                                    select {
+                                        class: "select",
+                                        oninput: move |v: String| {
+                                            parent.set(if v.is_empty() { None } else { v.parse::<u64>().ok() });
+                                        },
+                                        for opt in parent_options(&page_list.get(), current_id.get(), parent.get()) {
+                                            option {
+                                                key: opt.value.clone(),
+                                                value: opt.value,
+                                                selected: opt.selected,
+                                                {opt.label}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Template picker: the theme's page templates (the server sends
+                            // "Default" as the empty-value option, so no synthesizing here).
+                            if matches!(kind.get(), EntityKind::Page) {
+                                div { class: "metaitem",
+                                    label { "Template" }
+                                    select {
+                                        class: "select",
+                                        oninput: move |v: String| template.set(v),
+                                        for opt in template_opts(&templates.get(), &template.get()) {
+                                            option {
+                                                key: opt.value.clone(),
+                                                value: opt.value,
+                                                selected: opt.selected,
+                                                {opt.label}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Sibling order (WP `menu_order`). Held as a String for the
+                            // number input; parsed to i32 on save.
+                            if matches!(kind.get(), EntityKind::Page) {
+                                div { class: "metaitem",
+                                    label { "Order" }
+                                    input {
+                                        class: "input input--number",
+                                        r#type: "number",
+                                        step: "1",
+                                        value: {move || menu_order.get()},
+                                        oninput: move |v: String| menu_order.set(v),
                                     }
                                 }
                             }
@@ -769,6 +959,37 @@ fn row_vms(posts: &[PostSummary]) -> Vec<RowVm> {
         .collect()
 }
 
+/// A page-galley row's presentation fields (mirrors [`RowVm`], plus the tree
+/// `indent`). `path_disp` is the full nested permalink; `indent` is an inline
+/// `padding-left` derived from the page's depth so nesting reads at a glance.
+#[derive(Clone, PartialEq)]
+struct PageRowVm {
+    id: u64,
+    title: String,
+    path_disp: String,
+    stamp_class: &'static str,
+    stamp_label: String,
+    time: String,
+    featured_url: Option<String>,
+    indent: String,
+}
+
+fn page_row_vms(pages: &[api::PageSummary]) -> Vec<PageRowVm> {
+    pages
+        .iter()
+        .map(|p| PageRowVm {
+            id: p.id,
+            title: p.title.clone(),
+            path_disp: format!("/{}", p.path),
+            stamp_class: api::status_stamp_class(&p.status),
+            stamp_label: api::status_label(&p.status),
+            time: api::fmt_relative(p.updated_at),
+            featured_url: p.featured_media.as_ref().map(|f| f.url.clone()),
+            indent: format!("padding-left: {:.2}rem", 0.25 + p.depth as f32 * 1.25),
+        })
+        .collect()
+}
+
 /// A plugin-cabinet row's presentation fields, precomputed so the reactive `for`
 /// body reads each once. `hint` is the trailing affordance (configurable vs not).
 #[derive(Clone, PartialEq)]
@@ -823,6 +1044,40 @@ fn load_posts(posts: Signal<Vec<PostSummary>>, state: Signal<Load>, auth: AuthCt
     });
 }
 
+/// Fetch the page list into `pages`, tracking `state`. A 401 routes back to login (an
+/// expired session), NOT a false outage. Mirrors [`load_posts`].
+fn load_pages(pages: Signal<Vec<api::PageSummary>>, state: Signal<Load>, auth: AuthCtx) {
+    state.set(Load::Loading);
+    spawn_local(async move {
+        match api::list_pages().await {
+            Ok(list) => {
+                pages.set(list);
+                state.set(Load::Ready);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(_)) => state.set(Load::Error),
+        }
+    });
+}
+
+/// Fetch the theme's page templates into `templates` for the editor's Template picker.
+/// Best-effort and idempotent: skips the fetch when already loaded (theme metadata is
+/// ~static), routes a 401 to login, and on any other failure leaves the list empty (the
+/// picker offers only what loaded; a save then defaults the template) rather than
+/// blocking the page list.
+fn load_templates(templates: Signal<Vec<api::TemplateOption>>, auth: AuthCtx) {
+    if !templates.get().is_empty() {
+        return;
+    }
+    spawn_local(async move {
+        match api::list_templates().await {
+            Ok(list) => templates.set(list),
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(_)) => {}
+        }
+    });
+}
+
 /// Whether the signed-in user is an Administrator — the only role that manages
 /// settings. Decides whether to show the Settings nav; the server enforces
 /// `ManageSettings` on the endpoints regardless.
@@ -859,6 +1114,40 @@ fn load_plugins(list: Signal<Vec<api::PluginDescriptor>>, state: Signal<Load>, a
             Err(api::ApiError::Message(_)) => state.set(Load::Error),
         }
     });
+}
+
+/// Switch the List view to the POSTS galley and (re)load it.
+fn open_posts_list(
+    kind: Signal<EntityKind>,
+    posts: Signal<Vec<PostSummary>>,
+    state: Signal<Load>,
+    notice: Signal<String>,
+    view: Signal<View>,
+    auth: AuthCtx,
+) {
+    notice.set(String::new());
+    kind.set(EntityKind::Post);
+    view.set(View::List);
+    load_posts(posts, state, auth);
+}
+
+/// Switch the List view to the PAGES galley and (re)load it, plus the theme's page
+/// templates (so the editor's Template picker is ready when a page is opened).
+#[allow(clippy::too_many_arguments)]
+fn open_pages_list(
+    kind: Signal<EntityKind>,
+    pages: Signal<Vec<api::PageSummary>>,
+    state: Signal<Load>,
+    templates: Signal<Vec<api::TemplateOption>>,
+    notice: Signal<String>,
+    view: Signal<View>,
+    auth: AuthCtx,
+) {
+    notice.set(String::new());
+    kind.set(EntityKind::Page);
+    view.set(View::List);
+    load_pages(pages, state, auth);
+    load_templates(templates, auth);
 }
 
 /// Switch to the Settings view for the SITE settings and (re)load its schema + values.
@@ -1112,6 +1401,65 @@ fn open_post(
     });
 }
 
+/// Open a page in the editor: fetch it, populate the meta fields (including the
+/// hierarchy controls), bridge its `BlockTree` into the editor, set the entity kind to
+/// Page, then switch to the editor. Mirrors [`open_post`]; a bridge failure loads an
+/// EMPTY document + a warning rather than corrupting content.
+#[allow(clippy::too_many_arguments)]
+fn open_page(
+    id: u64,
+    editor: Signal<EditorHandle>,
+    kind: Signal<EntityKind>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
+    parent: Signal<Option<u64>>,
+    menu_order: Signal<String>,
+    template: Signal<String>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    notice.set(String::new());
+    spawn_local(async move {
+        match api::get_page(id).await {
+            Ok(detail) => {
+                // A new document takes over the shared editor: bump the session so an
+                // in-flight save can no longer write back its id here.
+                editor_session.update(|g| *g += 1);
+                title.set(detail.title);
+                slug.set(detail.slug);
+                status.set(detail.status);
+                featured.set(detail.featured_media);
+                parent.set(detail.parent);
+                menu_order.set(detail.menu_order.to_string());
+                template.set(detail.template.unwrap_or_default());
+                current_id.set(Some(detail.id));
+                kind.set(EntityKind::Page);
+
+                let schema = Schema::starter_kit();
+                let handle = editor.get();
+                match bridge::block_tree_json_to_node(&schema, &detail.block_tree) {
+                    Ok(node) => handle.load_doc(node),
+                    Err(e) => {
+                        if let Ok(node) = bridge::block_tree_json_to_node(&schema, &empty_tree()) {
+                            handle.load_doc(node);
+                        }
+                        notice.set(format!(
+                            "This page uses content the editor couldn't load ({e}). Saving will overwrite it."
+                        ));
+                    }
+                }
+                auth.view.set(View::Editor);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(e)) => notice.set(format!("Couldn't open that page: {e}")),
+        }
+    });
+}
+
 /// Read the editor document back, bridge it to `BlockTree` JSON, and validate the
 /// slug — everything a Save or Preview needs from the sheet before hitting the
 /// network. Returns `(block_tree, slug)` or a ready-to-show error message. Shared by
@@ -1163,6 +1511,52 @@ async fn persist_post(
                 status,
                 block_tree,
                 featured_media: featured,
+            })
+            .await
+        }
+    }
+}
+
+/// CREATE (`POST`) or UPDATE (`PUT`) a page, mirroring [`persist_post`] with the
+/// hierarchy fields. Returns the effective page id (freshly assigned on create).
+#[allow(clippy::too_many_arguments)]
+async fn persist_page(
+    existing: Option<u64>,
+    title: String,
+    slug: String,
+    status: String,
+    block_tree: serde_json::Value,
+    featured: Option<u64>,
+    parent: Option<u64>,
+    menu_order: i32,
+    template: Option<String>,
+) -> Result<u64, api::ApiError> {
+    match existing {
+        Some(id) => api::save_page(
+            id,
+            &api::SavePageRequest {
+                title,
+                slug,
+                status,
+                block_tree,
+                featured_media: featured,
+                parent,
+                menu_order,
+                template,
+            },
+        )
+        .await
+        .map(|()| id),
+        None => {
+            api::create_page(&api::CreatePageRequest {
+                title,
+                slug,
+                status,
+                block_tree,
+                featured_media: featured,
+                parent,
+                menu_order,
+                template,
             })
             .await
         }
@@ -1230,6 +1624,87 @@ fn save_post(
                     return;
                 }
                 // A create hands back a new id; record it so the next save updates.
+                if existing.is_none() {
+                    current_id.set(Some(id));
+                }
+                toast.set(true);
+                TimeoutFuture::new(1600).await;
+                toast.set(false);
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(e)) => {
+                if !stale {
+                    notice.set(e);
+                }
+            }
+        }
+    });
+}
+
+/// Persist the current page (create-or-update). Mirrors [`save_post`] with the
+/// hierarchy fields read from the Page-only signals: `menu_order` is parsed from its
+/// string input and an empty `template` maps to the default (None). Surfaces the
+/// server's 400/409 message (bad slug/parent/template, cycle, path clash); stamps the
+/// "Saved" toast; the stale-generation guard matches [`save_post`].
+#[allow(clippy::too_many_arguments)]
+fn save_page(
+    editor: Signal<EditorHandle>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
+    parent: Signal<Option<u64>>,
+    menu_order: Signal<String>,
+    template: Signal<String>,
+    saving: Signal<bool>,
+    notice: Signal<String>,
+    toast: Signal<bool>,
+    auth: AuthCtx,
+) {
+    if saving.get() {
+        return;
+    }
+
+    let (block_tree, slug_val) = match prepared_doc(editor, slug) {
+        Ok(v) => v,
+        Err(msg) => {
+            notice.set(msg);
+            return;
+        }
+    };
+
+    notice.set(String::new());
+    saving.set(true);
+    let title_val = title.get();
+    let status_val = status.get();
+    let featured_val = featured.get().map(|f| f.id);
+    let parent_val = parent.get();
+    let menu_order_val = parse_menu_order(&menu_order.get());
+    let template_val = template_arg(&template.get());
+    let existing = current_id.get();
+    let save_gen = editor_session.get();
+    spawn_local(async move {
+        let result = persist_page(
+            existing,
+            title_val,
+            slug_val,
+            status_val,
+            block_tree,
+            featured_val,
+            parent_val,
+            menu_order_val,
+            template_val,
+        )
+        .await;
+        let stale = editor_session.get() != save_gen;
+        saving.set(false);
+        match result {
+            Ok(id) => {
+                if stale {
+                    return;
+                }
                 if existing.is_none() {
                     current_id.set(Some(id));
                 }
@@ -1342,6 +1817,101 @@ fn preview_post(
     });
 }
 
+/// Preview the current page draft in the real public theme (new tab). Mirrors
+/// [`preview_post`] — persist first (via [`persist_page`]), open the tab synchronously
+/// in the click gesture to dodge the pop-up blocker — but steers the tab to the page
+/// preview route `/admin/preview/page/{id}`.
+#[allow(clippy::too_many_arguments)]
+fn preview_page(
+    editor: Signal<EditorHandle>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
+    parent: Signal<Option<u64>>,
+    menu_order: Signal<String>,
+    template: Signal<String>,
+    saving: Signal<bool>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    if saving.get() {
+        return;
+    }
+
+    let (block_tree, slug_val) = match prepared_doc(editor, slug) {
+        Ok(v) => v,
+        Err(msg) => {
+            notice.set(msg);
+            return;
+        }
+    };
+
+    let Some(win) =
+        web_sys::window().and_then(|w| w.open_with_url_and_target("", "_blank").ok().flatten())
+    else {
+        notice.set("Couldn't open a preview tab — allow pop-ups for this site.".to_owned());
+        return;
+    };
+
+    notice.set(String::new());
+    saving.set(true);
+    let title_val = title.get();
+    let status_val = status.get();
+    let featured_val = featured.get().map(|f| f.id);
+    let parent_val = parent.get();
+    let menu_order_val = parse_menu_order(&menu_order.get());
+    let template_val = template_arg(&template.get());
+    let existing = current_id.get();
+    let save_gen = editor_session.get();
+    spawn_local(async move {
+        let result = persist_page(
+            existing,
+            title_val,
+            slug_val,
+            status_val,
+            block_tree,
+            featured_val,
+            parent_val,
+            menu_order_val,
+            template_val,
+        )
+        .await;
+        let stale = editor_session.get() != save_gen;
+        saving.set(false);
+        match result {
+            Ok(id) => {
+                if stale {
+                    let _ = win.close();
+                    return;
+                }
+                if existing.is_none() {
+                    current_id.set(Some(id));
+                }
+                if win
+                    .location()
+                    .set_href(&format!("/admin/preview/page/{id}"))
+                    .is_err()
+                {
+                    notice.set("Saved, but couldn't open the preview.".to_owned());
+                }
+            }
+            Err(api::ApiError::Unauthorized) => {
+                let _ = win.close();
+                auth.session_expired();
+            }
+            Err(api::ApiError::Message(e)) => {
+                let _ = win.close();
+                if !stale {
+                    notice.set(e);
+                }
+            }
+        }
+    });
+}
+
 /// Start a brand-new post: reset the editor meta to a blank Draft, clear the shared
 /// editor to an empty document, and switch to the editor view. `current_id` is set
 /// to `None` so the first Save creates the post (see [`save_post`]). The signals are
@@ -1370,6 +1940,46 @@ fn new_post(
     current_id.set(None);
 
     // Clear whatever the shared editor held from a previously opened post.
+    let schema = Schema::starter_kit();
+    let handle = editor.get();
+    if let Ok(node) = bridge::block_tree_json_to_node(&schema, &empty_tree()) {
+        handle.load_doc(node);
+    }
+    auth.view.set(View::Editor);
+}
+
+/// Start a brand-new page: reset the editor meta to a blank top-level Draft, clear the
+/// shared editor, set the entity kind to Page, and switch to the editor. Mirrors
+/// [`new_post`] plus the hierarchy defaults (no parent, order 0, default template);
+/// `current_id` is `None` so the first Save creates the page.
+#[allow(clippy::too_many_arguments)]
+fn new_page(
+    editor: Signal<EditorHandle>,
+    kind: Signal<EntityKind>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
+    parent: Signal<Option<u64>>,
+    menu_order: Signal<String>,
+    template: Signal<String>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+) {
+    editor_session.update(|g| *g += 1);
+    notice.set(String::new());
+    title.set(String::new());
+    slug.set(String::new());
+    status.set("draft".to_owned());
+    featured.set(None);
+    parent.set(None);
+    menu_order.set("0".to_owned());
+    template.set(String::new());
+    current_id.set(None);
+    kind.set(EntityKind::Page);
+
     let schema = Schema::starter_kit();
     let handle = editor.get();
     if let Ok(node) = bridge::block_tree_json_to_node(&schema, &empty_tree()) {
@@ -1625,6 +2235,136 @@ fn masthead_title(title: &str) -> String {
 
 fn empty_tree() -> serde_json::Value {
     serde_json::json!({ "schema_version": 1, "blocks": [] })
+}
+
+/// One controlled-`<select>` option: value + label + whether it's the current
+/// selection. `selected` is computed against the signal value when the option list is
+/// built (via the reactive `for`), so the right option shows on load; after that the
+/// browser tracks the live selection natively and a programmatic change (open_page /
+/// new_page) rebuilds the editor arm fresh — so a `Copy` bool suffices, with no
+/// per-option reactive closure (which a non-`Copy` `String` value can't feed in a `for`
+/// body).
+#[derive(Clone, PartialEq)]
+struct SelectOpt {
+    value: String,
+    label: String,
+    selected: bool,
+}
+
+/// The option-value string for a parent id: the id as a string, or `""` for None
+/// (top-level).
+fn opt_value(id: Option<u64>) -> String {
+    id.map(|x| x.to_string()).unwrap_or_default()
+}
+
+/// Parse the Order field (WP `menu_order`) leniently: an empty field is 0 (the default),
+/// an out-of-range integer saturates to the `i32` bound, and a decimal is truncated — so a
+/// mistyped `10.5` or an over-long number is honored near its intent instead of silently
+/// collapsing to 0 (which would jump the page to the front of its siblings). Genuine
+/// garbage still falls back to 0.
+fn parse_menu_order(value: &str) -> i32 {
+    let t = value.trim();
+    if t.is_empty() {
+        return 0;
+    }
+    if let Ok(n) = t.parse::<i64>() {
+        return n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    // A float parse lets a decimal truncate (and saturate) rather than collapse to 0.
+    t.parse::<f64>().map(|f| f as i32).unwrap_or(0)
+}
+
+/// Map the Template signal's string to the save request's `Option`: an empty string is
+/// the default template (None); any other value is sent as-is (the server validates it
+/// against the theme's registered templates).
+fn template_arg(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_owned())
+    }
+}
+
+/// The Template `<select>` options, marking the one matching `current` selected. The
+/// server already includes the "Default" (empty value) entry, so this just annotates
+/// selection.
+fn template_opts(options: &[api::TemplateOption], current: &str) -> Vec<SelectOpt> {
+    options
+        .iter()
+        .map(|o| SelectOpt {
+            value: o.value.clone(),
+            label: o.label.clone(),
+            selected: o.value == current,
+        })
+        .collect()
+}
+
+/// Build the Parent `<select>` options: a top-level ("— None —") entry first, then every
+/// page EXCEPT `self_id` and its own subtree (a page can't be parented under itself or a
+/// descendant — the server enforces this too). `current` is the page's current parent,
+/// used to mark the selected option. `self_id`'s path is looked up in `pages` to exclude
+/// the subtree by path prefix; a brand-new page (`None`) excludes nothing.
+fn parent_options(
+    pages: &[api::PageSummary],
+    self_id: Option<u64>,
+    current: Option<u64>,
+) -> Vec<SelectOpt> {
+    let self_path = self_id
+        .and_then(|sid| pages.iter().find(|p| p.id == sid).map(|p| p.path.clone()))
+        .unwrap_or_default();
+    let subtree_prefix = if self_path.is_empty() {
+        None
+    } else {
+        Some(format!("{self_path}/"))
+    };
+    let current_str = opt_value(current);
+
+    let mut opts = vec![SelectOpt {
+        value: String::new(),
+        label: "\u{2014} None (top level) \u{2014}".to_owned(),
+        selected: current_str.is_empty(),
+    }];
+    for p in pages {
+        if Some(p.id) == self_id {
+            continue; // not itself
+        }
+        if let Some(prefix) = &subtree_prefix
+            && (p.path == self_path || p.path.starts_with(prefix.as_str()))
+        {
+            continue; // not a descendant
+        }
+        let indent = "\u{00A0}\u{00A0}".repeat(p.depth as usize);
+        let label = if p.title.trim().is_empty() {
+            format!("{indent}/{}", p.path)
+        } else {
+            format!("{indent}{}", p.title)
+        };
+        let value = p.id.to_string();
+        let selected = value == current_str;
+        opts.push(SelectOpt {
+            value,
+            label,
+            selected,
+        });
+    }
+    // If the current parent isn't among the candidates — e.g. it's outside an
+    // author-scoped page list (a Contributor/Author only sees pages they authored) or a
+    // stale list — still represent it as the selected option. Otherwise NO option is
+    // marked, the browser falls back to showing the first ("— None —") entry, which both
+    // misreports the page as top-level AND traps the author: re-selecting the already-shown
+    // "None" fires no change event, so an intended un-parent edit is silently dropped. With
+    // the current parent shown as selected, "None" becomes a real change the author can pick.
+    if let Some(pid) = current
+        && !opts.iter().any(|o| o.selected)
+    {
+        opts.push(SelectOpt {
+            value: pid.to_string(),
+            label: format!("#{pid} (current parent)"),
+            selected: true,
+        });
+    }
+    opts
 }
 
 /// The masthead avatar letter — the display name's (or username's) first char.
