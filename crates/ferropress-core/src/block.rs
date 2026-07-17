@@ -17,6 +17,8 @@
 //! serializes rinch's editor state into this shape over the wire. (rinch CE
 //! serde is rinch issue #50, in-flight upstream — but core does not wait on it.)
 
+use std::collections::BTreeSet;
+
 /// Bumped whenever the on-the-wire block JSON shape changes incompatibly. Stored
 /// in every `BlockTree` so a reader can refuse / migrate older trees explicitly.
 pub const BLOCK_SCHEMA_VERSION: u32 = 1;
@@ -66,6 +68,28 @@ impl BlockTree {
         }
         out.trim().to_owned()
     }
+
+    /// The set of plugin ids referenced by [`Custom`](BlockKind::Custom) blocks
+    /// anywhere in the tree.
+    ///
+    /// A custom block's rendered output is BAKED into the prerendered page HTML (the
+    /// owning plugin may read its own configuration at render time via
+    /// `fp_get_setting`), unlike site chrome which is composed live. The serve layer
+    /// uses this to answer "which pages bake output from plugin X?" so a change to
+    /// that plugin's `plugin.X.*` config can invalidate exactly those pages.
+    ///
+    /// A `BTreeSet` (deduped + ordered) so repeated uses of one plugin collapse and
+    /// the result is deterministic for tests/logs. Note the asymmetry that governs
+    /// the walk: OVER-collection would only cost a harmless cache rebuild, whereas
+    /// UNDER-collection would leave a page serving stale baked HTML — so the
+    /// recursion into `children` is UNCONDITIONAL (see [`Block::collect_plugin_ids`]).
+    pub fn referenced_plugin_ids(&self) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
+        for block in &self.blocks {
+            block.collect_plugin_ids(&mut ids);
+        }
+        ids
+    }
 }
 
 impl Block {
@@ -97,6 +121,23 @@ impl Block {
         }
         for child in &self.children {
             child.push_plaintext(out);
+        }
+    }
+
+    /// Collect this block's plugin id (when it is a [`Custom`](BlockKind::Custom)
+    /// block) then recurse into EVERY child, mirroring [`Block::push_plaintext`]'s
+    /// traversal shape: the `for child in &self.children` recursion runs
+    /// unconditionally AFTER inspecting `kind`. That is load-bearing — a `Custom`
+    /// block can nest arbitrary blocks (including another plugin's `Custom` block)
+    /// in its own `children`, and missing a nested plugin id would leave that
+    /// plugin's page stale on a config change (the one failure this feature exists
+    /// to prevent).
+    fn collect_plugin_ids(&self, ids: &mut BTreeSet<String>) {
+        if let BlockKind::Custom { plugin, .. } = &self.kind {
+            ids.insert(plugin.clone());
+        }
+        for child in &self.children {
+            child.collect_plugin_ids(ids);
         }
     }
 }
@@ -269,5 +310,59 @@ mod tests {
     #[test]
     fn plaintext_of_empty_tree_is_empty() {
         assert_eq!(BlockTree::from_blocks(vec![]).plaintext(), "");
+    }
+
+    fn custom(plugin: &str, name: &str, children: Vec<Block>) -> Block {
+        block(
+            BlockKind::Custom {
+                plugin: plugin.to_owned(),
+                name: name.to_owned(),
+                data: serde_json::json!({}),
+            },
+            children,
+        )
+    }
+
+    #[test]
+    fn referenced_plugin_ids_recurses_children_including_nested_custom() {
+        // The load-bearing case: a plugin-B `Custom` block nested inside a plugin-A
+        // `Custom` block's OWN children, plus a plugin-C `Custom` buried under a
+        // List -> Quote child chain, plus a duplicate plugin-A to prove dedup. A
+        // walk that stopped recursing at a `Custom` block would miss `beta`.
+        let tree = BlockTree::from_blocks(vec![
+            custom("alpha", "a", vec![custom("beta", "b", vec![])]),
+            block(
+                BlockKind::List { ordered: false },
+                vec![block(
+                    BlockKind::Quote {
+                        runs: vec![run("q")],
+                    },
+                    vec![custom("gamma", "c", vec![])],
+                )],
+            ),
+            custom("alpha", "a-again", vec![]),
+        ]);
+
+        // BTreeSet -> sorted + deduped.
+        assert_eq!(
+            tree.referenced_plugin_ids().into_iter().collect::<Vec<_>>(),
+            vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+        );
+    }
+
+    #[test]
+    fn referenced_plugin_ids_empty_without_custom_blocks() {
+        let tree = BlockTree::from_blocks(vec![block(
+            BlockKind::Paragraph {
+                runs: vec![run("no plugins here")],
+            },
+            vec![],
+        )]);
+        assert!(tree.referenced_plugin_ids().is_empty());
+        assert!(
+            BlockTree::from_blocks(vec![])
+                .referenced_plugin_ids()
+                .is_empty()
+        );
     }
 }

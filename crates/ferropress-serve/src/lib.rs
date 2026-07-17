@@ -25,8 +25,8 @@ use std::sync::Arc;
 use ferropress_core::ports::{BlobKey, BlobStore};
 use ferropress_core::query::{Change, ChangeKind, SubscribeFilter};
 use ferropress_core::store::RhypeStore;
-use ferropress_core::value::Value;
-use ferropress_core::{PAGE_TYPE, POST_TYPE, REDIRECT_TYPE, USER_TYPE};
+use ferropress_core::value::{Object, TypeName, Value};
+use ferropress_core::{BlockTree, PAGE_TYPE, POST_TYPE, REDIRECT_TYPE, USER_TYPE};
 use ferropress_render::CustomBlockRenderer;
 
 pub mod authors;
@@ -113,18 +113,36 @@ fn page_blob_key(page: &OutputPage) -> BlobKey {
 /// only way to know a *deleted* object's path. A Page keys on `path` because its public
 /// URL is nested (`/parent/child`), not `/<slug>`.
 fn cache_path_key_from_change(change: &Change) -> Option<String> {
-    let field = if change.type_name.as_str() == PAGE_TYPE {
-        "path"
-    } else {
-        "slug"
-    };
     change
         .fields
         .as_ref()
-        .and_then(|f| f.get(field))
+        .and_then(|f| f.get(output_path_field(change.type_name.as_str())))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Which scalar field carries a content object's cache path key: a `Page`'s full nested
+/// materialized `path`, else a flat `Post`'s `slug`. Single source of the Page-vs-Post
+/// rule shared by [`cache_path_key_from_change`] (reads it off a change's JSON snapshot)
+/// and [`object_output_path`] (reads it off a scanned store `Object`), so a key derived
+/// from the feed and one derived from a scan are byte-identical.
+fn output_path_field(type_name: &str) -> &'static str {
+    if type_name == PAGE_TYPE {
+        "path"
+    } else {
+        "slug"
+    }
+}
+
+/// The cache PATH KEY for a content object read from the store — the store-side analogue
+/// of [`cache_path_key_from_change`]. `None` when the field is absent/empty (no permalink
+/// to key a cache entry on).
+fn object_output_path(type_name: &str, obj: &Object) -> Option<String> {
+    match obj.get(output_path_field(type_name)) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
 }
 
 /// Drives prerender + incremental regeneration over the ports.
@@ -290,6 +308,19 @@ impl ServeEngine {
             if setting_reshapes_front(change) {
                 self.evict_front().await;
             }
+            // A plugin CONFIG change (`plugin.{id}.*`) is the ONE `Setting` sub-case that
+            // reshapes baked CONTENT, not just live chrome: a plugin's custom-block output
+            // (e.g. a callout's variant class) is rendered INTO the page HTML from its config
+            // (read at render time via `fp_get_setting`). Refreshing the live snapshot above
+            // does nothing for it — the stale bytes are already in the cached body — so evict
+            // the pages that bake this plugin's blocks and let the read path rebuild them with
+            // the new config. Deliberately kind-agnostic: a config DELETE reverts the plugin to
+            // its compiled-in default, an equally-stale change. Ordered AFTER the snapshot
+            // refresh so the static-front precision inside sees the current `front_page_id`.
+            // Best-effort (see the method) — a scan/blob fault never fails the change apply.
+            if let Some(plugin_id) = setting_change_plugin_id(change) {
+                self.evict_pages_using_plugin(&plugin_id).await;
+            }
             return Ok(());
         }
 
@@ -353,15 +384,10 @@ impl ServeEngine {
                     Some(key) => key,
                     None => {
                         let obj = self.store.get(&change.type_name, change.object_id).await?;
-                        let field = if change.type_name.as_str() == PAGE_TYPE {
-                            "path"
-                        } else {
-                            "slug"
-                        };
-                        match obj.get(field) {
-                            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                        match object_output_path(change.type_name.as_str(), &obj) {
+                            Some(key) => key,
                             // No usable key -> no permalink to (in)validate; skip.
-                            _ => return Ok(()),
+                            None => return Ok(()),
                         }
                     }
                 };
@@ -468,6 +494,105 @@ impl ServeEngine {
         }
     }
 
+    /// Evict every cached page whose block tree bakes a [`Custom`](ferropress_core::BlockKind::Custom)
+    /// block owned by `plugin_id` — the fan-OUT invalidation for a plugin-config change.
+    ///
+    /// EVICT, not eager regenerate: a widely-used plugin's config change touches N pages,
+    /// and rebuilding them here would fan one admin edit out into N synchronous WASM
+    /// `render_block` calls, head-of-line-blocking the single sequential regen loop. So this
+    /// deletes each affected page's cache entry and lets the read path lazily rebuild it (with
+    /// the new config) on next request — the fan-OUT analogue of the fan-IN `/` strategy in
+    /// [`invalidate_front_for_content`], the same serving-model guardrail-2 reasoning. Because
+    /// the action is a pure delete, any imprecision is benign: an over-eviction only triggers a
+    /// rebuild of byte-identical content, never wrong output. (So a `Post` slug and a `Page`
+    /// path that share a permalink key, or a draft that was never cached, cost at most one
+    /// idempotent no-op delete — this is a positive argument for EVICT over REGEN, not a bug.)
+    ///
+    /// Discovery is a full `Post` + `Page` scan: block trees are opaque `Json` with no
+    /// store-side "uses plugin X" query, and the content tables are small (already full-scanned
+    /// for the galley). This runs ONLY on a rare plugin-config change, never on the hot save
+    /// path — the opposite tradeoff to a maintained reverse index (which would tax every save).
+    /// One plugin-config form save emits one `Setting` change per changed key, so it can drive
+    /// a few scans in a burst; bounded and rare, so no coalescing is warranted.
+    ///
+    /// BEST-EFFORT throughout (mirrors [`evict_front`]): a scan fault on one type, an
+    /// unparseable/legacy block tree on one object, or a blob-delete fault on one page is
+    /// logged and skipped — NEVER propagated — so one bad row can't leave the rest of the
+    /// plugin's pages stale (a silent partial miss would be worse than the pre-fix status quo).
+    async fn evict_pages_using_plugin(&self, plugin_id: &str) {
+        // The configured static front page bakes its body into the `/` LISTING blob (a
+        // different key than its own permalink), so if it uses the plugin we must ALSO evict
+        // `/`. `Some(inner)` = we hold a settings handle and `inner` is the configured static
+        // front (or `None` for a galley front, which bakes no plugin output); the outer `None`
+        // = no handle, so we cannot identify the front and evict `/` conservatively — parity
+        // with `invalidate_front_for_content` (the read path caches `/` regardless of handle).
+        let front_page_id = self.settings.as_ref().map(|h| h.current().front_page_id);
+        let mut front_uses_plugin = false;
+        let mut evicted = 0usize;
+
+        for type_name in [POST_TYPE, PAGE_TYPE] {
+            // Scan each type independently: one type's scan error must not suppress the other's
+            // evictions.
+            let objects = match self.store.scan(&TypeName::from(type_name)).await {
+                Ok(objects) => objects,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e, type_name, plugin = plugin_id,
+                        "scanning content for a plugin-setting eviction failed; skipping this type",
+                    );
+                    continue;
+                }
+            };
+            for obj in objects {
+                // A missing / non-Json / legacy-unparseable block tree on ONE row is logged and
+                // skipped, never aborting the scan (that would silently leave later plugin pages
+                // stale). `_ => continue` covers a row with no block tree at all.
+                let tree = match obj.get("block_tree") {
+                    Some(Value::Json(json)) => match BlockTree::from_json_value(json.clone()) {
+                        Ok(tree) => tree,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e, type_name, object_id = obj.id.0,
+                                "skipping a row whose block tree failed to parse",
+                            );
+                            continue;
+                        }
+                    },
+                    _ => continue,
+                };
+                if !tree.referenced_plugin_ids().contains(plugin_id) {
+                    continue;
+                }
+                if front_page_id == Some(Some(obj.id.0)) {
+                    front_uses_plugin = true;
+                }
+                let Some(path) = object_output_path(type_name, &obj) else {
+                    // The page bakes the plugin but carries no slug/path -> no permalink key to
+                    // evict (a not-yet-materialized row); the static-front check above still ran.
+                    continue;
+                };
+                let key = cache_key(&format!("/{path}"));
+                if let Err(e) = self.blobs.delete(&key).await {
+                    tracing::warn!(error = %e, key = %key.0, "evicting a plugin page's cache failed");
+                } else {
+                    evicted += 1;
+                }
+            }
+        }
+
+        // Evict `/` precisely when the configured static front page bakes the plugin, or
+        // conservatively when we have no settings handle to identify it (idempotent delete).
+        if front_uses_plugin || front_page_id.is_none() {
+            self.evict_front().await;
+        }
+
+        tracing::debug!(
+            plugin = plugin_id,
+            evicted,
+            "evicted prerender pages for a plugin-setting change",
+        );
+    }
+
     /// Build the cache envelope for a single output page, or `None` if no
     /// PUBLISHED entity backs it.
     ///
@@ -511,6 +636,22 @@ fn setting_reshapes_front(change: &Change) -> bool {
         ),
         None => true,
     }
+}
+
+/// The plugin id a `Setting` change targets, if its key is a `plugin.{id}.*` config key.
+///
+/// Reads the changed row's `key` off the change's scalar snapshot (rhypedb publishes the
+/// full merged fields, incl. on delete — the same field [`setting_reshapes_front`] reads)
+/// and maps it to the owning plugin id via [`ferropress_core::plugin_id_from_setting_key`].
+/// `None` for a core key (`site.*`, `reading.*`), a malformed key, or an absent one.
+///
+/// Note the DELIBERATE asymmetry with [`setting_reshapes_front`], which fails OPEN (an
+/// absent key evicts `/` conservatively): this fails CLOSED. You cannot "regenerate the
+/// pages using plugin ???", so an unparseable/non-plugin key must be a safe no-op — never
+/// an over-eviction of all content. (Keep the two key-parses separate for this reason.)
+fn setting_change_plugin_id(change: &Change) -> Option<String> {
+    let key = change.fields.as_ref()?.get("key")?.as_str()?;
+    ferropress_core::plugin_id_from_setting_key(key).map(str::to_owned)
 }
 
 #[cfg(test)]
