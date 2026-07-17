@@ -12,10 +12,20 @@
 //! are built as a 0-or-1 `Vec<NodeHandle>` rather than a reactive `if let`, since they
 //! never change.
 //!
-//! Text/number/select inputs are UNCONTROLLED — seeded once, edits written straight to
-//! `values` (read back only on submit) — so typing never rebuilds them. The reactive
-//! parts (radio/toggle `checked`, the switch on-class, a `visible_when` row's hidden
-//! class) read a per-field `Signal<Value>` that mirrors the live value.
+//! Text/textarea inputs are CONTROLLED: a reactive `value: {|| state.get()…}` binding
+//! keeps them in sync with the field's `Signal<Value>` and stays caret-safe — the pinned
+//! rinch (`2ea7625`, upstream #100) reflects the DOM *property* (not just the attribute)
+//! and only when it differs, so the type→oninput→signal echo is a no-op. `Select`/`EntityRef`
+//! render their options in natural order and mark the current one with a per-option
+//! `selected` bool (again property-reflected, so the stored value's option shows on load; a
+//! value no longer among the options falls back to a synthetic selected entry, as EntityRef
+//! does). `Number` is the deliberate exception — it stays UNCONTROLLED (seeded once): a
+//! numeric `value:` must round-trip the in-progress string through a numeric `Value`, which
+//! can't preserve what the user is typing (an integer gains a spurious `.0`; a half-typed
+//! "1." snaps to "1.0", jumping the caret to the end), and this form never re-seeds a field
+//! externally, so controlled buys it nothing.
+//! The reactive parts (radio/toggle `checked`, the switch on-class, a `visible_when` row's
+//! hidden class) read the same per-field `Signal<Value>` that mirrors the live value.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -171,7 +181,6 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
         WidgetKind::Text { format } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
-            let initial = state.get().as_str().unwrap_or_default().to_owned();
             let cls = match format {
                 TextFormat::Email | TextFormat::Url => "input input--mono",
                 TextFormat::Plain | TextFormat::Slug => "input",
@@ -185,7 +194,9 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 input {
                     class: cls,
                     r#type: itype,
-                    value: initial,
+                    // Controlled: the reactive `value` mirrors the signal (a string round-
+                    // trips exactly, so the oninput echo is a no-op write) and is caret-safe.
+                    value: {move || state.get().as_str().unwrap_or_default().to_owned()},
                     spellcheck: "false",
                     oninput: move |v: String| {
                         let val = Value::String(v);
@@ -198,17 +209,19 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
         WidgetKind::TextArea => {
             let key = field.key.clone();
             let values = ctx.values.clone();
-            let initial = state.get().as_str().unwrap_or_default().to_owned();
             rsx! {
                 textarea {
                     class: "input",
                     rows: "4",
+                    // Controlled: rinch reflects `value` onto the <textarea>'s DOM property
+                    // (web_document `sync_reflected_property`, only-when-differs), so the
+                    // reactive binding seeds and stays in sync WITHOUT a child text node.
+                    value: {move || state.get().as_str().unwrap_or_default().to_owned()},
                     oninput: move |v: String| {
                         let val = Value::String(v);
                         state.set(val.clone());
                         values.set(&key, val);
                     },
-                    {initial}
                 }
             }
         }
@@ -220,6 +233,15 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
         } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
+            // Uncontrolled ON PURPOSE (unlike Text/Select): seed once, then let the browser
+            // own the string. A controlled numeric `value:` would have to re-derive the
+            // display from the `Value::Number` on every keystroke, and that round-trip can't
+            // preserve the in-progress text — `Number::from_f64(10.0).to_string()` is
+            // "10.0", so "10" would snap to "10.0" and a half-typed "1." (parsed to 1.0)
+            // would snap to "1.0", each jumping the caret to the end mid-entry. Since this
+            // form never re-seeds a field externally, controlled would add that hazard for no
+            // benefit. The `oninput` keeps the prior value on a clear/mid-edit; the server
+            // clamps + integralizes.
             let initial = match state.get() {
                 Value::Number(n) => n.to_string(),
                 _ => String::new(),
@@ -240,8 +262,6 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                         step: step_attr,
                         value: initial,
                         oninput: move |v: String| {
-                            // Keep the prior value if the field is cleared / mid-edit;
-                            // the server clamps + integralizes.
                             if let Ok(n) = v.trim().parse::<f64>()
                                 && let Some(num) = serde_json::Number::from_f64(n)
                             {
@@ -288,22 +308,30 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
             let key = field.key.clone();
             let values = ctx.values.clone();
             let current = state.get().as_str().unwrap_or_default().to_owned();
-            // Current-first ordering: the uncontrolled <select> shows its first option,
-            // and rinch emits a boolean `selected` even when false — so per-option
-            // `selected` can't mark just one.
-            let mut ordered = Vec::with_capacity(options.len());
-            if let Some(cur) = options.iter().find(|c| c.value == current) {
-                ordered.push(cur.clone());
-            }
-            for c in &options {
-                if c.value != current {
-                    ordered.push(c.clone());
-                }
-            }
-            let opts: Vec<NodeHandle> = ordered
+            // Whether the stored value is still among the options (checked before the map
+            // consumes `options`), so a value dropped by a schema revision gets a fallback.
+            let current_present = options.iter().any(|c| c.value == current);
+            // Natural order + a per-option static `selected` bool marking the stored value:
+            // rinch reflects the `selected` property and unsets a stringified `false` (pin
+            // `2ea7625`, #100), so the stored value's option shows on load regardless of DOM
+            // order. A `Copy` bool is enough — the initial mark is all a <select> needs (the
+            // browser tracks live selection after, and a form re-seed rebuilds this arm
+            // fresh); the non-`Copy` `String` value rules out a reactive per-option closure.
+            let mut opts: Vec<NodeHandle> = options
                 .into_iter()
-                .map(|opt| rsx! { option { value: opt.value.clone(), {opt.label.clone()} } })
+                .map(|opt| {
+                    let selected = opt.value == current;
+                    rsx! { option { value: opt.value, selected: selected, {opt.label} } }
+                })
                 .collect();
+            // If the stored value is no longer one of the options (a schema revision dropped
+            // it after it was saved), append it as its own selected option so the control
+            // reflects the real value instead of silently defaulting to the first — mirrors
+            // the EntityRef "(not published)" fallback, so exactly one option stays marked.
+            if !current.is_empty() && !current_present {
+                let label = format!("{current} (unavailable)");
+                opts.push(rsx! { option { value: current, selected: true, {label} } });
+            }
             rsx! {
                 select {
                     class: "select",
@@ -379,16 +407,15 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
             {
                 entries.push((id.to_string(), format!("Page #{id} (not published)")));
             }
-            // Current-first so the uncontrolled <select> shows the stored value (rinch
-            // emits `selected` even when false, so ordering — not a per-option attr —
-            // marks the selection; mirrors the `Select` arm).
-            if let Some(pos) = entries.iter().position(|(v, _)| *v == current_key) {
-                let cur = entries.remove(pos);
-                entries.insert(0, cur);
-            }
+            // Natural order + a per-option `selected` bool marking the stored id (mirrors
+            // the `Select` arm; rinch reflects the `selected` property so exactly one is
+            // marked — pin `2ea7625`, #100).
             let opts: Vec<NodeHandle> = entries
                 .into_iter()
-                .map(|(v, l)| rsx! { option { value: v, {l} } })
+                .map(|(v, l)| {
+                    let selected = v == current_key;
+                    rsx! { option { value: v, selected: selected, {l} } }
+                })
                 .collect();
             rsx! {
                 select {
