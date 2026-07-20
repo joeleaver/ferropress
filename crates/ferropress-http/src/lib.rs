@@ -35,6 +35,7 @@ use ferropress_serve::{AuthorsHandle, RedirectHandle, Resolved, SettingsHandle};
 use ferropress_theme::ThemeEngine;
 
 pub mod admin;
+pub mod feed;
 pub mod island;
 pub mod media;
 
@@ -258,6 +259,11 @@ pub fn router(state: AppState) -> Router {
         // Public media originals (`GET /media/{id}`) — un-authenticated, served on
         // every deployment (not gated on `admin`). See [`media`].
         .route(&media_route, get(media::serve))
+        // Public syndication feeds (`GET /feed.xml` RSS, `GET /feed.atom` Atom) — explicit
+        // routes BEFORE the fallback so a post/page slug can never shadow them; un-authenticated
+        // and served on every deployment. See [`feed`].
+        .route("/feed.xml", get(feed::feed_rss))
+        .route("/feed.atom", get(feed::feed_atom))
         // Static-first hot path is the fallback: it consults the prerender
         // BlobStore cache first (via `ferropress_serve::serve_path`) and only
         // falls through to an on-demand SSR render — populating the cache — on a
