@@ -14,6 +14,8 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::settings::DEFAULT_THEME;
+
 /// The default date pattern when none is stored, or when "Custom" is selected
 /// with an empty custom string. Mirrors the `site.date_format` schema default.
 const DEFAULT_DATE_FORMAT: &str = "F j, Y";
@@ -46,6 +48,12 @@ pub struct SiteSettings {
     /// layer still checks the page is published before rendering it (a dangling or
     /// unpublished id falls back to the galley).
     pub front_page_id: Option<u64>,
+    /// The active public theme id (`appearance.theme`) — which theme's templates
+    /// frame the content. Projected as a plain string; the serve layer's theme
+    /// registry maps it to template sources, falling back to the default theme on an
+    /// unknown id. Content-independent: a theme change re-frames every page live, so
+    /// it evicts no cached envelope (they store only the theme-agnostic body).
+    pub theme: String,
     /// The `/media/{uuid}` URL of the site logo, or `None`. Unlike every other field,
     /// this is NOT projected from the values map — `site.logo` stores a media object
     /// id, and resolving it to a URL needs a store lookup. [`from_values`](Self::from_values)
@@ -101,6 +109,7 @@ impl SiteSettings {
             timezone: string("site.timezone").unwrap_or_else(|| "UTC".to_owned()),
             date_format,
             front_page_id,
+            theme: string("appearance.theme").unwrap_or_else(|| DEFAULT_THEME.to_owned()),
             // Not projectable from the values map (a store lookup on the id); the
             // serve layer fills it. See the field doc.
             logo_url: None,
@@ -146,6 +155,7 @@ mod tests {
         assert_eq!(s.date_format, "F j, Y");
         assert_eq!(s.title, "");
         assert_eq!(s.title_or_default(), "Ferropress");
+        assert_eq!(s.theme, "letterpress");
     }
 
     #[test]

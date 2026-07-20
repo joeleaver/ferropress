@@ -42,29 +42,21 @@ use ferropress_core::{
 };
 use ferropress_render::{CustomBlockRenderer, RenderMode, render_with};
 use ferropress_render_form::SiteSettings;
-use ferropress_theme::{SandboxLimits, ThemeEngine, ThemeError};
+use ferropress_theme::{ThemeEngine, ThemeError};
 use serde::{Deserialize, Serialize};
 
 use crate::authors::AuthorDirectory;
 use crate::cache_key;
 use crate::datefmt;
-use crate::templates::{
-    BASE_SRC, BASE_TEMPLATE, HOME_SRC, HOME_TEMPLATE, PAGE_WIDE_SRC, PAGE_WIDE_TEMPLATE,
-    SINGLE_SRC, SINGLE_TEMPLATE, template_name_for,
-};
+use crate::templates::{HOME_TEMPLATE, template_name_for};
 
-/// Build the v1 [`ThemeEngine`] with the built-in public theme registered (shared
-/// chrome + single-page + front-page templates). Both the composition root
-/// (`ferropress-server`) and the integration tests call this, so the chrome they
-/// exercise is byte-for-byte identical. A real theme system will later load author
-/// templates in place of these built-ins.
+/// Build a [`ThemeEngine`] for the **default** theme (the letterpress "Composing
+/// Room" — `appearance.theme`'s default). The integration tests and any pre-settings
+/// boot use this; the composition root instead builds the theme named by the live
+/// `appearance.theme` setting via [`build_theme`](crate::build_theme). Kept as the
+/// zero-arg constructor so every test that just wants "a theme" gets the built-in one.
 pub fn default_theme() -> Result<ThemeEngine, ThemeError> {
-    let mut theme = ThemeEngine::new(SandboxLimits::default());
-    theme.add_template(BASE_TEMPLATE.to_owned(), BASE_SRC.to_owned())?;
-    theme.add_template(SINGLE_TEMPLATE.to_owned(), SINGLE_SRC.to_owned())?;
-    theme.add_template(HOME_TEMPLATE.to_owned(), HOME_SRC.to_owned())?;
-    theme.add_template(PAGE_WIDE_TEMPLATE.to_owned(), PAGE_WIDE_SRC.to_owned())?;
-    Ok(theme)
+    crate::themes::build_theme(ferropress_render_form::DEFAULT_THEME)
 }
 
 /// Outcome of resolving a request path to a fully rendered HTML document.

@@ -28,7 +28,7 @@ pub use refs::{EntityOption, MediaRef, SettingRefs};
 pub use schema::{
     Choice, Condition, Field, FieldError, FormSchema, FormSection, TextFormat, WidgetKind,
 };
-pub use settings::schema_for_settings;
+pub use settings::{DEFAULT_THEME, THEME_FELLSTONE, THEME_LETTERPRESS, schema_for_settings};
 pub use site_settings::SiteSettings;
 
 #[cfg(test)]

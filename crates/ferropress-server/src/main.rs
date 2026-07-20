@@ -40,7 +40,7 @@ use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{
     AuthorsHandle, HookBridge, RedirectHandle, ServeEngine, SettingsHandle, backfill_page_paths,
-    default_theme, load_author_directory, load_redirects, load_site_settings,
+    build_theme, load_author_directory, load_redirects, load_site_settings,
 };
 use ferropress_store_embedded::EmbeddedStore;
 
@@ -146,7 +146,11 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // Build the page-chrome theme once (its templates registered) for the HTTP read
     // path (`AppState`). The regen loop does NOT need it: it caches per-object
     // envelopes, and chrome is composed live at request time.
-    let theme = Arc::new(default_theme().context("building the page-chrome theme")?);
+    // Build the page-chrome theme named by the live `appearance.theme` setting (an
+    // unknown id falls back to the default theme). Selected at boot; switching theme
+    // without a restart is a follow-up (a `ThemeHandle` mirroring `SettingsHandle`).
+    let theme =
+        Arc::new(build_theme(&settings.current().theme).context("building the page-chrome theme")?);
 
     // The embedded plugin host: load installed plugins from the plugins dir, then
     // share it as the custom-block renderer for BOTH the read path (`AppState`) and

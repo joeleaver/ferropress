@@ -38,6 +38,7 @@ pub mod hook_bridge;
 pub mod redirects;
 pub mod settings;
 pub mod templates;
+pub mod themes;
 
 pub use authors::{AuthorDirectory, AuthorsHandle, load_author_directory};
 pub use content::{
@@ -49,6 +50,7 @@ pub use hierarchy::{BackfillReport, backfill_page_paths, join_page_path};
 pub use hook_bridge::HookBridge;
 pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects};
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
+pub use themes::build_theme;
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it

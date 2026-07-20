@@ -27,6 +27,26 @@ fn choice(value: &str, label: &str) -> Choice {
     }
 }
 
+/// Theme ids — the single source of truth for the selectable public themes, shared
+/// by [`schema_for_settings`]'s Appearance picker and the serve layer's theme
+/// registry (which maps each id to its template sources). Adding a theme means
+/// adding an id + a [`theme_choices`] row HERE and a matching `ThemeDef` in
+/// `ferropress_serve`'s registry; an unknown stored id falls back to the default
+/// theme when the registry resolves it.
+pub const THEME_LETTERPRESS: &str = "letterpress";
+/// The Fellstone Tales theme (a faithful reproduction of fellstonetales.com).
+pub const THEME_FELLSTONE: &str = "fellstone";
+/// The public theme a site uses before any `appearance.theme` is stored.
+pub const DEFAULT_THEME: &str = THEME_LETTERPRESS;
+
+/// The selectable public themes as form choices (id + human label).
+fn theme_choices() -> Vec<Choice> {
+    vec![
+        choice(THEME_LETTERPRESS, "Composing Room \u{2014} letterpress"),
+        choice(THEME_FELLSTONE, "Fellstone Tales"),
+    ]
+}
+
 /// A small, curated set of common IANA zones (not the full ~350-entry database —
 /// enough to be useful, trivially extended). `UTC` is the safe default.
 fn timezones() -> Vec<Choice> {
@@ -102,6 +122,25 @@ pub fn schema_for_settings() -> FormSchema {
                         visible_when: None,
                     },
                 ],
+            },
+            FormSection {
+                id: "appearance".to_owned(),
+                title: "Appearance".to_owned(),
+                help: None,
+                fields: vec![Field {
+                    key: "appearance.theme".to_owned(),
+                    label: "Theme".to_owned(),
+                    help: Some(
+                        "The public theme that frames your content. Only the surrounding \
+                         design changes — your posts and pages are untouched."
+                            .to_owned(),
+                    ),
+                    default: Value::String(DEFAULT_THEME.to_owned()),
+                    widget: WidgetKind::Select {
+                        options: theme_choices(),
+                    },
+                    visible_when: None,
+                }],
             },
             FormSection {
                 id: "reading".to_owned(),
