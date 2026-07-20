@@ -151,7 +151,11 @@ pub fn format_datetime(millis: i64, format: &str, tz_name: &str) -> String {
 }
 
 /// Epoch-millis → a UTC [`OffsetDateTime`], clamped to the epoch on overflow.
-fn millis_to_utc(millis: i64) -> OffsetDateTime {
+///
+/// `pub(crate)` so the feed's RFC-2822/RFC-3339 formatters ([`crate::feed`]) reuse the SAME
+/// clamp-to-epoch conversion rather than re-deriving `from_unix_timestamp_nanos` (a divergent
+/// overflow policy across the serve layer would be a subtle bug).
+pub(crate) fn millis_to_utc(millis: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp_nanos((millis as i128) * 1_000_000)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }

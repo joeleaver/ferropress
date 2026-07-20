@@ -45,3 +45,5 @@ parking_lot = { workspace = true }
 ferropress-store-embedded = { workspace = true }
 ferropress-blob-localfs = { workspace = true }
 tempfile = { workspace = true }
+# Assert the composed RSS/Atom feeds are well-formed XML (parse or fail the test).
+roxmltree = { workspace = true }

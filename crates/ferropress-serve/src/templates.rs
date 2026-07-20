@@ -53,6 +53,8 @@ pub const BASE_SRC: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="alternate" type="application/rss+xml" title="RSS feed" href="/feed.xml">
+<link rel="alternate" type="application/atom+xml" title="Atom feed" href="/feed.atom">
 <title>{{ page_title }}</title>
 {% if page_description %}<meta name="description" content="{{ page_description }}">
 {% endif %}{% if site.noindex %}<meta name="robots" content="noindex, nofollow">

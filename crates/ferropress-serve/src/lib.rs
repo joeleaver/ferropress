@@ -32,6 +32,7 @@ use ferropress_render::CustomBlockRenderer;
 pub mod authors;
 pub mod content;
 pub mod datefmt;
+pub mod feed;
 pub mod hierarchy;
 pub mod hook_bridge;
 pub mod redirects;
@@ -43,6 +44,7 @@ pub use content::{
     Resolved, default_theme, render_preview, resolve_path, resolve_published_entity, serve_path,
     slug_from_path,
 };
+pub use feed::{FeedFormat, serve_feed};
 pub use hierarchy::{BackfillReport, backfill_page_paths, join_page_path};
 pub use hook_bridge::HookBridge;
 pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects};
@@ -308,6 +310,15 @@ impl ServeEngine {
             if setting_reshapes_front(change) {
                 self.evict_front().await;
             }
+            // `reading.feed_items` is the ONE `Setting` that reshapes the cached FEED's content
+            // (how many entries it lists — the feed analogue of `reading.posts_per_page`
+            // reshaping `/`). Every other setting composes live in the feed (title/description/
+            // links) or is irrelevant to it (the feed uses fixed RFC date formats, so
+            // `site.date_format`/`site.timezone` never apply), so it must not bust the feed cache.
+            // Evict for that key so the next request rebuilds with the new count. Best-effort.
+            if setting_reshapes_feed(change) {
+                self.evict_feed().await;
+            }
             // A plugin CONFIG change (`plugin.{id}.*`) is the ONE `Setting` sub-case that
             // reshapes baked CONTENT, not just live chrome: a plugin's custom-block output
             // (e.g. a callout's variant class) is rendered INTO the page HTML from its config
@@ -374,6 +385,16 @@ impl ServeEngine {
         // eager rebuild) is the guardrail-2 strategy for this fan-in-N shared page: an
         // idempotent, coalescing delete whose next-request rebuild is the sole populator.
         self.invalidate_front_for_content(change).await;
+
+        // The syndication feed lists PUBLISHED POSTS only (never pages), so ONLY a post change
+        // can reshape it — a create/update/delete/publish/unpublish, or a newer post pushing an
+        // older one out of the `feed_items` window (that newer post's OWN change is the trigger;
+        // the pushed-out post needs no event). Evict here (before the slug-gated permalink
+        // handling below, so even a slug-less post DELETE still evicts); the read path rebuilds.
+        // A PAGE change never touches the feed. Best-effort, like `evict_front`.
+        if ty == POST_TYPE {
+            self.evict_feed().await;
+        }
 
         match change.kind {
             ChangeKind::Create | ChangeKind::Update => {
@@ -494,6 +515,17 @@ impl ServeEngine {
         }
     }
 
+    /// Evict the syndication-feed prerender cache entry (`prerender/listing/feed.json`).
+    /// **Best-effort**: an idempotent delete whose failure is logged and swallowed — the read
+    /// path rebuilds the feed on the next request regardless, and the cache is best-effort
+    /// throughout, so a cache fault must never fail the change apply. Mirrors
+    /// [`evict_front`](Self::evict_front); a no-op if the feed was never cached.
+    async fn evict_feed(&self) {
+        if let Err(e) = self.blobs.delete(&feed::feed_cache_key()).await {
+            tracing::warn!(error = %e, "evicting the syndication feed prerender cache failed");
+        }
+    }
+
     /// Evict every cached page whose block tree bakes a [`Custom`](ferropress_core::BlockKind::Custom)
     /// block owned by `plugin_id` — the fan-OUT invalidation for a plugin-config change.
     ///
@@ -528,6 +560,10 @@ impl ServeEngine {
         // with `invalidate_front_for_content` (the read path caches `/` regardless of handle).
         let front_page_id = self.settings.as_ref().map(|h| h.current().front_page_id);
         let mut front_uses_plugin = false;
+        // The feed bakes PUBLISHED post BODIES, which may contain this plugin's custom block —
+        // stale after a config change, exactly like a permalink. Track whether any published post
+        // uses the plugin so we evict the (single) feed cache entry once, after the scan.
+        let mut feed_uses_plugin = false;
         let mut evicted = 0usize;
 
         for type_name in [POST_TYPE, PAGE_TYPE] {
@@ -566,6 +602,11 @@ impl ServeEngine {
                 if front_page_id == Some(Some(obj.id.0)) {
                     front_uses_plugin = true;
                 }
+                // Only a PUBLISHED post is in the feed window (over-eviction on a draft-only
+                // match would be benign, but this matches the feed's published-only membership).
+                if type_name == POST_TYPE && content::is_published(&obj) {
+                    feed_uses_plugin = true;
+                }
                 let Some(path) = object_output_path(type_name, &obj) else {
                     // The page bakes the plugin but carries no slug/path -> no permalink key to
                     // evict (a not-yet-materialized row); the static-front check above still ran.
@@ -584,6 +625,11 @@ impl ServeEngine {
         // conservatively when we have no settings handle to identify it (idempotent delete).
         if front_uses_plugin || front_page_id.is_none() {
             self.evict_front().await;
+        }
+        // Evict the feed once if any published post bakes the plugin (the feed is a single cache
+        // entry over all posts, so one delete covers every affected item).
+        if feed_uses_plugin {
+            self.evict_feed().await;
         }
 
         tracing::debug!(
@@ -634,6 +680,26 @@ fn setting_reshapes_front(change: &Change) -> bool {
             key,
             "reading.posts_per_page" | "reading.show_on_front" | "reading.page_on_front"
         ),
+        None => true,
+    }
+}
+
+/// Whether a `Setting` change altered the one key that reshapes the cached FEED's content —
+/// `reading.feed_items` (how many entries the feed lists). The feed analogue of
+/// [`setting_reshapes_front`]'s `reading.posts_per_page`. Every other setting composes live in the
+/// feed (title/description/links) or does not apply (the feed uses fixed RFC date formats, so
+/// `site.date_format`/`site.timezone` are irrelevant), and must not bust the feed cache.
+///
+/// Fails OPEN on an absent key (evict conservatively) — parity with [`setting_reshapes_front`];
+/// under-eviction is the dangerous direction, and a needless feed rebuild is idempotent and cheap.
+fn setting_reshapes_feed(change: &Change) -> bool {
+    match change
+        .fields
+        .as_ref()
+        .and_then(|f| f.get("key"))
+        .and_then(|v| v.as_str())
+    {
+        Some(key) => key == "reading.feed_items",
         None => true,
     }
 }

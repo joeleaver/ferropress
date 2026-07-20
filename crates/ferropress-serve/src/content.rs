@@ -485,7 +485,7 @@ pub(crate) async fn cached_page_from_object(
     // Render the block body, then rewrite `data-media-id` placeholders into real
     // media `src`s — the serve layer's job, not the pure renderer's. This runs
     // pre-cache so cached envelopes always carry final URLs.
-    let body = rewrite_media_srcs(render_with(&tree, mode, custom).as_str());
+    let body = render_body(&tree, mode, custom);
 
     let is_post = type_name == POST_TYPE;
 
@@ -706,6 +706,36 @@ async fn build_galley(
     store: &Arc<dyn RhypeStore>,
     settings: &SiteSettings,
 ) -> Result<Vec<CachedHomePost>, CoreError> {
+    let (published, author_links) =
+        recent_published_posts(store, settings.posts_per_page as usize).await?;
+
+    Ok(published
+        .iter()
+        .zip(author_links.iter())
+        .map(|(obj, author_ids)| CachedHomePost {
+            title: str_field(obj, "title"),
+            url: format!("/{}", str_field(obj, "slug")),
+            excerpt: str_field(obj, "excerpt"),
+            published_at: obj.get("published_at").and_then(Value::as_datetime),
+            author_id: author_ids.first().map(|id| id.0),
+        })
+        .collect())
+}
+
+/// The most-recent PUBLISHED posts (newest first, capped at `limit`) with each row's author
+/// target ids in ONE batched link read — the scan/filter/sort/truncate + no-N+1 author query
+/// shared by BOTH the front-page galley ([`build_galley`]) and the syndication feed
+/// ([`crate::feed::build_feed`]), so the two listings can never drift on which posts they
+/// include or on the batched-author discipline.
+///
+/// Scans posts and filters/sorts in Rust: v1 has no compound "status == published ORDER BY
+/// published_at DESC LIMIT n" primitive, and the post table is small. Posts with no
+/// `published_at` sort last (keyed `i64::MIN`). Returns the truncated objects and, positionally
+/// aligned by index, each object's `author` target ids (empty vec when unlinked).
+pub(crate) async fn recent_published_posts(
+    store: &Arc<dyn RhypeStore>,
+    limit: usize,
+) -> Result<(Vec<Object>, Vec<Vec<ObjectId>>), CoreError> {
     let mut published: Vec<Object> = store
         .scan(&TypeName::from(POST_TYPE))
         .await?
@@ -722,27 +752,16 @@ async fn build_galley(
         };
         key(b).cmp(&key(a))
     });
-    published.truncate(settings.posts_per_page as usize);
+    published.truncate(limit);
 
     // Resolve every row's author id in ONE batched link read (no N+1). The display name is
     // NOT stored — it is looked up live from the author directory at compose time (the SAME
-    // directory the single-page byline uses, so the galley + permalink can never disagree).
+    // directory the single-page byline uses, so the galley/feed + permalink can never disagree).
     let ids: Vec<ObjectId> = published.iter().map(|o| o.id).collect();
     let author_links = store
         .get_links_many(&TypeName::from(POST_TYPE), &ids, "author")
         .await?;
-
-    Ok(published
-        .iter()
-        .zip(author_links.iter())
-        .map(|(obj, author_ids)| CachedHomePost {
-            title: str_field(obj, "title"),
-            url: format!("/{}", str_field(obj, "slug")),
-            excerpt: str_field(obj, "excerpt"),
-            published_at: obj.get("published_at").and_then(Value::as_datetime),
-            author_id: author_ids.first().map(|id| id.0),
-        })
-        .collect())
+    Ok((published, author_links))
 }
 
 /// Resolve a request path key to the PUBLISHED entity behind it, returning its store
@@ -827,7 +846,10 @@ pub(crate) fn is_published(obj: &Object) -> bool {
 }
 
 /// A single field read as a `String` (empty when absent or not a string).
-fn str_field(obj: &Object, field: &str) -> String {
+///
+/// `pub(crate)` so the feed builder ([`crate::feed`]) reads a post's scalar
+/// title/slug/uuid/excerpt through the SAME accessor the permalink envelope uses.
+pub(crate) fn str_field(obj: &Object, field: &str) -> String {
     match obj.get(field) {
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
@@ -975,6 +997,21 @@ struct PostSummary {
     excerpt: String,
     dateline: Option<String>,
     author: Option<String>,
+}
+
+/// Render a block tree to its final, media-rewritten HTML body.
+///
+/// The SINGLE code path BOTH the permalink envelope ([`cached_page_from_object`]) and the
+/// syndication feed ([`crate::feed::build_feed`]) funnel a body through, so the
+/// one-shared-renderer invariant holds for every surface that bakes body HTML: block dispatch
+/// is solely [`render_with`] and the media rewrite is applied identically. `mode` threads to
+/// the renderer (public serve/regen pass [`RenderMode::Publish`]; the feed always publishes).
+pub(crate) fn render_body(
+    tree: &BlockTree,
+    mode: RenderMode,
+    custom: &dyn CustomBlockRenderer,
+) -> String {
+    rewrite_media_srcs(render_with(tree, mode, custom).as_str())
 }
 
 /// Rewrite the renderer's `src`-less media placeholder into a real media URL.

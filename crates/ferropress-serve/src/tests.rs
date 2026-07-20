@@ -3236,3 +3236,313 @@ async fn front_page_that_is_a_page_honors_its_template() {
         "the front page still marks the home nav current",
     );
 }
+
+// --- Syndication feeds (RSS + Atom cached listing) ---------------------------
+
+/// Seed a PUBLISHED post with the fields the feed reads: uuid, title, a paragraph body, and a
+/// `published_at`/`updated_at` instant (millis) so ordering + dates are deterministic.
+async fn seed_feed_post(
+    store: &Arc<dyn RhypeStore>,
+    slug: &str,
+    title: &str,
+    uuid: &str,
+    published_at_millis: i64,
+) -> ObjectId {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(Status::Published.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String(title.to_owned()));
+    fields.insert("uuid".to_owned(), Value::String(uuid.to_owned()));
+    fields.insert(
+        "excerpt".to_owned(),
+        Value::String("A short summary.".to_owned()),
+    );
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert(
+        "block_tree".to_owned(),
+        Value::Json(paragraph_block_tree_json()),
+    );
+    fields.insert(
+        "published_at".to_owned(),
+        Value::DateTime(published_at_millis),
+    );
+    fields.insert(
+        "updated_at".to_owned(),
+        Value::DateTime(published_at_millis),
+    );
+    store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .expect("seeding a feed post must succeed")
+}
+
+#[tokio::test]
+async fn build_feed_lists_published_newest_first_capped_at_feed_items() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, _blobs, _) = boot(tmp.path());
+
+    seed_feed_post(&store, "oldest", "Oldest", "uuid-a", 1_000).await;
+    seed_feed_post(&store, "middle", "Middle", "uuid-b", 2_000).await;
+    seed_feed_post(&store, "newest", "Newest", "uuid-c", 3_000).await;
+    // A draft must never appear in the feed.
+    seed_post(&store, "a-draft", Status::Draft).await;
+
+    let mut settings = SiteSettings::defaults();
+    settings.feed_items = 2;
+
+    let feed = crate::feed::build_feed(&store, &NoCustomBlocks, &settings)
+        .await
+        .expect("build_feed");
+
+    assert_eq!(feed.items.len(), 2, "capped at feed_items");
+    assert_eq!(feed.items[0].slug, "newest", "newest first");
+    assert_eq!(feed.items[1].slug, "middle");
+    assert_eq!(feed.items[0].uuid, "uuid-c");
+    assert!(
+        feed.items[0]
+            .content
+            .contains(&format!("<p>{PARAGRAPH_TEXT}</p>")),
+        "the item carries the rendered body: {}",
+        feed.items[0].content,
+    );
+}
+
+#[tokio::test]
+async fn serve_feed_read_through_populates_cache_and_composes_both_formats() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    seed_feed_post(&store, "welcome", "Welcome", "uuid-1", 1_700_000_000_000).await;
+
+    let settings = SiteSettings::defaults();
+    let authors = AuthorDirectory::default();
+    let key = crate::feed::feed_cache_key();
+
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "feed cache empty before first serve"
+    );
+
+    // Miss -> build -> write-through. The RSS output names the post + is absolute (request origin).
+    let rss = crate::serve_feed(
+        &store,
+        &blobs,
+        &NoCustomBlocks,
+        &settings,
+        &authors,
+        crate::FeedFormat::Rss,
+        Some("https://press.example"),
+    )
+    .await
+    .expect("serve rss");
+    assert!(
+        rss.contains("<title>Welcome</title>"),
+        "rss names the post: {rss}"
+    );
+    assert!(
+        rss.contains("https://press.example/welcome"),
+        "absolute item link"
+    );
+
+    // The cache now holds the ENVELOPE (a CachedFeed), not the composed XML.
+    let bytes = blobs.get(&key).await.expect("feed cache populated");
+    let envelope: crate::feed::CachedFeed =
+        serde_json::from_slice(&bytes).expect("cache holds a CachedFeed envelope, not raw XML");
+    assert_eq!(envelope.items.len(), 1);
+
+    // Atom reads the SAME envelope (a hit) and composes the post too.
+    let atom = crate::serve_feed(
+        &store,
+        &blobs,
+        &NoCustomBlocks,
+        &settings,
+        &authors,
+        crate::FeedFormat::Atom,
+        Some("https://press.example"),
+    )
+    .await
+    .expect("serve atom");
+    assert!(
+        atom.contains("<title>Welcome</title>"),
+        "atom names the post"
+    );
+    assert!(
+        atom.contains("urn:uuid:uuid-1"),
+        "atom entry id from the post uuid"
+    );
+}
+
+/// Warm the feed cache via a read, returning the engine + the feed key for an eviction assertion.
+async fn warm_feed(
+    store: &Arc<dyn RhypeStore>,
+    blobs: &Arc<dyn BlobStore>,
+) -> (ServeEngine, ferropress_core::ports::BlobKey) {
+    let key = crate::feed::feed_cache_key();
+    crate::serve_feed(
+        store,
+        blobs,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        crate::FeedFormat::Rss,
+        Some("https://press.example"),
+    )
+    .await
+    .expect("warm the feed cache");
+    assert!(blobs.exists(&key).await.unwrap(), "feed cache warm");
+    let engine = ServeEngine::new(
+        Arc::clone(store),
+        Arc::clone(blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()));
+    (engine, key)
+}
+
+#[tokio::test]
+async fn a_post_change_evicts_the_feed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    let post_id = seed_feed_post(&store, "welcome", "Welcome", "uuid-1", 1_000).await;
+    let (engine, key) = warm_feed(&store, &blobs).await;
+
+    engine
+        .apply_change(&change(ChangeKind::Update, post_id))
+        .await
+        .expect("post change applies");
+
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "a post change must EVICT the feed",
+    );
+}
+
+#[tokio::test]
+async fn a_page_change_does_not_evict_the_feed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    seed_feed_post(&store, "welcome", "Welcome", "uuid-1", 1_000).await;
+    let page_id = seed_page(&store, "about", Status::Published, "About text").await;
+    let (engine, key) = warm_feed(&store, &blobs).await;
+
+    engine
+        .apply_change(&page_change(ChangeKind::Update, page_id, "about"))
+        .await
+        .expect("page change applies");
+
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "a PAGE change must NOT touch the feed (feeds list posts only)",
+    );
+}
+
+#[tokio::test]
+async fn a_user_rename_does_not_evict_the_feed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    let user_id = seed_user(&store, "user-ada", "Ada").await;
+    seed_feed_post(&store, "welcome", "Welcome", "uuid-1", 1_000).await;
+    let (engine, key) = warm_feed(&store, &blobs).await;
+
+    engine
+        .apply_change(&user_change(
+            ChangeKind::Update,
+            user_id,
+            Some("Ada Lovelace"),
+        ))
+        .await
+        .expect("user change applies");
+
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "an author rename must NOT evict the feed (byline resolved live)",
+    );
+}
+
+#[tokio::test]
+async fn feed_items_setting_change_evicts_the_feed_but_other_settings_do_not() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    seed_feed_post(&store, "welcome", "Welcome", "uuid-1", 1_000).await;
+    let (engine, key) = warm_feed(&store, &blobs).await;
+
+    // A CHROME setting (composed live in the feed) must NOT bust it.
+    engine
+        .apply_change(&setting_change_with_key(ChangeKind::Update, "site.title"))
+        .await
+        .expect("site.title change applies");
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "site.title composes live in the feed → no eviction",
+    );
+
+    // `reading.feed_items` reshapes the cached row count → evict.
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "reading.feed_items",
+        ))
+        .await
+        .expect("reading.feed_items change applies");
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "reading.feed_items must EVICT the feed",
+    );
+}
+
+#[tokio::test]
+async fn plugin_setting_change_evicts_the_feed_when_a_published_post_bakes_the_plugin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    seed_post_with_block_tree(
+        &store,
+        "callout-post",
+        Status::Published,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    let (engine, key) = warm_feed(&store, &blobs).await;
+
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("plugin-setting change applies");
+
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "a plugin-config change must EVICT the feed when a published post bakes that plugin's block",
+    );
+}
+
+#[tokio::test]
+async fn plugin_setting_change_does_not_evict_the_feed_for_a_draft_only_match() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+    // Only a DRAFT bakes the plugin — it is NOT in the feed, so the feed must survive.
+    seed_post_with_block_tree(
+        &store,
+        "draft-callout",
+        Status::Draft,
+        custom_block_tree_json("callout"),
+    )
+    .await;
+    let (engine, key) = warm_feed(&store, &blobs).await;
+
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "plugin.callout.default_variant",
+        ))
+        .await
+        .expect("plugin-setting change applies");
+
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "a plugin used only by a DRAFT post must NOT evict the feed (published-only membership)",
+    );
+}

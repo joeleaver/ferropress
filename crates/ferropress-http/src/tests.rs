@@ -771,3 +771,105 @@ async fn serve_page_resolves_byline_live_from_the_author_directory() {
         "the stale byline must be gone; was:\n{body2}"
     );
 }
+
+// --- Syndication feeds (RSS + Atom) ------------------------------------------
+
+/// Drive one GET and return `(status, content_type, etag, body)` — the feed tests need the
+/// content-type + ETag headers `get` drops.
+async fn get_feed(
+    state: &AppState,
+    path: &str,
+    if_none_match: Option<&str>,
+) -> (StatusCode, Option<String>, Option<String>, String) {
+    let mut builder = Request::builder().uri(path);
+    if let Some(etag) = if_none_match {
+        builder = builder.header(header::IF_NONE_MATCH, etag);
+    }
+    let request = builder.body(Body::empty()).expect("request builds");
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router is infallible");
+    let status = response.status();
+    let header_str = |h| {
+        response
+            .headers()
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let content_type = header_str(header::CONTENT_TYPE);
+    let etag = header_str(header::ETAG);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body collects");
+    (
+        status,
+        content_type,
+        etag,
+        String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
+    )
+}
+
+#[tokio::test]
+async fn feed_xml_serves_rss_naming_published_posts_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+    seed_post(&store, PUBLISHED_SLUG, Status::Published).await;
+    seed_post(&store, DRAFT_SLUG, Status::Draft).await;
+
+    let (status, content_type, etag, body) = get_feed(&state, "/feed.xml", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/rss+xml; charset=utf-8"),
+    );
+    assert!(etag.is_some(), "the feed sets an ETag for conditional GET");
+    assert!(body.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>"));
+    assert!(body.contains("<rss"), "an RSS document");
+    assert!(
+        body.contains(PUBLISHED_SLUG),
+        "the published post is syndicated"
+    );
+    assert!(
+        !body.contains(DRAFT_SLUG),
+        "a draft must never appear in the public feed",
+    );
+}
+
+#[tokio::test]
+async fn feed_atom_serves_atom_with_its_content_type() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+    seed_post(&store, PUBLISHED_SLUG, Status::Published).await;
+
+    let (status, content_type, _etag, body) = get_feed(&state, "/feed.atom", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/atom+xml; charset=utf-8"),
+    );
+    assert!(body.contains("<feed"), "an Atom document");
+    assert!(body.contains(PUBLISHED_SLUG));
+}
+
+#[tokio::test]
+async fn feed_supports_conditional_get_with_etag() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+    seed_post(&store, PUBLISHED_SLUG, Status::Published).await;
+
+    // First request yields an ETag + a body.
+    let (status1, _ct, etag, body1) = get_feed(&state, "/feed.xml", None).await;
+    assert_eq!(status1, StatusCode::OK);
+    assert!(!body1.is_empty());
+    let etag = etag.expect("first response carries an ETag");
+
+    // A conditional request with the matching validator gets a bodyless 304.
+    let (status2, _ct2, etag2, body2) = get_feed(&state, "/feed.xml", Some(&etag)).await;
+    assert_eq!(status2, StatusCode::NOT_MODIFIED, "matching ETag → 304");
+    assert!(body2.is_empty(), "a 304 carries no body");
+    assert_eq!(etag2.as_ref(), Some(&etag), "304 echoes the ETag");
+}
