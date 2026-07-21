@@ -172,6 +172,9 @@ struct MenuCtx {
     edit_id: Signal<Option<u64>>,
     name: Signal<String>,
     slug: Signal<String>,
+    /// WordPress's "automatically add new top-level pages" flag for the open menu. Seeded from
+    /// the load/save response (the single source), toggled by the editor, persisted on Save.
+    auto_add: Signal<bool>,
     /// The tree STRUCTURE (drives the `for`); reorder/add/remove only.
     tree: Signal<Vec<MenuRow>>,
     /// cid -> per-row edit signals (label / URL / new-tab).
@@ -227,6 +230,7 @@ impl Default for MenuCtx {
             edit_id: Signal::new(None),
             name: Signal::new(String::new()),
             slug: Signal::new(String::new()),
+            auto_add: Signal::new(false),
             tree: Signal::new(Vec::new()),
             edits: Signal::new(HashMap::new()),
             next_cid: Signal::new(0),
@@ -344,6 +348,7 @@ pub fn app() -> NodeHandle {
         edit_id: Signal::new(Option::<u64>::None),
         name: Signal::new(String::new()),
         slug: Signal::new(String::new()),
+        auto_add: Signal::new(false),
         tree: Signal::new(Vec::<MenuRow>::new()),
         edits: Signal::new(HashMap::<String, RowEdit>::new()),
         next_cid: Signal::new(0u64),
@@ -1172,6 +1177,21 @@ pub fn app() -> NodeHandle {
                         // The item tree — only when the menu loaded cleanly, so a Save can
                         // never PUT a forest derived from an errored/empty load (must-fix M1).
                         if matches!(menu.load.get(), Load::Ready) {
+                            // WordPress's "Automatically add new top-level pages to this menu".
+                            div { class: "menucfg",
+                                label { class: "switch", title: "New top-level pages are added to this menu automatically",
+                                    input {
+                                        r#type: "checkbox", class: "menurow__newtab",
+                                        checked: {move || menu.auto_add.get()},
+                                        oninput: move |c: String| { if menu.saving.get() { return; } menu.auto_add.set(c == "true"); menu.dirty.set(true); },
+                                    }
+                                    span {
+                                        class: {move || if menu.auto_add.get() { "switch__track is-on" } else { "switch__track" }},
+                                        span { class: "switch__knob" }
+                                    }
+                                    span { class: "switch__text", "Automatically add new top-level pages to this menu" }
+                                }
+                            }
                             div { class: "menubar",
                                 span { class: "galley__count",
                                     {move || { let n = menu.tree.get().len(); if n == 0 { String::new() } else { format!("{} item{}", n, if n == 1 { "" } else { "s" }) } }}
@@ -3240,6 +3260,9 @@ fn leave_menu_editor(menu: MenuCtx) {
 fn seed_tree_from_detail(menu: MenuCtx, detail: api::MenuDetail) {
     // Keep the authoritative id from the response (a load/save always echoes it).
     menu.edit_id.set(Some(detail.id));
+    // Seed the auto-add flag from the authoritative response — the SINGLE source, so a load and a
+    // post-save re-seed both reflect exactly what the server persisted (never a duplicated set).
+    menu.auto_add.set(detail.auto_add_pages);
     // Reuse the currently-mounted rows' signals for cids that survive (a re-seed after
     // save), so a still-mounted MenuRowView's inputs keep binding to live cells (see
     // `push_subtree`). On a fresh open the current map is empty, so all are new.
@@ -3301,9 +3324,10 @@ fn save_menu(menu: MenuCtx) {
     menu.saving.set(true);
     let name = menu.name.get();
     let slug = menu.slug.get();
+    let auto_add = menu.auto_add.get();
     spawn_local(async move {
-        // Rename first (so a slug/name edit persists even if the item PUT later fails).
-        match api::update_menu(id, &name, Some(&slug)).await {
+        // Rename first (so a slug/name/auto-add edit persists even if the item PUT later fails).
+        match api::update_menu(id, &name, Some(&slug), Some(auto_add)).await {
             Ok(m) => {
                 menu.name.set(m.name);
                 menu.slug.set(m.slug);

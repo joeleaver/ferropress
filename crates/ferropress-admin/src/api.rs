@@ -719,6 +719,9 @@ pub struct MenuDetail {
     pub slug: String,
     #[serde(default)]
     pub name: String,
+    /// WordPress's "Automatically add new top-level pages to this menu" flag.
+    #[serde(default)]
+    pub auto_add_pages: bool,
     #[serde(default)]
     pub items: Vec<MenuItemNode>,
 }
@@ -768,6 +771,9 @@ struct MenuNameBody<'a> {
     name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     slug: Option<&'a str>,
+    /// Present only on an update that toggles it (create always sends `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_add_pages: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -814,7 +820,11 @@ pub async fn get_menu(id: u64) -> Result<MenuDetail, ApiError> {
 pub async fn create_menu(name: &str, slug: Option<&str>) -> Result<MenuRef, ApiError> {
     let built = Request::post("/admin/api/menus")
         .credentials(RequestCredentials::SameOrigin)
-        .json(&MenuNameBody { name, slug });
+        .json(&MenuNameBody {
+            name,
+            slug,
+            auto_add_pages: None,
+        });
     let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
     let resp = req
         .send()
@@ -828,11 +838,21 @@ pub async fn create_menu(name: &str, slug: Option<&str>) -> Result<MenuRef, ApiE
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
-/// `PUT /admin/api/menus/{id}` — rename / re-slug a menu.
-pub async fn update_menu(id: u64, name: &str, slug: Option<&str>) -> Result<MenuRef, ApiError> {
+/// `PUT /admin/api/menus/{id}` — rename / re-slug a menu, and (when `auto_add_pages` is
+/// `Some`) set its "automatically add new top-level pages" flag.
+pub async fn update_menu(
+    id: u64,
+    name: &str,
+    slug: Option<&str>,
+    auto_add_pages: Option<bool>,
+) -> Result<MenuRef, ApiError> {
     let built = Request::put(&format!("/admin/api/menus/{id}"))
         .credentials(RequestCredentials::SameOrigin)
-        .json(&MenuNameBody { name, slug });
+        .json(&MenuNameBody {
+            name,
+            slug,
+            auto_add_pages,
+        });
     let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
     let resp = req
         .send()

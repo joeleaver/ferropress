@@ -464,6 +464,7 @@ const ADMIN_CSS: &str = r#"
 .xbtn:hover { color: var(--minium-deep); border-color: #D8C4BC; background: #F3E7E2; }
 .menurow__newtab { position: absolute; opacity: 0; width: 0; height: 0; }
 .emptytree { padding: 1.6rem; text-align: center; color: var(--steel); border: 1px dashed var(--rule); border-radius: var(--radius); margin-top: 1rem; }
+.menucfg { margin: .7rem 0 .2rem; }
 .menubar { display: flex; align-items: center; justify-content: space-between; margin: .5rem 0 0; }
 .savebar { margin-top: 1.2rem; display: flex; gap: .8rem; align-items: center; }
 .dirtydot { font-family: var(--ff-mono); font-size: .72rem; letter-spacing: .06em; color: var(--ochre); }
