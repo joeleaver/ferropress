@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -32,8 +32,9 @@ use ferropress_core::LinkTarget;
 use ferropress_core::error::CoreError;
 use ferropress_core::query::{Compare, Edge, FilterSpec};
 use ferropress_core::role::Capability;
+use ferropress_core::status::Status;
 use ferropress_core::value::{FieldMap, Object, ObjectId, TypeName, Value};
-use ferropress_core::{MENU_ITEM_TYPE, MENU_LOCATION_TYPE, MENU_TYPE};
+use ferropress_core::{MENU_ITEM_TYPE, MENU_LOCATION_TYPE, MENU_TYPE, PAGE_TYPE, POST_TYPE};
 
 use super::{AdminError, AdminJson, AuthedUser, i32_field, str_field};
 use crate::AppState;
@@ -77,12 +78,29 @@ pub struct MenuDetail {
     pub items: Vec<MenuItemNode>,
 }
 
+/// A menu item's target resolved for DISPLAY in the admin editor — the target's human
+/// title and its public href. Server→client only (the whole-tree PUT never sends it
+/// back; it is `skip_serializing_if` empty and ignored on input). `title` is
+/// publish-state-INDEPENDENT (a draft Post/Page still shows its title so the author
+/// knows what the item points at); `href` is `Some` ONLY when the target currently
+/// resolves publicly (a published Post/Page), matching the compose-time resolution —
+/// so `href: None` is the editor's signal that the item won't render in the live nav.
+/// A `Custom` item carries no sidecar (its URL is already in the `target`).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ResolvedTarget {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+}
+
 /// One menu item on the wire — used BOTH in the GET response and the whole-tree
 /// PUT. `id` is `Some` for an existing item (absent = a brand-new one to create);
 /// `client_id` is the payload-stable handle a child references via
 /// `parent_client_id` (the server maps `client_id -> ObjectId` as it creates new
 /// items, so a new child can resolve its new parent in one pass). `target` is the
-/// serde-tagged `LinkTarget` (`{"kind":"page","id":5}` etc.).
+/// serde-tagged `LinkTarget` (`{"kind":"page","id":5}` etc.). `resolved` is a
+/// server-computed display sidecar (see [`ResolvedTarget`]); it is output-only —
+/// omitted from a PUT body and ignored if a client sends one.
 #[derive(Serialize, Deserialize)]
 pub struct MenuItemNode {
     #[serde(default)]
@@ -94,6 +112,8 @@ pub struct MenuItemNode {
     pub target: LinkTarget,
     #[serde(default)]
     pub new_tab: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ResolvedTarget>,
 }
 
 /// `POST /menus` body.
@@ -117,13 +137,6 @@ pub struct UpdateMenuRequest {
 #[derive(Deserialize)]
 pub struct SaveItemsRequest {
     pub items: Vec<MenuItemNode>,
-}
-
-/// `PUT /menus/{id}/items` response.
-#[derive(Serialize)]
-pub struct SaveItemsResponse {
-    pub id: u64,
-    pub item_count: usize,
 }
 
 // ---- handlers ---------------------------------------------------------------
@@ -163,7 +176,16 @@ pub async fn get_one(
     Path(id): Path<u64>,
 ) -> Result<Json<MenuDetail>, AdminError> {
     who.require(Capability::ManageMenus)?;
+    Ok(Json(load_menu_detail(&state, id).await?))
+}
 
+/// Build the full [`MenuDetail`] for menu `id`: its identity + item forest (flat, in
+/// `(item_order, id)` order) + each item's resolved-display sidecar. Shared by
+/// [`get_one`] AND [`save_items`] so a load and a save-response are byte-identical —
+/// the save is thus AUTHORITATIVE (the client re-seeds its editor from the PUT's 200,
+/// learning every new item's real id in the same response, with no fallible second
+/// GET that could otherwise leave `id: None` rows the next save would duplicate).
+async fn load_menu_detail(state: &AppState, id: u64) -> Result<MenuDetail, AdminError> {
     let menu = state
         .store
         .get(&TypeName::from(MENU_TYPE), ObjectId(id))
@@ -171,7 +193,7 @@ pub async fn get_one(
 
     // Batch the item objects + their parent links (one get_many + one
     // get_links_many, not an N+1 per item).
-    let item_ids = menu_item_ids(&state, ObjectId(id)).await?;
+    let item_ids = menu_item_ids(state, ObjectId(id)).await?;
     let objs = state
         .store
         .get_many(&TypeName::from(MENU_ITEM_TYPE), &item_ids)
@@ -211,17 +233,105 @@ pub async fn get_one(
                 label: str_field(obj, "label").unwrap_or_default(),
                 target,
                 new_tab: item_new_tab(obj),
+                resolved: None,
             },
         ));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut items: Vec<MenuItemNode> = rows.into_iter().map(|(_, _, n)| n).collect();
 
-    Ok(Json(MenuDetail {
+    // Resolve each item's target to a display title/href (see `resolve_item_displays`).
+    resolve_item_displays(state, &mut items).await?;
+
+    Ok(MenuDetail {
         id,
         slug: str_field(&menu, "slug").unwrap_or_default(),
         name: str_field(&menu, "name").unwrap_or_default(),
-        items: rows.into_iter().map(|(_, _, n)| n).collect(),
-    }))
+        items,
+    })
+}
+
+/// Fill each item's [`ResolvedTarget`] display sidecar: the target's title (a Post/Page
+/// title regardless of publish state, so the editor names a draft target) and its public
+/// href (`Some` only when it currently resolves publicly). Two batched `get_many`s (all
+/// referenced Post ids, all referenced Page ids); `Custom` items carry no sidecar (the
+/// URL is in the target already), `Term` shows a placeholder until taxonomies land.
+async fn resolve_item_displays(
+    state: &AppState,
+    items: &mut [MenuItemNode],
+) -> Result<(), AdminError> {
+    let mut post_ids: Vec<ObjectId> = Vec::new();
+    let mut page_ids: Vec<ObjectId> = Vec::new();
+    for n in items.iter() {
+        match &n.target {
+            LinkTarget::Post { id } => post_ids.push(ObjectId(*id)),
+            LinkTarget::Page { id } => page_ids.push(ObjectId(*id)),
+            _ => {}
+        }
+    }
+    let posts = fetch_display_map(state, POST_TYPE, &post_ids).await?;
+    let pages = fetch_display_map(state, PAGE_TYPE, &page_ids).await?;
+
+    for n in items.iter_mut() {
+        n.resolved = match &n.target {
+            LinkTarget::Post { id } => {
+                Some(posts.get(id).cloned().unwrap_or_else(|| ResolvedTarget {
+                    title: format!("Post #{id} (deleted)"),
+                    href: None,
+                }))
+            }
+            LinkTarget::Page { id } => {
+                Some(pages.get(id).cloned().unwrap_or_else(|| ResolvedTarget {
+                    title: format!("Page #{id} (deleted)"),
+                    href: None,
+                }))
+            }
+            LinkTarget::Term { id } => Some(ResolvedTarget {
+                title: format!("Term #{id}"),
+                href: None,
+            }),
+            // A Custom item's URL is its target; no sidecar needed.
+            LinkTarget::Custom { .. } => None,
+        };
+    }
+    Ok(())
+}
+
+/// Batch-fetch `type_name` objects by id, mapping each to its [`ResolvedTarget`]
+/// display: `title` always, `href` only when the object is currently PUBLISHED —
+/// derived via [`ferropress_serve::content_index::href_from_fields`], the SAME
+/// function the compose path uses, so an admin-shown href can never drift from the
+/// rendered one (empty-key → `None` included). A missing id simply has no entry (the
+/// caller shows a "deleted" placeholder).
+async fn fetch_display_map(
+    state: &AppState,
+    type_name: &str,
+    ids: &[ObjectId],
+) -> Result<HashMap<u64, ResolvedTarget>, AdminError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let objs = state
+        .store
+        .get_many(&TypeName::from(type_name), ids)
+        .await?;
+    let mut map = HashMap::with_capacity(objs.len());
+    for obj in objs {
+        let title = str_field(&obj, "title").unwrap_or_default();
+        let href = if is_published(&obj) {
+            ferropress_serve::content_index::href_from_fields(type_name, |f| str_field(&obj, f))
+        } else {
+            None
+        };
+        map.insert(obj.id.0, ResolvedTarget { title, href });
+    }
+    Ok(map)
+}
+
+/// Whether an object's `status` scalar is exactly `"published"` (mirrors the serve
+/// read path's publish gate).
+fn is_published(obj: &Object) -> bool {
+    matches!(obj.get("status"), Some(Value::String(s)) if s == Status::Published.as_str())
 }
 
 /// `POST /admin/api/menus` — create a menu (empty; items are added via the item PUT).
@@ -339,7 +449,7 @@ pub async fn save_items(
     who: AuthedUser,
     Path(id): Path<u64>,
     AdminJson(body): AdminJson<SaveItemsRequest>,
-) -> Result<Json<SaveItemsResponse>, AdminError> {
+) -> Result<Json<MenuDetail>, AdminError> {
     who.require(Capability::ManageMenus)?;
 
     // Validate the whole forest in memory BEFORE any lock/write (all-or-nothing intent).
@@ -482,10 +592,136 @@ pub async fn save_items(
     // so the live `MenuHandle` always converges on the settled state.
     touch_menu(&state, &menu).await?;
 
-    Ok(Json(SaveItemsResponse {
-        id,
-        item_count: resolved.len(),
+    // Return the reconciled menu (identity + freshly-numbered item forest + resolved
+    // display) as the AUTHORITATIVE save result: the client re-seeds its editor from
+    // THIS response — every just-created item now carries its real id — so there is no
+    // second, fallible GET whose failure could leave `id: None` rows a later save would
+    // duplicate. `resolved` is dropped from the map by the `save_items` reconcile above;
+    // rebuild the full detail (this also settles the just-bumped `_rev`).
+    Ok(Json(load_menu_detail(&state, id).await?))
+}
+
+// ---- link-candidate picker --------------------------------------------------
+
+/// The default number of Post candidates returned when no `limit` is given.
+const LINK_CANDIDATE_DEFAULT_LIMIT: usize = 50;
+/// The hard ceiling on Post candidates per request (a runaway-payload guard).
+const LINK_CANDIDATE_MAX_LIMIT: usize = 200;
+
+/// `GET /admin/api/menus/link-candidates` query: an optional title/href search `q`
+/// and a `limit` on the Post slice.
+#[derive(Deserialize)]
+pub struct LinkCandidateQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One pickable menu target: a PUBLISHED Post or Page, with the href a
+/// [`LinkTarget::Post`]/[`LinkTarget::Page`] pointing at it will resolve to. (The
+/// stored target is only the id; `href` is display sugar so the picker can show what
+/// it links to.)
+#[derive(Serialize)]
+pub struct LinkCandidate {
+    pub kind: &'static str,
+    pub id: u64,
+    pub title: String,
+    pub href: String,
+}
+
+/// `GET /admin/api/menus/link-candidates` response: Pages in full (few, hierarchical),
+/// Posts as a bounded slice (unbounded in a real blog), with a truncation flag so the
+/// UI can prompt a narrower search.
+#[derive(Serialize)]
+pub struct LinkCandidatesResponse {
+    pub pages: Vec<LinkCandidate>,
+    pub posts: Vec<LinkCandidate>,
+    pub posts_truncated: bool,
+}
+
+/// `GET /admin/api/menus/link-candidates` — the PUBLISHED Post + Page targets for the
+/// "add item" picker, never drafts. Published-only BY CONSTRUCTION (an unpublished
+/// target resolves to nothing at compose, so offering it would only add an item that
+/// never renders) — which also means it leaks no draft slug to a role with only
+/// `ManageMenus` (must-fix #12). Custom URLs cover linking anything else.
+pub async fn link_candidates(
+    State(state): State<AppState>,
+    who: AuthedUser,
+    Query(query): Query<LinkCandidateQuery>,
+) -> Result<Json<LinkCandidatesResponse>, AdminError> {
+    who.require(Capability::ManageMenus)?;
+
+    let needle = query
+        .q
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+
+    // Pages: return them all (few, and the hierarchy matters for choosing).
+    let mut pages = collect_candidates(&state, PAGE_TYPE, "page", needle.as_deref()).await?;
+    pages.sort_by_key(candidate_key);
+
+    // Posts: potentially unbounded → search-filter, then cap.
+    let mut posts = collect_candidates(&state, POST_TYPE, "post", needle.as_deref()).await?;
+    posts.sort_by_key(candidate_key);
+    let limit = query
+        .limit
+        .unwrap_or(LINK_CANDIDATE_DEFAULT_LIMIT)
+        .clamp(1, LINK_CANDIDATE_MAX_LIMIT);
+    let posts_truncated = posts.len() > limit;
+    posts.truncate(limit);
+
+    Ok(Json(LinkCandidatesResponse {
+        pages,
+        posts,
+        posts_truncated,
     }))
+}
+
+/// A deterministic sort key for a candidate (case-folded title, then id) so the order
+/// is stable across requests (a bare title sort would tie-break unpredictably).
+fn candidate_key(c: &LinkCandidate) -> (String, u64) {
+    (c.title.to_lowercase(), c.id)
+}
+
+/// Scan `type_name`, keep every PUBLISHED row with a resolvable href, project it to a
+/// [`LinkCandidate`], and (when `needle` is set) keep only those whose title or href
+/// contains it (case-insensitive). Href derivation reuses the serve
+/// [`href_from_fields`](ferropress_serve::content_index::href_from_fields) so the
+/// picker's hrefs match exactly what compose renders (an empty-slug row → no href →
+/// skipped, same as the index).
+async fn collect_candidates(
+    state: &AppState,
+    type_name: &str,
+    kind: &'static str,
+    needle: Option<&str>,
+) -> Result<Vec<LinkCandidate>, AdminError> {
+    let mut out = Vec::new();
+    for obj in state.store.scan(&TypeName::from(type_name)).await? {
+        if !is_published(&obj) {
+            continue;
+        }
+        let Some(href) =
+            ferropress_serve::content_index::href_from_fields(type_name, |f| str_field(&obj, f))
+        else {
+            continue;
+        };
+        let title = str_field(&obj, "title").unwrap_or_default();
+        if let Some(n) = needle
+            && !title.to_lowercase().contains(n)
+            && !href.to_lowercase().contains(n)
+        {
+            continue;
+        }
+        out.push(LinkCandidate {
+            kind,
+            id: obj.id.0,
+            title,
+            href,
+        });
+    }
+    Ok(out)
 }
 
 // ---- location assignment ----------------------------------------------------
@@ -1002,6 +1238,7 @@ mod tests {
                 url: "/".to_owned(),
             },
             new_tab: false,
+            resolved: None,
         }
     }
 

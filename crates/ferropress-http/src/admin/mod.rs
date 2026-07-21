@@ -298,12 +298,18 @@ pub fn api_routes() -> Router<AppState> {
         // Nav menus: CRUD a menu, then reconcile its whole item tree in one PUT. All
         // gated on `ManageMenus` (Editor+).
         .route("/admin/api/menus", get(menus::list).post(menus::create))
-        // Theme locations + their menu bindings. The static `locations` segment is registered
-        // alongside `/menus/{id}`; the router prefers the static match, so it is never shadowed.
+        // Static `menus/*` segments (locations, link-candidates) sit alongside the
+        // `/menus/{id}` param route: axum's router always prefers a static segment over a
+        // `{id}` param REGARDLESS of registration order, so these are never shadowed.
         .route("/admin/api/menus/locations", get(menus::locations))
         .route(
             "/admin/api/menus/locations/{location}",
             put(menus::assign_location),
+        )
+        // Published Post/Page targets for the admin menu editor's "add item" picker.
+        .route(
+            "/admin/api/menus/link-candidates",
+            get(menus::link_candidates),
         )
         .route(
             "/admin/api/menus/{id}",

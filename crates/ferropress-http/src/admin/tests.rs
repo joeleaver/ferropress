@@ -2805,7 +2805,17 @@ async fn menu_crud_and_whole_tree_reconcile_roundtrip() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "put items: {body}");
-    assert_eq!(body["item_count"], 3);
+    // The PUT returns the reconciled MenuDetail (authoritative save result), not a bare
+    // count — every just-created item carries its real id in this same response.
+    assert_eq!(body["items"].as_array().unwrap().len(), 3);
+    assert!(
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"].is_u64()),
+        "the save response assigns a real id to every item"
+    );
 
     // GET it back: 3 items, Sub nested under Reads, new_tab preserved.
     let (s, body) = send(
@@ -2844,7 +2854,7 @@ async fn menu_crud_and_whole_tree_reconcile_roundtrip() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "re-put: {body}");
-    assert_eq!(body["item_count"], 2);
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
     let (_s, body) = send(
         &state,
         "GET",
@@ -2940,4 +2950,131 @@ async fn menu_endpoints_guard_capability_and_reject_bad_input() {
     )
     .await;
     assert_eq!(body["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn menu_link_candidates_are_published_only_searched_and_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, state) = boot(dir.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // Two published posts, one draft post, one published page.
+    seed_post(&store, "iron-oxide", Status::Published).await;
+    seed_post(&store, "bronze-age", Status::Published).await;
+    seed_post(&store, "secret-draft", Status::Draft).await;
+    create_page(&state, &cookie, "about", None, "published").await;
+
+    // All candidates: the two published posts (never the draft), the page with its path href.
+    let (s, body) = send(
+        &state,
+        "GET",
+        "/admin/api/menus/link-candidates",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "link-candidates: {body}");
+    let posts = body["posts"].as_array().unwrap();
+    let pages = body["pages"].as_array().unwrap();
+    let post_slugs: Vec<&str> = posts.iter().map(|p| p["href"].as_str().unwrap()).collect();
+    assert!(post_slugs.contains(&"/iron-oxide") && post_slugs.contains(&"/bronze-age"));
+    assert!(
+        !post_slugs.contains(&"/secret-draft"),
+        "a draft post must NOT be offered as a menu target: {post_slugs:?}"
+    );
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["href"], "/about");
+    assert_eq!(pages[0]["kind"], "page");
+    assert_eq!(posts[0]["kind"], "post");
+    assert_eq!(body["posts_truncated"], false);
+
+    // `q` filters by title/href (case-insensitive): only the bronze post matches.
+    let (s, body) = send(
+        &state,
+        "GET",
+        "/admin/api/menus/link-candidates?q=BRONZE",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let posts = body["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0]["href"], "/bronze-age");
+
+    // `limit` bounds the Post slice and surfaces truncation.
+    let (s, body) = send(
+        &state,
+        "GET",
+        "/admin/api/menus/link-candidates?limit=1",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body["posts"].as_array().unwrap().len(), 1);
+    assert_eq!(body["posts_truncated"], true);
+
+    // Capability gate: a Contributor (no ManageMenus) → 403.
+    seed_user(&store, "contrib", "pw-contrib-12", "contributor").await;
+    let (_s, cc, _b) = do_login(&state, "contrib", "pw-contrib-12").await;
+    let cc = session_pair(&cc.unwrap());
+    let (s, _b) = send(&state, "GET", "/admin/api/menus/link-candidates", &cc, None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn menu_item_resolved_sidecar_names_and_links_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, state) = boot(dir.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // A published post, a draft page (title known, but no public href), and a menu
+    // pointing a Post item, a Page item, and a Custom item at them.
+    let post_id = seed_post(&store, "iron-oxide", Status::Published).await;
+    let page_id = create_page(&state, &cookie, "hidden", None, "draft").await;
+
+    let (_s, body) = send(
+        &state,
+        "POST",
+        "/admin/api/menus",
+        &cookie,
+        Some(serde_json::json!({ "name": "Main" })),
+    )
+    .await;
+    let menu_id = body["id"].as_u64().unwrap();
+
+    let (s, detail) = send(
+        &state,
+        "PUT",
+        &format!("/admin/api/menus/{menu_id}/items"),
+        &cookie,
+        Some(serde_json::json!({ "items": [
+            { "client_id": "p", "label": "", "target": { "kind": "post", "id": post_id.0 } },
+            { "client_id": "g", "label": "", "target": { "kind": "page", "id": page_id } },
+            { "client_id": "c", "label": "Elsewhere", "target": { "kind": "custom", "url": "/x" } }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "put items: {detail}");
+    let items = detail["items"].as_array().unwrap();
+    let by_label_target = |k: &str| items.iter().find(|i| i["target"]["kind"] == k).unwrap();
+
+    // Published post: resolved title from the post, href present (matches compose).
+    let post_item = by_label_target("post");
+    assert_eq!(post_item["resolved"]["title"], "Title iron-oxide");
+    assert_eq!(post_item["resolved"]["href"], "/iron-oxide");
+
+    // Draft page: title still resolves (so the editor names it), but NO href — the
+    // editor's signal that it won't render in the live nav.
+    let page_item = by_label_target("page");
+    assert_eq!(page_item["resolved"]["title"], "Page hidden");
+    assert!(
+        page_item["resolved"]["href"].is_null(),
+        "a draft target must resolve NO href: {page_item}"
+    );
+
+    // Custom item: no sidecar (its URL is already the target).
+    let custom_item = by_label_target("custom");
+    assert!(custom_item["resolved"].is_null());
 }

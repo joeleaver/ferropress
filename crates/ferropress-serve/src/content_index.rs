@@ -111,7 +111,12 @@ impl ContentIndex {
 /// The `fields` are read the same way whether they come off a change snapshot or a
 /// scanned object (both expose `get`), so the boot seed and the incremental update
 /// derive byte-identical hrefs.
-fn href_from_fields(type_name: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
+///
+/// `pub` because the admin's menu surface (`ferropress-http`) reuses THIS one function
+/// to derive the same hrefs for its link-candidate picker and per-item resolved
+/// sidecar — so an admin-shown target href can never drift from the one the compose
+/// path renders (the empty-key→`None` rule included).
+pub fn href_from_fields(type_name: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
     let field = if type_name == PAGE_TYPE {
         "path"
     } else {
