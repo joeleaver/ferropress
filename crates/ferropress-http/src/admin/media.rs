@@ -342,24 +342,10 @@ fn image_mime_ext(kind: &imagesize::ImageType) -> Option<(&'static str, &'static
 /// display metadata only (`Media.slug` is `@indexed`, not `@unique`); `None` if the
 /// stem has no slug-able characters.
 fn slugify_filename(filename: &str) -> Option<String> {
-    // Drop any path prefix, then the extension.
+    // Drop any path prefix, then the extension, then slugify the stem.
     let stem = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s);
-
-    let mut slug = String::new();
-    let mut pending_dash = false;
-    for ch in stem.chars() {
-        if ch.is_ascii_alphanumeric() {
-            if pending_dash {
-                slug.push('-');
-                pending_dash = false;
-            }
-            slug.push(ch.to_ascii_lowercase());
-        } else if !slug.is_empty() {
-            pending_dash = true;
-        }
-    }
-    if slug.is_empty() { None } else { Some(slug) }
+    super::slugify(stem)
 }
 
 #[cfg(test)]

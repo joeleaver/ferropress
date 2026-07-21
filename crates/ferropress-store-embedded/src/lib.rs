@@ -64,11 +64,26 @@ impl EmbeddedStore {
         //    so we assign the `Arc` directly — NOT `Arc::new(...)`. The `schema`
         //    is consumed by value here, so we hand the open a `.clone()` and keep
         //    the original to construct the vectorizer below.
+        //
+        //    The version-controlled SDL is the authoritative schema, applied at
+        //    open. rhypedb REFUSES to drop a catalog entry a persisted database
+        //    still holds unless `allow_schema_shrink` is set (a retirement is
+        //    one-way and irreversible). We keep that safe default — an accidental
+        //    SDL field removal must NOT silently drop a live column — and gate the
+        //    opt-in behind an explicit operator env var: to apply an INTENTIONAL
+        //    field/type removal to an existing data dir, boot once with
+        //    `FERROPRESS_ALLOW_SCHEMA_SHRINK=1`. Absent it, the boot fails loudly
+        //    with rhypedb's dropped-entry list rather than mutating on-disk data.
+        let allow_schema_shrink = matches!(
+            std::env::var("FERROPRESS_ALLOW_SCHEMA_SHRINK").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
         let db = Database::open_with_options(
             schema.clone(),
             data_dir,
             OpenOptions {
                 sync_on_commit: true,
+                allow_schema_shrink,
                 ..Default::default()
             },
         )

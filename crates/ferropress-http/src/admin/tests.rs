@@ -2737,3 +2737,207 @@ async fn page_preview_renders_a_draft_uncached_and_noindex() {
     );
     assert!(html.contains("Preview"), "the preview banner shows");
 }
+
+// ---------------------------------------------------------------------------
+// Nav menus
+// ---------------------------------------------------------------------------
+
+/// Issue an authed admin request with an optional JSON body; return (status, json).
+async fn send(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, cookie);
+    let body = match body {
+        Some(j) => {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+            Body::from(j.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = router(state.clone())
+        .oneshot(b.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+#[tokio::test]
+async fn menu_crud_and_whole_tree_reconcile_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(dir.path());
+    seed_user(&_store, "boss", "pw-boss-1234", "administrator").await;
+    let (_s, set_cookie, _b) = do_login(&state, "boss", "pw-boss-1234").await;
+    let cookie = session_pair(&set_cookie.unwrap());
+
+    // Create a menu.
+    let (s, body) = send(
+        &state,
+        "POST",
+        "/admin/api/menus",
+        &cookie,
+        Some(serde_json::json!({ "name": "Primary Navigation" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "create menu: {body}");
+    let menu_id = body["id"].as_u64().unwrap();
+    assert_eq!(body["slug"], "primary-navigation");
+
+    // PUT a nested tree, deliberately child-before-parent in the payload.
+    let (s, body) = send(
+        &state,
+        "PUT",
+        &format!("/admin/api/menus/{menu_id}/items"),
+        &cookie,
+        Some(serde_json::json!({ "items": [
+            { "client_id": "c-sub", "parent_client_id": "c-reads", "label": "Sub",
+              "target": { "kind": "custom", "url": "/reads/sub" }, "new_tab": true },
+            { "client_id": "c-home", "label": "Home", "target": { "kind": "custom", "url": "/" } },
+            { "client_id": "c-reads", "label": "Reads", "target": { "kind": "custom", "url": "/reads" } }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "put items: {body}");
+    assert_eq!(body["item_count"], 3);
+
+    // GET it back: 3 items, Sub nested under Reads, new_tab preserved.
+    let (s, body) = send(
+        &state,
+        "GET",
+        &format!("/admin/api/menus/{menu_id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    let reads = items.iter().find(|i| i["label"] == "Reads").unwrap();
+    let sub = items.iter().find(|i| i["label"] == "Sub").unwrap();
+    assert_eq!(
+        sub["parent_client_id"], reads["client_id"],
+        "Sub nests under Reads"
+    );
+    assert_eq!(sub["new_tab"], true);
+    let reads_id = reads["id"].as_u64().unwrap();
+
+    // Re-PUT dropping Sub, keeping the two top-level ids stable (update-in-place).
+    let home_id = items.iter().find(|i| i["label"] == "Home").unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let (s, body) = send(
+        &state,
+        "PUT",
+        &format!("/admin/api/menus/{menu_id}/items"),
+        &cookie,
+        Some(serde_json::json!({ "items": [
+            { "id": home_id, "client_id": "h", "label": "Home", "target": { "kind": "custom", "url": "/" } },
+            { "id": reads_id, "client_id": "r", "label": "Reads", "target": { "kind": "custom", "url": "/reads" } }
+        ]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "re-put: {body}");
+    assert_eq!(body["item_count"], 2);
+    let (_s, body) = send(
+        &state,
+        "GET",
+        &format!("/admin/api/menus/{menu_id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    let ids: Vec<u64> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_u64().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&home_id) && ids.contains(&reads_id),
+        "existing ids stayed stable"
+    );
+    assert_eq!(ids.len(), 2, "Sub was removed");
+
+    // Delete the menu → 204, then it 404s.
+    let (s, _b) = send(
+        &state,
+        "DELETE",
+        &format!("/admin/api/menus/{menu_id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _b) = send(
+        &state,
+        "GET",
+        &format!("/admin/api/menus/{menu_id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn menu_endpoints_guard_capability_and_reject_bad_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(dir.path());
+    seed_user(&_store, "boss", "pw-boss-1234", "administrator").await;
+    seed_user(&_store, "contrib", "pw-contrib-12", "contributor").await;
+    let (_s, admin_cookie, _b) = do_login(&state, "boss", "pw-boss-1234").await;
+    let admin_cookie = session_pair(&admin_cookie.unwrap());
+    let (_s, contrib_cookie, _b) = do_login(&state, "contrib", "pw-contrib-12").await;
+    let contrib_cookie = session_pair(&contrib_cookie.unwrap());
+
+    // Capability gate: a Contributor lacks ManageMenus → 403.
+    let (s, _b) = send(&state, "GET", "/admin/api/menus", &contrib_cookie, None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // No session → 401.
+    let (s, _b) = send(&state, "GET", "/admin/api/menus", "", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // Admin creates a menu to target with bad PUTs.
+    let (_s, body) = send(
+        &state,
+        "POST",
+        "/admin/api/menus",
+        &admin_cookie,
+        Some(serde_json::json!({ "name": "Main" })),
+    )
+    .await;
+    let menu_id = body["id"].as_u64().unwrap();
+
+    // A javascript: custom URL is rejected (400) and nothing is written.
+    let (s, _b) = send(&state, "PUT", &format!("/admin/api/menus/{menu_id}/items"), &admin_cookie,
+        Some(serde_json::json!({ "items": [
+            { "client_id": "x", "label": "X", "target": { "kind": "custom", "url": "javascript:alert(1)" } }
+        ]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // An item id not belonging to this menu is rejected.
+    let (s, _b) = send(&state, "PUT", &format!("/admin/api/menus/{menu_id}/items"), &admin_cookie,
+        Some(serde_json::json!({ "items": [
+            { "id": 999999, "client_id": "z", "label": "Z", "target": { "kind": "custom", "url": "/z" } }
+        ]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // The failed PUTs left the menu empty.
+    let (_s, body) = send(
+        &state,
+        "GET",
+        &format!("/admin/api/menus/{menu_id}"),
+        &admin_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+}

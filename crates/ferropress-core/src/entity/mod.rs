@@ -34,7 +34,7 @@ pub use comment::Comment;
 pub use media::{
     MEDIA_ID_ATTR, MEDIA_URL_PREFIX, Media, is_media_token, media_token_from_url, media_url,
 };
-pub use menu::{LinkTarget, Menu, MenuItem};
+pub use menu::{LinkTarget, Menu, MenuItem, MenuLocation};
 pub use page::Page;
 pub use post::Post;
 pub use redirect::Redirect;
@@ -57,6 +57,7 @@ pub const USER_TYPE: &str = "User";
 pub const COMMENT_TYPE: &str = "Comment";
 pub const MENU_TYPE: &str = "Menu";
 pub const MENU_ITEM_TYPE: &str = "MenuItem";
+pub const MENU_LOCATION_TYPE: &str = "MenuLocation";
 pub const SETTING_TYPE: &str = "Setting";
 pub const REVISION_TYPE: &str = "Revision";
 pub const REDIRECT_TYPE: &str = "Redirect";

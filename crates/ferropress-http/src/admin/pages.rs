@@ -36,7 +36,7 @@ use ferropress_serve::templates::page_templates;
 use super::posts::{
     FeaturedMediaDto, effective_time, ensure_media_exists, initial_status, parse_status,
 };
-use super::{AdminError, AdminJson, AuthedUser, content_ops, json_field, str_field};
+use super::{AdminError, AdminJson, AuthedUser, content_ops, i32_field, json_field, str_field};
 use crate::AppState;
 
 /// A runaway guard on the descendant cascade: the max number of subtree nodes a single
@@ -563,30 +563,14 @@ async fn children_of(state: &AppState, page_id: ObjectId) -> Result<Vec<ObjectId
         .collect())
 }
 
-/// Reconcile the to-one `parent` relation to `parent_id`. Fail-safe ordering (link new first,
-/// then unlink the old), mirroring [`set_featured`]; `None` clears the parent (→ top-level).
+/// Reconcile the to-one `parent` relation to `parent_id` (`None` clears it → top-level), via the
+/// shared fail-safe [`reconcile_to_one`](super::reconcile_to_one) helper.
 async fn set_parent(
     state: &AppState,
     page_id: ObjectId,
     parent_id: Option<u64>,
 ) -> Result<(), AdminError> {
-    let edge = parent_edge(page_id);
-    let existing = state.store.get_links(&edge).await?;
-    if existing.len() == 1 && Some(existing[0].0.0) == parent_id {
-        return Ok(());
-    }
-    if let Some(pid) = parent_id {
-        state
-            .store
-            .link(&edge, ObjectId(pid), FieldMap::new())
-            .await?;
-    }
-    for (old, _) in existing {
-        if Some(old.0) != parent_id {
-            state.store.unlink(&edge, old).await?;
-        }
-    }
-    Ok(())
+    super::reconcile_to_one(&state.store, &parent_edge(page_id), parent_id.map(ObjectId)).await
 }
 
 /// The single `parent` link target of `page_id`, if any.
@@ -666,30 +650,19 @@ async fn backfill_author(
     }
 }
 
-/// Reconcile the to-one `featured_media` relation for a page (fail-safe: link new, then unlink
-/// old). Mirrors `posts::set_featured`.
+/// Reconcile the to-one `featured_media` relation for a page (`None` detaches it), via the shared
+/// fail-safe [`reconcile_to_one`](super::reconcile_to_one) helper.
 async fn set_featured(
     state: &AppState,
     page_id: ObjectId,
     media_id: Option<u64>,
 ) -> Result<(), AdminError> {
-    let edge = featured_edge(page_id);
-    let existing = state.store.get_links(&edge).await?;
-    if existing.len() == 1 && Some(existing[0].0.0) == media_id {
-        return Ok(());
-    }
-    if let Some(mid) = media_id {
-        state
-            .store
-            .link(&edge, ObjectId(mid), FieldMap::new())
-            .await?;
-    }
-    for (old, _) in existing {
-        if Some(old.0) != media_id {
-            state.store.unlink(&edge, old).await?;
-        }
-    }
-    Ok(())
+    super::reconcile_to_one(
+        &state.store,
+        &featured_edge(page_id),
+        media_id.map(ObjectId),
+    )
+    .await
 }
 
 /// Resolve a page's featured image to `{id, url}`, or `None`.
@@ -734,14 +707,6 @@ fn summary(obj: &Object, parent: Option<u64>, featured: Option<FeaturedMediaDto>
         parent,
         depth,
         featured_media: featured,
-    }
-}
-
-/// Read an `i32` field (e.g. `menu_order`), defaulting to 0 when absent / wrong type.
-fn i32_field(obj: &Object, field: &str) -> i32 {
-    match obj.get(field) {
-        Some(Value::I32(n)) => *n,
-        _ => 0,
     }
 }
 

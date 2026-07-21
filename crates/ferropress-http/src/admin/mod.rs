@@ -23,19 +23,22 @@ use axum::http::StatusCode;
 use axum::http::header::COOKIE;
 use axum::http::request::Parts;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::Serialize;
 
 use ferropress_auth::{SigningKey, token};
 use ferropress_core::error::CoreError;
+use ferropress_core::query::Edge;
 use ferropress_core::role::{Capability, Role};
-use ferropress_core::value::{Object, ObjectId, Value, now_millis};
+use ferropress_core::store::RhypeStore;
+use ferropress_core::value::{FieldMap, Object, ObjectId, Value, now_millis};
 
 use crate::AppState;
 
 pub mod auth;
 mod content_ops;
 pub mod media;
+pub mod menus;
 pub mod pages;
 pub mod plugins;
 pub mod posts;
@@ -292,6 +295,14 @@ pub fn api_routes() -> Router<AppState> {
         )
         // The theme's page templates, for the editor's Template picker.
         .route("/admin/api/templates", get(pages::templates))
+        // Nav menus: CRUD a menu, then reconcile its whole item tree in one PUT. All
+        // gated on `ManageMenus` (Editor+). Location assignment + render land later.
+        .route("/admin/api/menus", get(menus::list).post(menus::create))
+        .route(
+            "/admin/api/menus/{id}",
+            get(menus::get_one).put(menus::update).delete(menus::delete),
+        )
+        .route("/admin/api/menus/{id}/items", put(menus::save_items))
         // Site settings: read the schema + values, write a validated submission.
         // Both gated on `ManageSettings` (Administrator).
         .route("/admin/api/settings", get(settings::get).put(settings::put))
@@ -376,4 +387,58 @@ pub(crate) fn json_field(obj: &Object, field: &str) -> Option<serde_json::Value>
         Some(Value::Json(j)) => Some(j.clone()),
         _ => None,
     }
+}
+
+/// Read an `i32` field (e.g. `menu_order`, `item_order`), defaulting to 0 when
+/// absent / wrong type.
+pub(crate) fn i32_field(obj: &Object, field: &str) -> i32 {
+    match obj.get(field) {
+        Some(Value::I32(n)) => *n,
+        _ => 0,
+    }
+}
+
+/// Reconcile a to-one relation `edge` to point at `target` (`None` clears it).
+/// Fail-safe ordering — link the new target FIRST, then unlink any stale one — so
+/// a mid-op fault never leaves the relation empty. The single idiom behind every
+/// admin to-one link (a page's `parent`/`featured_media`, a menu item's `parent`).
+pub(crate) async fn reconcile_to_one(
+    store: &Arc<dyn RhypeStore>,
+    edge: &Edge,
+    target: Option<ObjectId>,
+) -> Result<(), AdminError> {
+    let existing = store.get_links(edge).await?;
+    if existing.len() == 1 && Some(existing[0].0) == target {
+        return Ok(());
+    }
+    if let Some(t) = target {
+        store.link(edge, t, FieldMap::new()).await?;
+    }
+    for (old, _) in existing {
+        if Some(old) != target {
+            store.unlink(edge, old).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Derive a URL-safe single-segment slug from arbitrary text: lowercase ASCII
+/// alphanumerics are kept, every other run collapses to a single `-`, and leading/
+/// trailing dashes are trimmed. `None` when nothing survives (e.g. an all-symbol
+/// input). Shared by media filenames and menu names.
+pub(crate) fn slugify(text: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash {
+                slug.push('-');
+                pending_dash = false;
+            }
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() {
+            pending_dash = true;
+        }
+    }
+    if slug.is_empty() { None } else { Some(slug) }
 }

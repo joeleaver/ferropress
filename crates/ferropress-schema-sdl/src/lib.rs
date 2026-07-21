@@ -205,8 +205,9 @@ type Comment {
 type Menu {
     slug: String @unique
     name: String
-    location: String @indexed
     meta: Json
+
+    items: [MenuItem] @inverse(MenuItem.menu)
 }
 
 type MenuItem {
@@ -217,6 +218,13 @@ type MenuItem {
 
     menu: Menu @on_delete(cascade)
     parent: MenuItem @on_delete(cascade)
+    children: [MenuItem] @inverse(MenuItem.parent)
+}
+
+type MenuLocation {
+    location: String @unique
+
+    menu: Menu @on_delete(cascade)
 }
 
 type Setting {
@@ -273,8 +281,8 @@ mod tests {
         assert!(schema.get_type("Page").is_some());
         assert!(schema.get_type("Comment").is_some());
         assert!(schema.get_type("User").is_some());
-        // 12 content types, single-site (no tenancy types).
-        assert_eq!(schema.types.len(), 12);
+        // 13 content types, single-site (no tenancy types).
+        assert_eq!(schema.types.len(), 13);
     }
 
     /// Guard the GLOBAL DECISION embedding choice so a stray edit can't silently

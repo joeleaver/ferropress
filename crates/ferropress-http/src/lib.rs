@@ -105,6 +105,12 @@ pub struct AppState {
     /// process-wide lock shared by every cloned handler; page edits are infrequent, so the
     /// contention is negligible (posts are unaffected — they have no hierarchy).
     pub hierarchy_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes nav-menu-tree-mutating admin writes (the whole-tree items reconcile + a
+    /// location assignment) so the in-memory forest validation + the N per-item writes are
+    /// atomic w.r.t. a concurrent submission of the same menu. Deliberately SEPARATE from
+    /// [`hierarchy_lock`](Self::hierarchy_lock) — a menu reorder and a page re-parent are
+    /// unrelated and must not contend. Menu edits are rare, so this is near-uncontended.
+    pub menu_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -125,6 +131,7 @@ impl AppState {
             plugins: Arc::new(NoPlugins),
             admin: None,
             hierarchy_lock: Arc::new(tokio::sync::Mutex::new(())),
+            menu_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
