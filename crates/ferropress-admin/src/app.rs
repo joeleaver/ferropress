@@ -207,10 +207,13 @@ struct MenuCtx {
     auth: AuthCtx,
 }
 
-// `Default` impls exist ONLY to satisfy the rinch `#[component]` macro, which derives a
-// `Default` props struct for `MenuLocationView` (a `MenuCtx` prop). The default values are
-// throwaway — the macro overwrites every field with the real props at construction. Kept a
-// manual impl because `Signal<T>` has no `Default` (so `#[derive(Default)]` can't be used).
+// The `Default` impls below exist ONLY to satisfy the rinch `#[component]` macro: it builds a
+// component's props via `{ ..Default::default() }` (fully evaluated even when every field is
+// overridden), so every prop TYPE must impl `Default`. `MenuLocationView` takes a `LocCtx` prop
+// (which carries an `AuthCtx`), so both need it. Manual impls because `Signal<T>` has no `Default`
+// (`#[derive(Default)]` can't be used); the default values are throwaway placeholders. `MenuCtx`
+// itself is NOT a component prop (the row component `MenuRowView` takes discrete signals, and the
+// location component takes `LocCtx`), so it needs no `Default` — F6.
 impl Default for AuthCtx {
     fn default() -> Self {
         AuthCtx {
@@ -221,34 +224,25 @@ impl Default for AuthCtx {
     }
 }
 
-impl Default for MenuCtx {
+/// The minimal signal bundle the Locations panel's `<select>` rows need: the menu list (the
+/// options), the current assignments (the source of truth reloaded after an assign), a notice
+/// sink, and the auth bundle for a 401. Passing THIS (4 signals) to `MenuLocationView` instead of
+/// the whole 26-signal `MenuCtx` shrinks the throwaway signals the `#[component]`
+/// `..Default::default()` allocates per render — rinch never frees signals (F6).
+#[derive(Clone, Copy)]
+struct LocCtx {
+    list: Signal<Vec<api::MenuSummary>>,
+    locations: Signal<Vec<api::MenuLocationRow>>,
+    notice: Signal<String>,
+    auth: AuthCtx,
+}
+
+impl Default for LocCtx {
     fn default() -> Self {
-        MenuCtx {
+        LocCtx {
             list: Signal::new(Vec::new()),
-            list_state: Signal::new(Load::Loading),
             locations: Signal::new(Vec::new()),
-            edit_id: Signal::new(None),
-            name: Signal::new(String::new()),
-            slug: Signal::new(String::new()),
-            auto_add: Signal::new(false),
-            tree: Signal::new(Vec::new()),
-            edits: Signal::new(HashMap::new()),
-            next_cid: Signal::new(0),
-            load: Signal::new(Load::Loading),
-            saving: Signal::new(false),
-            dirty: Signal::new(false),
-            picker_open: Signal::new(false),
-            candidates: Signal::new(api::LinkCandidates::default()),
-            candidates_state: Signal::new(Load::Loading),
-            candidates_gen: Signal::new(0),
-            picker_query: Signal::new(String::new()),
-            picker_tab: Signal::new(0),
-            custom_url: Signal::new(String::new()),
-            custom_label: Signal::new(String::new()),
-            picker_err: Signal::new(String::new()),
-            view: Signal::new(View::Boot),
             notice: Signal::new(String::new()),
-            toast: Signal::new(false),
             auth: AuthCtx::default(),
         }
     }
@@ -1072,7 +1066,7 @@ pub fn app() -> NodeHandle {
                         div { class: "panel",
                             h2 { class: "panel__title", "Locations" }
                             for row in menu.locations.get() {
-                                MenuLocationView { key: row.location.clone(), row: row, menu: menu }
+                                MenuLocationView { key: row.location.clone(), row: row, lc: LocCtx { list: menu.list, locations: menu.locations, notice: menu.notice, auth: menu.auth } }
                             }
                             if matches!(menu.list_state.get(), Load::Ready) && menu.locations.get().is_empty() {
                                 p { class: "panel__note", "This theme declares no menu locations." }
@@ -2899,10 +2893,10 @@ fn can_manage_menus(user: &Option<UserDto>) -> bool {
 /// component so the reactive/option build is per-row. On change it assigns and RELOADS
 /// the locations list as the source of truth (reverting the control on a failed assign).
 #[component]
-fn MenuLocationView(row: api::MenuLocationRow, menu: MenuCtx) -> NodeHandle {
+fn MenuLocationView(row: api::MenuLocationRow, lc: LocCtx) -> NodeHandle {
     let loc = row.location.clone();
     let current_id = row.menu.as_ref().map(|m| m.id);
-    let menus = menu.list.get();
+    let menus = lc.list.get();
     let current_present = current_id
         .map(|id| menus.iter().any(|m| m.id == id))
         .unwrap_or(true);
@@ -2955,7 +2949,7 @@ fn MenuLocationView(row: api::MenuLocationRow, menu: MenuCtx) -> NodeHandle {
                     class: "select",
                     oninput: move |v: String| {
                         let id = v.parse::<u64>().ok();
-                        assign_menu_location(menu, &loc, id);
+                        assign_menu_location(lc, &loc, id);
                     },
                     {opts}
                 }
@@ -3178,7 +3172,7 @@ fn open_menus(menu: MenuCtx) {
 }
 
 /// Fetch the location assignments (the source of truth for the Locations `<select>`s).
-fn reload_menu_locations(menu: MenuCtx) {
+fn reload_menu_locations(lc: LocCtx) {
     spawn_local(async move {
         match api::list_menu_locations().await {
             // Clear THEN set so the keyed `for` genuinely rebuilds each `MenuLocationView`
@@ -3187,10 +3181,10 @@ fn reload_menu_locations(menu: MenuCtx) {
             // FAILED assign, where the binding is unchanged) would be a no-op — leaving the
             // native `<select>` still showing the user's rejected pick (must-fix F3).
             Ok(v) => {
-                menu.locations.set(Vec::new());
-                menu.locations.set(v);
+                lc.locations.set(Vec::new());
+                lc.locations.set(v);
             }
-            Err(api::ApiError::Unauthorized) => menu.auth.session_expired(),
+            Err(api::ApiError::Unauthorized) => lc.auth.session_expired(),
             // A failed locations fetch leaves the panel stale rather than blanking it.
             Err(api::ApiError::Message(_)) => {}
         }
@@ -3532,16 +3526,16 @@ fn add_row(
 
 /// Assign (or clear) a location's menu, then reload the locations panel — the source of
 /// truth, so a failed assign reverts the control instead of lying.
-fn assign_menu_location(menu: MenuCtx, location: &str, menu_id: Option<u64>) {
-    menu.notice.set(String::new());
+fn assign_menu_location(lc: LocCtx, location: &str, menu_id: Option<u64>) {
+    lc.notice.set(String::new());
     let loc = location.to_owned();
     spawn_local(async move {
         match api::assign_location(&loc, menu_id).await {
-            Ok(()) => reload_menu_locations(menu),
-            Err(api::ApiError::Unauthorized) => menu.auth.session_expired(),
+            Ok(()) => reload_menu_locations(lc),
+            Err(api::ApiError::Unauthorized) => lc.auth.session_expired(),
             Err(api::ApiError::Message(e)) => {
-                menu.notice.set(e);
-                reload_menu_locations(menu);
+                lc.notice.set(e);
+                reload_menu_locations(lc);
             }
         }
     });
