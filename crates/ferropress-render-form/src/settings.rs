@@ -27,25 +27,14 @@ fn choice(value: &str, label: &str) -> Choice {
     }
 }
 
-/// Theme ids — the single source of truth for the selectable public themes, shared
-/// by [`schema_for_settings`]'s Appearance picker and the serve layer's theme
-/// registry (which maps each id to its template sources). Adding a theme means
-/// adding an id + a [`theme_choices`] row HERE and a matching `ThemeDef` in
-/// `ferropress_serve`'s registry; an unknown stored id falls back to the default
-/// theme when the registry resolves it.
+/// The id of the built-in theme — the always-present default that ships with the core
+/// (its label + template sources live in `ferropress_serve`'s theme registry, which owns
+/// the built-in theme). Every other selectable theme is discovered at runtime from the
+/// themes directory; this crate no longer enumerates them — the Appearance picker's choices
+/// are passed into [`schema_for_settings`] by the caller (which holds the loaded registry).
 pub const THEME_LETTERPRESS: &str = "letterpress";
-/// The Fellstone Tales theme (a faithful reproduction of fellstonetales.com).
-pub const THEME_FELLSTONE: &str = "fellstone";
-/// The public theme a site uses before any `appearance.theme` is stored.
+/// The public theme a site uses before any `appearance.theme` is stored — the built-in.
 pub const DEFAULT_THEME: &str = THEME_LETTERPRESS;
-
-/// The selectable public themes as form choices (id + human label).
-fn theme_choices() -> Vec<Choice> {
-    vec![
-        choice(THEME_LETTERPRESS, "Composing Room \u{2014} letterpress"),
-        choice(THEME_FELLSTONE, "Fellstone Tales"),
-    ]
-}
 
 /// A small, curated set of common IANA zones (not the full ~350-entry database —
 /// enough to be useful, trivially extended). `UTC` is the safe default.
@@ -76,7 +65,14 @@ fn timezones() -> Vec<Choice> {
 
 /// Build the site-settings [`FormSchema`]. Deterministic and cheap; call per
 /// request rather than caching.
-pub fn schema_for_settings() -> FormSchema {
+///
+/// `themes` is the set of selectable public themes (id + label) the Appearance picker
+/// offers — supplied by the caller, which holds the runtime-loaded theme registry
+/// (`ferropress_serve`). Pass `&[]` where only the field keys / defaults matter (the
+/// `appearance.theme` default is [`DEFAULT_THEME`], independent of the option list) — the
+/// only caller that needs real choices is the admin settings API, whose PUT validates the
+/// submitted theme against these options.
+pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
     FormSchema {
         sections: vec![
             FormSection {
@@ -137,7 +133,7 @@ pub fn schema_for_settings() -> FormSchema {
                     ),
                     default: Value::String(DEFAULT_THEME.to_owned()),
                     widget: WidgetKind::Select {
-                        options: theme_choices(),
+                        options: themes.to_vec(),
                     },
                     visible_when: None,
                 }],

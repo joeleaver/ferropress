@@ -34,7 +34,9 @@ use serde_json::{Map, Value as JsonValue};
 /// agree on what a setting resolves to.
 pub async fn load_values(store: &Arc<dyn RhypeStore>) -> Result<Map<String, JsonValue>> {
     // Site settings store keys verbatim, so the store key IS the schema key.
-    overlay_settings(store, schema_for_settings().defaults(), |key| {
+    // The theme option list does not affect defaults (the `appearance.theme` default is a
+    // fixed constant), so pass none — the read path never renders the Appearance picker.
+    overlay_settings(store, schema_for_settings(&[]).defaults(), |key| {
         Some(key.to_owned())
     })
     .await

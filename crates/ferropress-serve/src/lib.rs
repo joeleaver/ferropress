@@ -50,7 +50,7 @@ pub use hierarchy::{BackfillReport, backfill_page_paths, join_page_path};
 pub use hook_bridge::HookBridge;
 pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects};
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
-pub use themes::{ThemeHandle, build_theme};
+pub use themes::{ThemeHandle, ThemeRegistry};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it
@@ -315,25 +315,13 @@ impl ServeEngine {
             if self.settings.is_some() || self.theme.is_some() {
                 match settings::load_site_settings(&self.store).await {
                     Ok(next) => {
-                        // Live theme swap: rebuild + swap the shared handle ONLY when the
-                        // active theme id actually changed (not on every `Setting` write).
-                        // On a build failure keep the current theme (never serve a broken or
-                        // silently-defaulted one) and FALL THROUGH — a co-edited title must
-                        // not be dropped because a theme rebuild happened to fail.
-                        if let Some(theme) = &self.theme
-                            && theme.current_id() != next.theme
-                        {
-                            match build_theme(&next.theme) {
-                                Ok(engine) => {
-                                    theme.set(next.theme.as_str(), engine);
-                                    tracing::info!(theme = %next.theme, "swapped live public theme");
-                                }
-                                Err(e) => tracing::error!(
-                                    error = %e,
-                                    theme = %next.theme,
-                                    "failed to build the new theme; keeping the current one",
-                                ),
-                            }
+                        // Live theme swap: rebuild + swap the shared handle when the active
+                        // `appearance.theme` changed. `swap_to` no-ops when unchanged, keeps the
+                        // current theme on a build error, and holds no lock across the rebuild —
+                        // and it takes `&str`, so `next` stays fully owned for `settings.set`
+                        // below (a co-edited title is never dropped by a theme change).
+                        if let Some(theme) = &self.theme {
+                            theme.swap_to(&next.theme);
                         }
                         if let Some(handle) = &self.settings {
                             handle.set(next);

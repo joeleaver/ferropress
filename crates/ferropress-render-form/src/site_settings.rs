@@ -162,7 +162,7 @@ mod tests {
     fn typed_view_matches_schema_defaults_no_drift() {
         // The inline fallbacks here must equal the schema's declared defaults;
         // this guards against the two drifting apart.
-        let from_schema = SiteSettings::from_values(&schema_for_settings().defaults());
+        let from_schema = SiteSettings::from_values(&schema_for_settings(&[]).defaults());
         assert_eq!(from_schema, SiteSettings::defaults());
     }
 

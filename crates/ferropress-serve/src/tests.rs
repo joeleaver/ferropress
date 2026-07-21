@@ -320,6 +320,52 @@ fn minimal_home_ctx() -> serde_json::Value {
     })
 }
 
+/// Write a minimal, valid on-disk theme (`theme.toml` + the four canonical templates) under
+/// `dir/<id>/`, its base carrying `marker` so a render can be attributed to it. Local to this
+/// module (`#[cfg(test)]` helpers don't cross module boundaries; the registry unit tests carry
+/// their own copy).
+fn write_test_theme(dir: &Path, id: &str, marker: &str) {
+    let d = dir.join(id);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("theme.toml"),
+        format!("id = \"{id}\"\nname = \"{id} theme\"\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("base.html"),
+        format!(
+            "<!doctype html><html><head><title>{{{{ page_title }}}}</title><!--{marker}--></head>\
+             <body>{{% block main %}}{{% endblock %}}</body></html>"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("single.html"),
+        "{% extends \"base.html\" %}{% block main %}<h1>{{ title }}</h1>{{ body | safe }}{% endblock %}",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("home.html"),
+        "{% extends \"base.html\" %}{% block main %}{% for post in posts %}<a href=\"{{ post.url }}\">{{ post.title }}</a>{% endfor %}{% endblock %}",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("page-wide.html"),
+        "{% extends \"base.html\" %}{% block main %}<article>{{ body | safe }}</article>{% endblock %}",
+    )
+    .unwrap();
+}
+
+/// A `ThemeHandle` over a registry loaded from `themes_dir`, seeded at the default theme.
+fn themed_handle(themes_dir: &Path) -> crate::ThemeHandle {
+    crate::ThemeHandle::new(
+        crate::ThemeRegistry::load_dir(themes_dir),
+        ferropress_render_form::DEFAULT_THEME,
+    )
+    .expect("theme handle builds")
+}
+
 /// A `Setting` change to `appearance.theme` rebuilds + swaps the live theme handle the read
 /// path frames pages with — with no restart. Because cached envelopes hold only theme-agnostic
 /// body HTML, this evicts nothing; the next request just re-frames the same body with the new
@@ -329,8 +375,10 @@ fn minimal_home_ctx() -> serde_json::Value {
 async fn setting_change_swaps_the_live_theme() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (store, blobs, _) = boot(tmp.path());
+    let themes = tmp.path().join("themes");
+    write_test_theme(&themes, "aurora", "AURORA-MARK");
 
-    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    let theme = themed_handle(&themes);
     assert_eq!(theme.current_id(), ferropress_render_form::DEFAULT_THEME);
 
     let engine = ServeEngine::new(
@@ -341,8 +389,8 @@ async fn setting_change_swaps_the_live_theme() {
     .with_settings(SettingsHandle::new(SiteSettings::defaults()))
     .with_theme(theme.clone());
 
-    // The admin writes appearance.theme=fellstone (JSON-encoded), then the change arrives.
-    seed_setting(&store, "appearance.theme", "\"fellstone\"").await;
+    // The admin writes appearance.theme=aurora (JSON-encoded), then the change arrives.
+    seed_setting(&store, "appearance.theme", "\"aurora\"").await;
     engine
         .apply_change(&setting_change_with_key(
             ChangeKind::Update,
@@ -351,28 +399,30 @@ async fn setting_change_swaps_the_live_theme() {
         .await
         .expect("a theme Setting change must apply cleanly");
 
-    // The shared handle now NAMES and RENDERS fellstone — no page regeneration involved.
-    assert_eq!(theme.current_id(), ferropress_render_form::THEME_FELLSTONE);
+    // The shared handle now NAMES and RENDERS the loaded disk theme — no page regeneration.
+    assert_eq!(theme.current_id(), "aurora");
     let home = theme
         .current()
         .render("home.html", &minimal_home_ctx())
         .expect("home renders through the swapped theme");
     assert!(
-        home.contains("Gowun Batang"),
-        "the live engine is now fellstone (its display face), not the default: {home}"
+        home.contains("AURORA-MARK"),
+        "the live engine is now the aurora disk theme, not the default: {home}"
     );
 }
 
 /// A live theme swap evicts NOTHING: cached page envelopes hold theme-agnostic body HTML, so
-/// switching theme must not touch the prerender cache. Guards the increment-2 no-page-eviction
-/// guardrail (and the doc-comment's explicit "this evicts nothing" claim) against a future edit
-/// that wires the swap to an eviction, or adds `appearance.*` to a `setting_reshapes_*` gate —
-/// either of which would ship green past the other three tests (they only check `current_id` /
-/// engine `Arc` identity / render output).
+/// switching theme must not touch the prerender cache. Guards the no-page-eviction guardrail
+/// (and the doc-comment's explicit "this evicts nothing" claim) against a future edit that wires
+/// the swap to an eviction, or adds `appearance.*` to a `setting_reshapes_*` gate — either of
+/// which would ship green past the other three tests (they only check `current_id` / engine
+/// `Arc` identity / render output).
 #[tokio::test]
 async fn theme_swap_evicts_no_cached_page() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (store, blobs, _) = boot(tmp.path());
+    let themes = tmp.path().join("themes");
+    write_test_theme(&themes, "aurora", "AURORA-MARK");
 
     // Warm a cached page envelope (any key in the permalink namespace).
     let key = cache_key("/hello");
@@ -381,7 +431,7 @@ async fn theme_swap_evicts_no_cached_page() {
         .await
         .expect("warming the cache must succeed");
 
-    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    let theme = themed_handle(&themes);
     let engine = ServeEngine::new(
         Arc::clone(&store),
         Arc::clone(&blobs),
@@ -390,7 +440,7 @@ async fn theme_swap_evicts_no_cached_page() {
     .with_settings(SettingsHandle::new(SiteSettings::defaults()))
     .with_theme(theme.clone());
 
-    seed_setting(&store, "appearance.theme", "\"fellstone\"").await;
+    seed_setting(&store, "appearance.theme", "\"aurora\"").await;
     engine
         .apply_change(&setting_change_with_key(
             ChangeKind::Update,
@@ -400,7 +450,7 @@ async fn theme_swap_evicts_no_cached_page() {
         .expect("a theme Setting change must apply cleanly");
 
     // The theme actually swapped…
-    assert_eq!(theme.current_id(), ferropress_render_form::THEME_FELLSTONE);
+    assert_eq!(theme.current_id(), "aurora");
     // …yet the warmed cache entry is untouched — a swap regenerates/evicts no page.
     assert!(
         blobs.exists(&key).await.unwrap(),
@@ -409,14 +459,16 @@ async fn theme_swap_evicts_no_cached_page() {
 }
 
 /// A `Setting` change that does NOT alter `appearance.theme` (here `site.title`) leaves the
-/// live theme untouched — the id comparison short-circuits, so the engine is NOT rebuilt (the
-/// `Arc` is pointer-identical before and after).
+/// live theme untouched — `swap_to` short-circuits on the unchanged id, so the engine is NOT
+/// rebuilt (the `Arc` is pointer-identical before and after).
 #[tokio::test]
 async fn non_theme_setting_change_does_not_rebuild_the_theme() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (store, blobs, _) = boot(tmp.path());
+    let themes = tmp.path().join("themes");
+    write_test_theme(&themes, "aurora", "AURORA-MARK");
 
-    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    let theme = themed_handle(&themes);
     let before = theme.current(); // capture the current engine's Arc identity
 
     let engine = ServeEngine::new(
@@ -442,14 +494,16 @@ async fn non_theme_setting_change_does_not_rebuild_the_theme() {
 }
 
 /// Deleting the `appearance.theme` row reverts the live theme to the default: the reload sees
-/// the row gone, `SiteSettings.theme` falls back to `DEFAULT_THEME`, and the id comparison
-/// rebuilds the default engine — a theme "unset" is a real state, not a stuck override.
+/// the row gone, `SiteSettings.theme` falls back to `DEFAULT_THEME`, and `swap_to` rebuilds the
+/// default engine — a theme "unset" is a real state, not a stuck override.
 #[tokio::test]
 async fn deleting_the_theme_setting_reverts_to_the_default_theme() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (store, blobs, _) = boot(tmp.path());
+    let themes = tmp.path().join("themes");
+    write_test_theme(&themes, "aurora", "AURORA-MARK");
 
-    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    let theme = themed_handle(&themes);
     let engine = ServeEngine::new(
         Arc::clone(&store),
         Arc::clone(&blobs),
@@ -458,8 +512,8 @@ async fn deleting_the_theme_setting_reverts_to_the_default_theme() {
     .with_settings(SettingsHandle::new(SiteSettings::defaults()))
     .with_theme(theme.clone());
 
-    // Switch to fellstone first…
-    let setting_id = seed_setting(&store, "appearance.theme", "\"fellstone\"").await;
+    // Switch to the disk theme first…
+    let setting_id = seed_setting(&store, "appearance.theme", "\"aurora\"").await;
     engine
         .apply_change(&setting_change_with_key(
             ChangeKind::Update,
@@ -467,7 +521,7 @@ async fn deleting_the_theme_setting_reverts_to_the_default_theme() {
         ))
         .await
         .expect("the theme switch must apply");
-    assert_eq!(theme.current_id(), ferropress_render_form::THEME_FELLSTONE);
+    assert_eq!(theme.current_id(), "aurora");
 
     // …then delete the row; the reload no longer sees it, so the theme reverts to default.
     store

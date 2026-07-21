@@ -35,6 +35,9 @@ tracing = { workspace = true }
 # The live SiteSettings snapshot is swapped under a short write lock when the
 # regen loop sees a Setting change; the read path clones the current Arc.
 parking_lot = { workspace = true }
+# Parses each on-disk theme's `theme.toml` manifest when the theme registry scans
+# the themes dir at boot (mirrors the plugin host's plugin.toml parsing).
+toml = { workspace = true }
 
 [dev-dependencies]
 # The cache + regen tests drive a REAL embedded store and local-FS blobs (no

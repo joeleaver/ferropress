@@ -50,23 +50,27 @@ use crate::cache_key;
 use crate::datefmt;
 use crate::templates::{HOME_TEMPLATE, template_name_for};
 
-/// Build a [`ThemeEngine`] for the **default** theme (the letterpress "Composing
-/// Room" — `appearance.theme`'s default). The integration tests and any pre-settings
-/// boot use this; the composition root instead builds the theme named by the live
-/// `appearance.theme` setting via [`build_theme`](crate::build_theme). Kept as the
-/// zero-arg constructor so every test that just wants "a theme" gets the built-in one.
+/// Build a [`ThemeEngine`] for the **default** theme (the built-in letterpress "Composing
+/// Room" — `appearance.theme`'s default) from a builtin-only registry. The integration tests
+/// and any pre-settings boot use this; the composition root instead builds the registry from
+/// the themes dir ([`ThemeRegistry::load_dir`](crate::ThemeRegistry::load_dir)) and the theme
+/// named by the live `appearance.theme` setting. Kept as the zero-arg constructor so every test
+/// that just wants "a theme" gets the built-in one.
 pub fn default_theme() -> Result<ThemeEngine, ThemeError> {
-    crate::themes::build_theme(ferropress_render_form::DEFAULT_THEME)
+    crate::themes::ThemeRegistry::builtin().build(ferropress_render_form::DEFAULT_THEME)
 }
 
-/// A [`ThemeHandle`](crate::ThemeHandle) seeded with the **default** theme — the test /
-/// pre-settings seam paralleling [`default_theme`]. The composition root instead seeds the
-/// handle with the theme named by the live `appearance.theme` setting. There is deliberately
-/// no `impl Default for ThemeHandle`: building a theme is fallible, so the constructor stays
-/// honest (a `Result`) rather than papering over a parse failure with a panic in `Default`.
+/// A [`ThemeHandle`](crate::ThemeHandle) over a builtin-only registry — the test / pre-settings
+/// seam paralleling [`default_theme`]. The composition root instead builds the registry from the
+/// themes dir ([`ThemeRegistry::load_dir`](crate::ThemeRegistry::load_dir)) and seeds the handle
+/// with the theme named by the live `appearance.theme` setting. There is deliberately no
+/// `impl Default for ThemeHandle`: building a theme is fallible, so the constructor stays honest
+/// (a `Result`) rather than papering over a parse failure with a panic in `Default`.
 pub fn default_theme_handle() -> Result<crate::themes::ThemeHandle, ThemeError> {
-    let id = ferropress_render_form::DEFAULT_THEME;
-    Ok(crate::themes::ThemeHandle::new(id, default_theme()?))
+    crate::themes::ThemeHandle::new(
+        crate::themes::ThemeRegistry::builtin(),
+        ferropress_render_form::DEFAULT_THEME,
+    )
 }
 
 /// Outcome of resolving a request path to a fully rendered HTML document.

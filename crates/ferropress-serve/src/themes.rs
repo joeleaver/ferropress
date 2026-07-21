@@ -1,464 +1,598 @@
-//! The public **theme registry**: a set of named themes, each a bundle of the four
-//! MiniJinja template sources registered under the canonical template names
-//! ([`BASE_TEMPLATE`]/[`SINGLE_TEMPLATE`]/[`HOME_TEMPLATE`]/[`PAGE_WIDE_TEMPLATE`]).
-//! The active theme is chosen by the `appearance.theme` setting; [`build_theme`]
-//! resolves an id to a ready [`ThemeEngine`]. An unknown id falls back to the
-//! default theme, so a stale/typo'd setting never fails a boot — it serves the
-//! default rather than erroring.
+//! The public **theme registry**: the set of themes available to frame the site, built once
+//! at boot. Exactly one theme is baked in — the built-in "letterpress" default (its sources
+//! are the [`crate::templates`] consts); every other theme is DATA, discovered at runtime by
+//! [`ThemeRegistry::load_dir`] from a themes directory (mirroring how the plugin host scans
+//! `plugins/dist/<id>/`). A theme on disk is a folder holding a `theme.toml` manifest
+//! (`id` + optional `name`) and the four canonical template files
+//! `base.html` / `single.html` / `home.html` / `page-wide.html`.
 //!
-//! The template NAMES + the page-template mapping ([`crate::templates`]) and the
-//! render context (`SingleCtx`/`HomeCtx`/`SiteCtx` in [`crate::content`]) are SHARED
-//! across themes; only the SOURCES registered under those names differ. Because a
-//! page's cached envelope stores only the theme-agnostic body HTML (chrome is
-//! composed live at request time), switching theme evicts **nothing** — the next
-//! request just frames the same body with the new theme.
+//! The template NAMES + the page-template mapping ([`crate::templates`]) and the render
+//! context (`SingleCtx`/`HomeCtx`/`SiteCtx` in [`crate::content`]) are SHARED across every
+//! theme; only the SOURCES registered under those names differ. Because a page's cached
+//! envelope stores only the theme-agnostic body HTML (chrome is composed live at request
+//! time), switching theme evicts **nothing** — the next request frames the same body with the
+//! new theme. A v1 theme restyles that fixed set of four slots; it cannot add partials or new
+//! page-template slots (those still require a core change to [`crate::templates`]).
 //!
-//! Adding a theme = a new id + label in `ferropress_render_form` (the Appearance
-//! picker's single source of truth) and a matching [`ThemeDef`] here.
+//! Loading is deliberately strict so a broken disk theme can never brick a later boot or 500
+//! every page: [`ThemeRegistry::load_dir`] compiles AND smoke-renders each candidate before
+//! admitting it, so **registered ⇒ renderable**. A themes-dir problem never fails boot — the
+//! built-in default is always present and is the fallback [`ThemeRegistry::build`] resolves an
+//! unknown id to.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferropress_render_form::THEME_FELLSTONE;
+use ferropress_core::entity::is_valid_plugin_id;
+use ferropress_render_form::{Choice, DEFAULT_THEME};
 use ferropress_theme::{SandboxLimits, ThemeEngine, ThemeError};
 use parking_lot::RwLock;
+use serde::Deserialize;
 
 use crate::templates::{
     BASE_SRC, BASE_TEMPLATE, HOME_SRC, HOME_TEMPLATE, PAGE_WIDE_SRC, PAGE_WIDE_TEMPLATE,
     SINGLE_SRC, SINGLE_TEMPLATE,
 };
 
-/// The current live theme: the built [`ThemeEngine`] paired with the `appearance.theme`
-/// id it was built from. The id is kept so the regen loop can rebuild the engine ONLY
-/// when the active theme actually changes, not on every `Setting` write.
+/// A theme's human label + its four template sources. A theme is fully described by these
+/// (the template NAMES + the render-context contract are shared across all themes).
+#[derive(Clone)]
+struct ThemeSources {
+    /// Human label shown in the Appearance picker.
+    label: String,
+    base: String,
+    single: String,
+    home: String,
+    page_wide: String,
+}
+
+/// A disk theme's `theme.toml` manifest (mirrors the plugin host's `plugin.toml`).
+#[derive(Debug, Deserialize)]
+struct ThemeManifest {
+    /// The theme id — the stored `appearance.theme` value + the picker option value. Must be
+    /// a dot-free ASCII id (reuses the plugin-id charset), since it flows into an
+    /// `<option value>`, a stored `Setting` string, and a registry key.
+    id: String,
+    /// Human label; defaults to the id when absent/blank.
+    name: Option<String>,
+}
+
+/// The built-in theme's sources — the "Composing Room" letterpress (the [`crate::templates`]
+/// consts). Seeded under [`DEFAULT_THEME`] so it is the single source of truth for the
+/// default id shared with `ferropress_render_form`.
+fn builtin_sources() -> ThemeSources {
+    ThemeSources {
+        label: "Composing Room \u{2014} letterpress".to_owned(),
+        base: BASE_SRC.to_owned(),
+        single: SINGLE_SRC.to_owned(),
+        home: HOME_SRC.to_owned(),
+        page_wide: PAGE_WIDE_SRC.to_owned(),
+    }
+}
+
+/// The set of themes available to frame the site: the always-present built-in default plus any
+/// discovered on disk. Built once at boot and thereafter immutable (folder additions/edits need
+/// a restart). Held (behind an `Arc`) by [`ThemeHandle`], which builds engines from it.
+pub struct ThemeRegistry {
+    /// id -> sources. Always contains [`DEFAULT_THEME`] (the built-in). A `BTreeMap` gives the
+    /// stable alphabetical order [`choices`](Self::choices) promises.
+    themes: BTreeMap<String, ThemeSources>,
+}
+
+impl ThemeRegistry {
+    /// A registry with ONLY the built-in default theme — the test / pre-settings seam (and what
+    /// [`crate::content::default_theme_handle`] uses). Production boots via [`load_dir`](Self::load_dir).
+    pub fn builtin() -> Self {
+        let mut themes = BTreeMap::new();
+        themes.insert(DEFAULT_THEME.to_owned(), builtin_sources());
+        Self { themes }
+    }
+
+    /// Scan `dir` for on-disk themes and register the ones that load cleanly, on top of the
+    /// always-present built-in default. INFALLIBLE — a themes-dir problem must never fail boot:
+    /// a missing dir logs and yields the built-in only; an unreadable dir warns and yields the
+    /// built-in only; a single bad theme is skip+logged so it can't stop the others. Only
+    /// themes that parse, carry all four templates, AND compile+smoke-render are admitted
+    /// (registered ⇒ renderable), so a later `build` of any registered id cannot fail.
+    ///
+    /// Directory entries are sorted before scanning, so disk-vs-disk id collisions resolve
+    /// deterministically (first wins) and the built-in (seeded first) is un-shadowable — the
+    /// same unified "id already present → skip + warn" rule covers both.
+    pub fn load_dir(dir: &Path) -> Self {
+        let mut registry = Self::builtin();
+
+        if !dir.is_dir() {
+            tracing::info!(dir = %dir.display(), "no themes dir; using the built-in theme only");
+            return registry;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "reading themes dir; using the built-in theme only");
+                return registry;
+            }
+        };
+
+        // Sort for deterministic precedence + the stable order `choices()` promises.
+        let mut subdirs: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        subdirs.sort();
+
+        for sub in subdirs {
+            let manifest_path = sub.join("theme.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            match load_theme(&sub, &manifest_path) {
+                Ok((id, sources)) => {
+                    // Unified collision rule: the built-in (seeded first) and any earlier disk
+                    // theme win. A disk theme claiming "letterpress" is thus ignored here.
+                    if registry.themes.contains_key(&id) {
+                        tracing::warn!(id = %id, dir = %sub.display(), "theme id already registered; skipping");
+                        continue;
+                    }
+                    tracing::info!(id = %id, dir = %sub.display(), "loaded theme");
+                    registry.themes.insert(id, sources);
+                }
+                Err(e) => tracing::error!(dir = %sub.display(), error = %e, "skipping theme"),
+            }
+        }
+        registry
+    }
+
+    /// Build a [`ThemeEngine`] for `id`, its four templates registered under the canonical
+    /// names. An unknown/stale id resolves to the built-in default (always seeded), so a
+    /// misspelled or removed `appearance.theme` degrades to the default rather than erroring.
+    /// In practice infallible (only compilable themes are registered), but returns `Result`
+    /// because template registration is fallible in principle.
+    pub fn build(&self, id: &str) -> Result<ThemeEngine, ThemeError> {
+        let sources = self.themes.get(id).unwrap_or_else(|| {
+            self.themes
+                .get(DEFAULT_THEME)
+                .expect("the built-in default theme is always seeded")
+        });
+        register_engine(sources)
+    }
+
+    /// The selectable themes as picker choices — the built-in default first, then the rest in
+    /// alphabetical id order (the `BTreeMap`'s order).
+    pub fn choices(&self) -> Vec<Choice> {
+        let mut choices = Vec::with_capacity(self.themes.len());
+        if let Some(src) = self.themes.get(DEFAULT_THEME) {
+            choices.push(Choice {
+                value: DEFAULT_THEME.to_owned(),
+                label: src.label.clone(),
+            });
+        }
+        for (id, src) in &self.themes {
+            if id != DEFAULT_THEME {
+                choices.push(Choice {
+                    value: id.clone(),
+                    label: src.label.clone(),
+                });
+            }
+        }
+        choices
+    }
+}
+
+/// Register a theme's four sources into a fresh sandboxed [`ThemeEngine`] under the canonical
+/// template names. Fails only if a source does not compile (MiniJinja parse error).
+fn register_engine(sources: &ThemeSources) -> Result<ThemeEngine, ThemeError> {
+    let mut theme = ThemeEngine::new(SandboxLimits::default());
+    theme.add_template(BASE_TEMPLATE.to_owned(), sources.base.clone())?;
+    theme.add_template(SINGLE_TEMPLATE.to_owned(), sources.single.clone())?;
+    theme.add_template(HOME_TEMPLATE.to_owned(), sources.home.clone())?;
+    theme.add_template(PAGE_WIDE_TEMPLATE.to_owned(), sources.page_wide.clone())?;
+    Ok(theme)
+}
+
+/// Load + VALIDATE one on-disk theme from its dir + `theme.toml` path. Returns `(id, sources)`
+/// only if the manifest parses with a valid id, all four canonical templates are present, and
+/// the theme both compiles and smoke-renders — so the registry's `registered ⇒ renderable`
+/// invariant holds and a broken theme is rejected at load rather than failing a later boot or
+/// render. Any problem is an `Err(String)` the caller logs and skips.
+fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources), String> {
+    let text = std::fs::read_to_string(manifest_path)
+        .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;
+    let manifest: ThemeManifest =
+        toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", manifest_path.display()))?;
+
+    let id = manifest.id.trim().to_owned();
+    if !is_valid_plugin_id(&id) {
+        return Err(format!(
+            "invalid theme id {id:?} (expected a non-empty, dot-free ASCII id)"
+        ));
+    }
+    let label = manifest
+        .name
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| id.clone());
+
+    let read = |file: &str| -> Result<String, String> {
+        let path = dir.join(file);
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))
+    };
+    let sources = ThemeSources {
+        label,
+        base: read("base.html")?,
+        single: read("single.html")?,
+        home: read("home.html")?,
+        page_wide: read("page-wide.html")?,
+    };
+
+    // registered ⇒ renderable: compile all four templates AND smoke-render each in EVERY
+    // production shape a real request can hit, so a syntax error OR a render-time-only fault (a
+    // bad `{% extends %}`, or an `{% include %}` of an unregistered partial — resolved lazily at
+    // render, not by `add_template`) is caught HERE, never at a later boot's `ThemeHandle::new`
+    // or on a live page. single/page-wide are only ever framed with `is_home = false` (the front
+    // page is the sole `is_home = true`); the home galley runs both populated and empty. (The
+    // engine + contexts are throwaway; only the validated sources are kept.)
+    let engine = register_engine(&sources).map_err(|e| format!("compiling templates: {e}"))?;
+    let empty = serde_json::json!([]);
+    let one_post = serde_json::json!([{
+        "title": "Sample Post", "url": "/sample-post", "excerpt": "An excerpt.",
+        "dateline": "January 1, 2026", "author": "A. Writer"
+    }]);
+    let single_ctx = sample_context(false, empty.clone());
+    let home_full = sample_context(true, one_post);
+    let home_empty = sample_context(true, empty);
+    for (template, ctx) in [
+        (SINGLE_TEMPLATE, &single_ctx),
+        (PAGE_WIDE_TEMPLATE, &single_ctx),
+        (HOME_TEMPLATE, &home_full),
+        (HOME_TEMPLATE, &home_empty),
+    ] {
+        engine
+            .render(template, ctx)
+            .map_err(|e| format!("rendering {template}: {e}"))?;
+    }
+    Ok((id, sources))
+}
+
+/// A representative render context covering the full shared contract (see `content.rs`), used to
+/// smoke-render a candidate theme at load. `is_home` + `posts` are varied by the caller so every
+/// branch a real request hits is exercised; all other fields are present so a well-formed theme
+/// renders cleanly (MiniJinja is lenient on undefined, so the check flags structural errors — bad
+/// `extends`/`include`/block/syntax — not missing optional data).
+fn sample_context(is_home: bool, posts: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "page_title": "Sample",
+        "page_description": "A sample page.",
+        "canonical": "https://example.com/sample",
+        "site": {"title": "Sample Site", "tagline": "A tagline", "url": "https://example.com", "logo": null, "noindex": false},
+        "is_home": is_home,
+        "preview_status": null,
+        "title": "Sample Post",
+        "dateline": "January 1, 2026",
+        "kicker": "Notes",
+        "author": "A. Writer",
+        "author_initials": "AW",
+        "featured_image": null,
+        "body": "<p>Sample <strong>body</strong>.</p>",
+        "posts": posts
+    })
+}
+
+/// The current live theme: the built [`ThemeEngine`] paired with the `appearance.theme` id it
+/// was built from. The id is kept so the regen loop can rebuild only when the active theme
+/// actually changes, not on every `Setting` write.
 struct ThemeState {
-    /// The **requested** `appearance.theme` id this engine was built for — used solely
-    /// for change-detection. It may differ from the theme actually rendered: an unknown
-    /// id resolves to the default theme via [`theme_def`], yet the requested id is stored
-    /// verbatim so that later fixing the typo is re-detected as a change (self-healing).
-    /// Do NOT read it as "the theme currently on screen".
+    /// The **requested** `appearance.theme` id this engine was built for — used solely for
+    /// change-detection. It may differ from the theme actually rendered: an unknown id resolves
+    /// to the built-in default via [`ThemeRegistry::build`], yet the requested id is stored
+    /// verbatim so that later fixing the typo (or restoring a removed theme's folder) is
+    /// re-detected as a change (self-healing). Do NOT read it as "the theme currently on screen".
     id: String,
     engine: Arc<ThemeEngine>,
 }
 
-/// A cheaply-cloneable handle to the current live public [`ThemeEngine`], shared between
-/// the HTTP read path (which frames every page) and the [`ServeEngine`](crate::ServeEngine)
-/// regen loop (which rebuilds + swaps it when `appearance.theme` changes). This makes a
-/// theme switch take effect with no restart and — because cached page envelopes hold only
-/// theme-agnostic body HTML (chrome is composed live) — with no page-cache eviction.
+/// A cheaply-cloneable handle to the current live public theme, bundling the boot-immutable
+/// [`ThemeRegistry`] with the currently-built engine. Shared between the HTTP read path (which
+/// frames every page + renders the Appearance picker) and the [`ServeEngine`](crate::ServeEngine)
+/// regen loop (which rebuilds + swaps the engine when `appearance.theme` changes). A theme
+/// switch takes effect with no restart and — because cached page envelopes hold only
+/// theme-agnostic body HTML — with no page-cache eviction.
 ///
-/// Mirrors [`SettingsHandle`](crate::SettingsHandle): reads clone the inner `Arc` under a
-/// short read lock; a swap replaces it under a short write lock. The engine is read on every
-/// request and rebuilt only on a (rare) theme change, so a plain `RwLock` is ample. Holding
-/// the cloned `Arc` for the duration of one render means a concurrent swap can never tear an
-/// in-flight render — it keeps its engine; the next request sees the new one.
-///
-/// The [`current_id`](Self::current_id) → build → [`set`](Self::set) sequence the regen loop
-/// runs is race-free ONLY because that loop is the SOLE writer (the same single-consumer
-/// assumption the settings/authors/redirects handles already rely on). Parallelizing the
-/// consumer would need a compare-and-swap here instead.
+/// Reads clone the inner engine `Arc` under a short read lock; a swap replaces it under a short
+/// write lock. Holding the cloned `Arc` for one render means a concurrent swap can never tear an
+/// in-flight render. The [`current_id`](Self::current_id) → build → set sequence in
+/// [`swap_to`](Self::swap_to) is race-free ONLY because the sequential regen loop is the SOLE
+/// writer (like the settings/authors/redirects handles); the admin PUT must persist the `Setting`
+/// and let the change feed drive `swap_to`, never call it directly.
 #[derive(Clone)]
-pub struct ThemeHandle(Arc<RwLock<ThemeState>>);
+pub struct ThemeHandle {
+    registry: Arc<ThemeRegistry>,
+    state: Arc<RwLock<ThemeState>>,
+}
 
 impl ThemeHandle {
-    /// Seed the handle with the theme built for `id` (at startup, from the live
-    /// `appearance.theme` setting).
-    pub fn new(id: impl Into<String>, engine: ThemeEngine) -> Self {
-        Self(Arc::new(RwLock::new(ThemeState {
-            id: id.into(),
-            engine: Arc::new(engine),
-        })))
+    /// Seed the handle from `registry`, building the engine for `id` (at startup, from the live
+    /// `appearance.theme` setting). On a build error falls back to the built-in default, so boot
+    /// can never fail on a themes-dir problem (defensive — `registered ⇒ buildable` and an
+    /// unknown id already resolves to the default inside [`ThemeRegistry::build`]). The stored
+    /// id is the REQUESTED `id` verbatim.
+    pub fn new(registry: ThemeRegistry, id: &str) -> Result<Self, ThemeError> {
+        let engine = match registry.build(id) {
+            Ok(engine) => engine,
+            Err(e) => {
+                tracing::error!(theme = %id, error = %e, "building the boot theme; falling back to the default");
+                registry.build(DEFAULT_THEME)?
+            }
+        };
+        Ok(Self {
+            registry: Arc::new(registry),
+            state: Arc::new(RwLock::new(ThemeState {
+                id: id.to_owned(),
+                engine: Arc::new(engine),
+            })),
+        })
     }
 
-    /// The current built theme engine. Cloning the `Arc` is cheap; hold it for the
-    /// duration of one render.
+    /// The current built theme engine. Cloning the `Arc` is cheap; hold it for one render.
     pub fn current(&self) -> Arc<ThemeEngine> {
-        Arc::clone(&self.0.read().engine)
+        Arc::clone(&self.state.read().engine)
     }
 
-    /// The `appearance.theme` id the current engine was built from — for change-detection
-    /// (see [`ThemeState::id`]; it names the *requested* theme, which may differ from the
-    /// rendered one when the id is unknown).
+    /// The `appearance.theme` id the current engine was built from — for change-detection (see
+    /// [`ThemeState::id`]; it names the *requested* theme, which may differ from the rendered
+    /// one when the id is unknown/removed).
     pub fn current_id(&self) -> String {
-        self.0.read().id.clone()
+        self.state.read().id.clone()
     }
 
-    /// Replace the current theme (called by the regen loop on an `appearance.theme`
-    /// change). Swaps the id and the engine together under one write lock.
-    pub fn set(&self, id: impl Into<String>, engine: ThemeEngine) {
-        let mut state = self.0.write();
-        state.id = id.into();
+    /// Rebuild + swap to `id` via the registry, IFF the active id changed. Keeps the current
+    /// theme on a build error (never serve a broken one). The REQUESTED `id` is stored verbatim,
+    /// so restoring a removed theme (or fixing a typo) is re-detected as a change.
+    ///
+    /// Lock discipline: NO lock is held across `registry.build` (MiniJinja compilation) or across
+    /// the read→write transition — `parking_lot::RwLock` is non-reentrant, and holding it would
+    /// both self-deadlock and stall every HTTP reader for the whole compile. Race-free only under
+    /// the single-writer discipline documented on the type.
+    pub fn swap_to(&self, id: &str) {
+        if self.current_id() == id {
+            return;
+        }
+        match self.registry.build(id) {
+            Ok(engine) => {
+                self.set(id, engine);
+                tracing::info!(theme = %id, "swapped live public theme");
+            }
+            Err(e) => {
+                tracing::error!(theme = %id, error = %e, "building the new theme; keeping the current one")
+            }
+        }
+    }
+
+    /// The selectable theme choices for the Appearance picker. Always includes the CURRENT id:
+    /// if the active theme's folder was removed/renamed after its id was saved, the registry no
+    /// longer lists it, but the admin Save PUTs the full value set and `coerce_values` rejects an
+    /// out-of-vocab `Select` — so append the current id as an "(unavailable)" option to keep
+    /// every settings PUT valid while still letting the admin switch to a real theme.
+    pub fn choices(&self) -> Vec<Choice> {
+        let mut choices = self.registry.choices();
+        let current = self.current_id();
+        if !choices.iter().any(|c| c.value == current) {
+            choices.push(Choice {
+                value: current.clone(),
+                label: format!("{current} (unavailable)"),
+            });
+        }
+        choices
+    }
+
+    /// Replace the current theme (id + engine) under one short write lock. Private: the only
+    /// caller is [`swap_to`](Self::swap_to), which enforces the lock + single-writer discipline.
+    fn set(&self, id: &str, engine: ThemeEngine) {
+        let mut state = self.state.write();
+        state.id = id.to_owned();
         state.engine = Arc::new(engine);
     }
 }
 
-/// A public theme: the four template sources registered under the canonical
-/// template names. The context contract + template names are shared, so a theme is
-/// fully described by its four sources.
-struct ThemeDef {
-    base: &'static str,
-    single: &'static str,
-    home: &'static str,
-    page_wide: &'static str,
-}
-
-/// The built-in "Composing Room" letterpress theme (sources in [`crate::templates`]).
-const LETTERPRESS: ThemeDef = ThemeDef {
-    base: BASE_SRC,
-    single: SINGLE_SRC,
-    home: HOME_SRC,
-    page_wide: PAGE_WIDE_SRC,
-};
-
-/// The "Fellstone Tales" theme — a faithful reproduction of fellstonetales.com.
-const FELLSTONE: ThemeDef = ThemeDef {
-    base: FELLSTONE_BASE_SRC,
-    single: FELLSTONE_SINGLE_SRC,
-    home: FELLSTONE_HOME_SRC,
-    page_wide: FELLSTONE_PAGE_WIDE_SRC,
-};
-
-/// Resolve a theme id to its bundle, falling back to the default (letterpress) on an
-/// unknown id — a stale or misspelled `appearance.theme` degrades to the default
-/// rather than failing the render.
-fn theme_def(id: &str) -> &'static ThemeDef {
-    match id {
-        THEME_FELLSTONE => &FELLSTONE,
-        _ => &LETTERPRESS,
-    }
-}
-
-/// Build a [`ThemeEngine`] with the named theme's four templates registered under
-/// the canonical template names. An unknown id resolves to the default theme.
-pub fn build_theme(id: &str) -> Result<ThemeEngine, ThemeError> {
-    let def = theme_def(id);
-    let mut theme = ThemeEngine::new(SandboxLimits::default());
-    theme.add_template(BASE_TEMPLATE.to_owned(), def.base.to_owned())?;
-    theme.add_template(SINGLE_TEMPLATE.to_owned(), def.single.to_owned())?;
-    theme.add_template(HOME_TEMPLATE.to_owned(), def.home.to_owned())?;
-    theme.add_template(PAGE_WIDE_TEMPLATE.to_owned(), def.page_wide.to_owned())?;
-    Ok(theme)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fellstone Tales theme sources.
-//
-// A faithful reproduction of fellstonetales.com: a parchment "page" floating on a
-// near-black field, an elegant Gowun Batang serif throughout, a bronze logotype
-// masthead (from the `site.logo` setting), and a white serif nav bar. Consumes the
-// SAME context as the letterpress theme (`SiteCtx`/`SingleCtx`/`HomeCtx`), so no
-// serve-side change is needed to render it.
-//
-// INTERIM (this is theme-slice step 1): the nav is the single Front-page link
-// (the menu system is a later step), the single template is single-column (the
-// sidebar + widgets are a later step), and the galley has no term chips or
-// pagination yet (taxonomies + pagination are later steps). Each of those extends
-// this template + the render context when its backend lands.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Fellstone shared chrome: `<head>`, the masthead (logo or title), the nav bar +
-/// `#fp-search` island mount, the colophon, the inline stylesheet, and the island
-/// boot script. Reads **live** `site.*` settings, so a settings change needs no
-/// page regeneration.
-pub const FELLSTONE_BASE_SRC: &str = r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="alternate" type="application/rss+xml" title="RSS feed" href="/feed.xml">
-<link rel="alternate" type="application/atom+xml" title="Atom feed" href="/feed.atom">
-<title>{{ page_title }}</title>
-{% if page_description %}<meta name="description" content="{{ page_description }}">
-{% endif %}{% if site.noindex %}<meta name="robots" content="noindex, nofollow">
-{% endif %}{% if canonical %}<link rel="canonical" href="{{ canonical }}">
-{% endif %}<style>{% raw %}
-@import url('https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&family=Open+Sans:ital,wght@0,400;0,600;0,700;1,400&display=swap');
-:root {
-  --frame:#1B1C21; --paper:#EDE8CB; --line:rgba(40,32,16,.14); --white:#fff;
-  --ink:#2B2723; --body:#5C5245; --muted:#8A7F6C; --bronze:#A9702F; --bronze-deep:#7C4E1D;
-  --blue:#2EA3F2; --orange:#E8912E; --radius:12px; --radius-sm:6px;
-  --ff-display:"Gowun Batang", Georgia, "Times New Roman", serif;
-  --ff-ui:"Open Sans", system-ui, -apple-system, sans-serif;
-  --measure:44rem;
-}
-* { box-sizing:border-box; }
-html { -webkit-text-size-adjust:100%; }
-body { margin:0; background:var(--frame); color:var(--body); font-family:var(--ff-ui);
-  font-size:16px; line-height:1.6; -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
-  padding:28px 16px; }
-a { color:inherit; }
-img { max-width:100%; }
-.skip { position:absolute; left:-999px; top:0; }
-.skip:focus { left:1rem; top:1rem; z-index:60; background:var(--ink); color:var(--paper);
-  padding:.5rem .8rem; border-radius:var(--radius-sm); }
-/* Draft-preview banner (authenticated new-tab preview only) */
-.preview-bar { position:sticky; top:0; z-index:70; display:flex; align-items:center;
-  justify-content:center; gap:.7rem; flex-wrap:wrap; padding:.5rem 1rem; margin:-28px -16px 28px;
-  background:var(--orange); color:#fff; font-family:var(--ff-ui); font-size:.75rem;
-  letter-spacing:.06em; text-transform:uppercase; }
-.preview-bar__tag { font-weight:700; letter-spacing:.14em; border:1px solid rgba(255,255,255,.6);
-  padding:.12rem .45rem; border-radius:3px; }
-.preview-bar__msg { color:rgba(255,255,255,.92); }
-/* The parchment page floating on the dark field */
-.page { max-width:1180px; margin:0 auto; background:var(--paper); border-radius:var(--radius);
-  overflow:hidden; box-shadow:0 24px 60px -28px rgba(0,0,0,.7); }
-/* Masthead — the bronze logotype or the site title */
-.masthead { padding:34px 24px 18px; text-align:center; }
-.brand { font-family:var(--ff-display); font-weight:700; font-size:clamp(2rem,6vw,3rem);
-  line-height:1.05; color:var(--ink); text-decoration:none; display:inline-block; }
-.brand:hover { color:var(--bronze-deep); }
-.brand--logo { line-height:0; }
-.brand--logo img { max-width:min(460px,80%); width:auto; height:auto; }
-.brand__tagline { font-family:var(--ff-ui); font-size:.82rem; letter-spacing:.1em;
-  text-transform:uppercase; color:var(--muted); margin:.8rem 0 0; }
-/* Nav — white bar, serif small-caps */
-.nav { background:var(--white); border-top:1px solid var(--line); border-bottom:1px solid var(--line);
-  display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:1.4rem; padding:10px 20px; }
-.nav ul { list-style:none; margin:0; padding:0; display:flex; flex-wrap:wrap; align-items:center;
-  justify-content:center; gap:1.65rem; }
-.nav a { font-family:var(--ff-display); font-size:1rem; letter-spacing:.06em; text-transform:uppercase;
-  color:#5b5240; text-decoration:none; padding:2px 0; border-bottom:2px solid transparent;
-  transition:color .15s, border-color .15s; }
-.nav a:hover { color:var(--bronze-deep); border-bottom-color:var(--bronze); }
-.nav a[aria-current="page"] { color:var(--ink); }
-.nav__search:not(:empty) { display:inline-flex; align-items:center; }
-/* Content shell */
-main { display:block; padding:36px 75px 24px; }
-.eyebrow { font-family:var(--ff-ui); font-size:.72rem; font-weight:600; letter-spacing:.18em;
-  text-transform:uppercase; color:var(--muted); margin:0 0 1.4rem; }
-/* Front page — the galley */
-.galley { list-style:none; margin:0; padding:0; }
-.entry { padding:1.7rem 0; border-bottom:1px solid var(--line); }
-.entry:first-child { padding-top:0; }
-.entry__meta { font-family:var(--ff-ui); font-size:.72rem; font-weight:600; letter-spacing:.08em;
-  text-transform:uppercase; color:var(--muted); margin:0 0 .5rem; }
-.entry__title { margin:0 0 .4rem; }
-.entry__title a { font-family:var(--ff-display); font-weight:400; font-size:1.7rem; line-height:1.18;
-  color:var(--ink); text-decoration:none;
-  background-image:linear-gradient(var(--bronze),var(--bronze)); background-size:0% 1.5px;
-  background-position:0 100%; background-repeat:no-repeat; transition:background-size .22s ease, color .15s; }
-.entry__title a:hover { background-size:100% 1.5px; color:var(--bronze-deep); }
-.entry__excerpt { margin:.2rem 0 0; color:var(--body); max-width:var(--measure); }
-.entry__more { display:inline-block; margin-top:.7rem; color:var(--blue); text-decoration:none;
-  font-weight:600; font-size:.92rem; }
-.entry__more:hover { text-decoration:underline; }
-.empty { font-family:var(--ff-ui); color:var(--muted); padding:2rem 0; }
-/* Single post / page */
-.article__title { font-family:var(--ff-display); font-weight:400; color:var(--ink);
-  font-size:clamp(1.9rem,4vw,2.4rem); line-height:1.15; margin:0 0 .8rem; }
-.article__meta { font-family:var(--ff-ui); font-size:.74rem; font-weight:600; letter-spacing:.08em;
-  text-transform:uppercase; color:var(--muted); margin:0 0 .6rem; }
-.article__byline { display:flex; align-items:center; gap:.55rem; font-family:var(--ff-ui);
-  font-size:.8rem; color:var(--body); margin:0 0 1.4rem; }
-.byline__avatar { width:26px; height:26px; border-radius:50%; background:var(--bronze); color:#fff;
-  display:grid; place-items:center; font-weight:700; font-size:.72rem; }
-.figure { margin:0 0 1.6rem; }
-.figure img { display:block; border-radius:4px; box-shadow:0 8px 22px -12px rgba(0,0,0,.5); }
-/* Article body — the semantic HTML from ferropress-render */
-.prose { font-family:var(--ff-display); color:var(--body); font-size:1.08rem; line-height:1.75;
-  max-width:var(--measure); }
-.prose p { margin:0 0 1.15rem; }
-.prose h2 { font-family:var(--ff-display); font-weight:700; color:var(--ink); font-size:1.5rem;
-  margin:2rem 0 .6rem; }
-.prose h3 { font-family:var(--ff-display); font-weight:700; color:var(--ink); font-size:1.22rem;
-  margin:1.6rem 0 .5rem; }
-.prose a { color:var(--blue); text-decoration:none; }
-.prose a:hover { text-decoration:underline; }
-.prose strong { color:var(--ink); font-weight:700; }
-.prose em { font-style:italic; }
-.prose blockquote { margin:1.7rem 0; padding:.3rem 0 .3rem 1.4rem; border-left:3px solid var(--bronze);
-  font-style:italic; color:var(--ink); }
-.prose ul, .prose ol { margin:0 0 1.15rem; padding-left:1.4rem; }
-.prose li { margin-bottom:.4rem; }
-.prose li::marker { color:var(--bronze); }
-.prose img { max-width:100%; height:auto; border-radius:4px; }
-.prose code { font-family:ui-monospace, Menlo, Consolas, monospace; font-size:.86em;
-  background:rgba(0,0,0,.06); padding:.12em .38em; border-radius:3px; }
-.prose pre { background:var(--ink); color:#EDE8CB; padding:1.1rem 1.2rem; border-radius:var(--radius-sm);
-  overflow:auto; font-size:.86rem; line-height:1.6; margin:0 0 1.3rem; }
-.prose pre code { background:transparent; padding:0; color:inherit; }
-.prose hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
-.article--wide .prose { max-width:none; }
-.article__foot { margin-top:2.4rem; padding-top:1.4rem; border-top:1px solid var(--line); }
-#fp-comments:empty { display:none; }
-/* Colophon */
-.colophon { background:var(--paper); border-top:1px solid var(--line); padding:26px 75px 30px;
-  text-align:center; font-family:var(--ff-ui); font-size:.78rem; color:var(--muted); }
-.colophon a { color:var(--bronze-deep); text-decoration:none; }
-.colophon a:hover { text-decoration:underline; }
-@media (max-width:900px) { main { padding:28px 28px 20px; } .colophon { padding:24px 28px 28px; } }
-@media (prefers-reduced-motion:reduce) { * { transition:none !important; } }
-{% endraw %}</style>
-</head>
-<body>
-<a class="skip" href="#main">Skip to content</a>
-{% if preview_status %}<div class="preview-bar" role="status"><span class="preview-bar__tag">Preview</span><span class="preview-bar__msg">{{ preview_status }} &middot; a private draft, not the public page</span></div>
-{% endif %}<div class="page">
-  <header class="masthead">
-    {% if site.logo %}<a href="/" class="brand brand--logo"><img src="{{ site.logo }}" alt="{{ site.title }}"></a>
-    {% else %}<a href="/" class="brand">{{ site.title }}</a>
-    {% endif %}{% if site.tagline %}<p class="brand__tagline">{{ site.tagline }}</p>{% endif %}
-  </header>
-  <nav class="nav" aria-label="Primary">
-    <ul>
-      <li><a href="/" {% if is_home %}aria-current="page"{% endif %}>Front page</a></li>
-    </ul>
-    <div id="fp-search" class="nav__search"></div>
-  </nav>
-  <main id="main">
-{% block main %}{% endblock %}
-  </main>
-  <footer class="colophon">
-    &copy; {{ site.title }} &middot; <a href="/feed.xml">Feed</a> &middot; Set in Ferropress
-  </footer>
-</div>
-<script type="module">
-import init from '/_fp/islands/ferropress_islands.js';
-init({ module_or_path: '/_fp/islands/ferropress_islands_bg.wasm' });
-</script>
-</body>
-</html>
-"##;
-
-/// Fellstone single post/page: title, dateline/kicker, optional byline (posts) +
-/// featured image, the rendered body, and the comments island mount.
-pub const FELLSTONE_SINGLE_SRC: &str = r##"{% extends "base.html" %}
-{% block main %}
-    <article class="article">
-      <header class="article__head">
-        <h1 class="article__title">{{ title }}</h1>
-        {% if dateline or kicker %}<p class="article__meta">{% if dateline %}{{ dateline }}{% endif %}{% if dateline and kicker %} &middot; {% endif %}{% if kicker %}{{ kicker }}{% endif %}</p>{% endif %}
-        {% if author %}<p class="article__byline"><span class="byline__avatar" aria-hidden="true">{{ author_initials }}</span> by {{ author }}</p>{% endif %}
-      </header>
-      {% if featured_image %}<figure class="figure"><img src="{{ featured_image }}" alt="{{ title }}" loading="lazy"></figure>{% endif %}
-      <div class="prose">{{ body | safe }}</div>
-      <div class="article__foot">
-        {% if not preview_status %}<div id="fp-comments"></div>{% endif %}
-      </div>
-    </article>
-{% endblock %}
-"##;
-
-/// Fellstone front page: a galley of published posts (newest first), each a
-/// dateline/byline line + headline link + excerpt.
-pub const FELLSTONE_HOME_SRC: &str = r##"{% extends "base.html" %}
-{% block main %}
-    <p class="eyebrow">Latest posts</p>
-    {% if posts %}
-    <ol class="galley">
-      {% for post in posts %}
-      <li class="entry">
-        {% if post.dateline or post.author %}<p class="entry__meta">{% if post.dateline %}{{ post.dateline }}{% endif %}{% if post.dateline and post.author %} &middot; {% endif %}{% if post.author %}{{ post.author }}{% endif %}</p>{% endif %}
-        <h2 class="entry__title"><a href="{{ post.url }}">{{ post.title }}</a></h2>
-        {% if post.excerpt %}<p class="entry__excerpt">{{ post.excerpt }}</p>{% endif %}
-        <a class="entry__more" href="{{ post.url }}">More&hellip;</a>
-      </li>
-      {% endfor %}
-    </ol>
-    {% else %}
-    <p class="empty">No posts yet.</p>
-    {% endif %}
-{% endblock %}
-"##;
-
-/// Fellstone full-width **page** template: structurally identical to the single
-/// template and consuming the identical context, differing only in the article's
-/// `article--wide` class (the body breaks out of the reading measure).
-pub const FELLSTONE_PAGE_WIDE_SRC: &str = r##"{% extends "base.html" %}
-{% block main %}
-    <article class="article article--wide">
-      <header class="article__head">
-        <h1 class="article__title">{{ title }}</h1>
-        {% if dateline or kicker %}<p class="article__meta">{% if dateline %}{{ dateline }}{% endif %}{% if dateline and kicker %} &middot; {% endif %}{% if kicker %}{{ kicker }}{% endif %}</p>{% endif %}
-        {% if author %}<p class="article__byline"><span class="byline__avatar" aria-hidden="true">{{ author_initials }}</span> by {{ author }}</p>{% endif %}
-      </header>
-      {% if featured_image %}<figure class="figure"><img src="{{ featured_image }}" alt="{{ title }}" loading="lazy"></figure>{% endif %}
-      <div class="prose">{{ body | safe }}</div>
-      <div class="article__foot">
-        {% if not preview_status %}<div id="fp-comments"></div>{% endif %}
-      </div>
-    </article>
-{% endblock %}
-"##;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferropress_render_form::{THEME_FELLSTONE, THEME_LETTERPRESS};
-    use serde_json::json;
+    use std::sync::Arc;
 
-    /// A SingleCtx-shaped context (see `content.rs`), as JSON so the test needn't
-    /// reach the private ctx structs — MiniJinja resolves dotted access into it.
-    fn single_ctx() -> serde_json::Value {
-        json!({
-            "page_title": "The Sleeping Doll — Fellstone Tales",
-            "page_description": "A book review",
-            "canonical": null,
-            "site": {"title": "Fellstone Tales", "tagline": "", "url": "https://x", "logo": null, "noindex": false},
-            "is_home": false,
-            "preview_status": null,
-            "title": "The Sleeping Doll",
-            "dateline": "July 20, 2026",
-            "kicker": null,
-            "author": "Liam Kincaid",
-            "author_initials": "LK",
-            "featured_image": null,
-            "body": "<p>Hello <strong>world</strong>.</p>"
-        })
-    }
-
-    /// A HomeCtx-shaped context with one galley row.
-    fn home_ctx() -> serde_json::Value {
-        json!({
-            "page_title": "Fellstone Tales",
-            "page_description": null,
-            "site": {"title": "Fellstone Tales", "tagline": "", "url": "", "logo": null, "noindex": false},
-            "is_home": true,
-            "preview_status": null,
-            "posts": [{
-                "title": "The Sleeping Doll",
-                "url": "/the-sleeping-doll",
-                "excerpt": "An excerpt.",
-                "dateline": "July 20, 2026",
-                "author": "Liam Kincaid"
-            }]
-        })
+    /// Write a minimal valid on-disk theme (manifest + the four canonical templates) into
+    /// `parent/<id>/`, whose base carries `marker` so a render can be attributed to it.
+    fn write_theme(parent: &Path, id: &str, marker: &str) {
+        let dir = parent.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("theme.toml"),
+            format!("id = \"{id}\"\nname = \"{id} theme\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("base.html"),
+            format!(
+                "<!doctype html><html><head><title>{{{{ page_title }}}}</title><!--{marker}--></head>\
+                 <body>{{% block main %}}{{% endblock %}}</body></html>"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("single.html"),
+            "{% extends \"base.html\" %}{% block main %}<h1>{{ title }}</h1>{{ body | safe }}{% endblock %}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("home.html"),
+            "{% extends \"base.html\" %}{% block main %}{% for post in posts %}<a href=\"{{ post.url }}\">{{ post.title }}</a>{% endfor %}{% endblock %}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("page-wide.html"),
+            "{% extends \"base.html\" %}{% block main %}<article>{{ body | safe }}</article>{% endblock %}",
+        )
+        .unwrap();
     }
 
     #[test]
-    fn fellstone_theme_renders_single_and_home() {
-        let theme = build_theme(THEME_FELLSTONE).expect("fellstone builds");
+    fn builtin_registry_always_has_the_default_and_it_builds() {
+        let reg = ThemeRegistry::builtin();
+        // The invariant the fallback + boot depend on: DEFAULT_THEME is always seeded.
+        assert!(reg.build(DEFAULT_THEME).is_ok(), "the default theme builds");
+        let choices = reg.choices();
+        assert_eq!(
+            choices.first().map(|c| c.value.as_str()),
+            Some(DEFAULT_THEME)
+        );
+        assert_eq!(choices.len(), 1, "builtin registry offers only the default");
+    }
 
-        let single = theme
-            .render("single.html", &single_ctx())
-            .expect("single renders");
-        assert!(single.contains("Gowun Batang"), "fellstone display font");
-        assert!(single.contains("class=\"article__title\""));
-        assert!(single.contains("The Sleeping Doll"));
+    #[test]
+    fn load_dir_missing_is_builtin_only() {
+        let reg = ThemeRegistry::load_dir(Path::new("/no/such/themes/dir"));
+        assert_eq!(reg.choices().len(), 1);
+        assert_eq!(reg.choices()[0].value, DEFAULT_THEME);
+    }
+
+    #[test]
+    fn load_dir_admits_a_valid_theme_and_orders_choices() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_theme(tmp.path(), "aurora", "AURORA-MARK");
+        let reg = ThemeRegistry::load_dir(tmp.path());
+
+        // Both present; default first, then the disk theme.
+        let choices = reg.choices();
+        assert_eq!(choices[0].value, DEFAULT_THEME);
         assert!(
-            single.contains("<strong>world</strong>"),
-            "pre-rendered body is emitted verbatim via | safe"
+            choices
+                .iter()
+                .any(|c| c.value == "aurora" && c.label == "aurora theme")
         );
 
-        let home = theme
-            .render("home.html", &home_ctx())
-            .expect("home renders");
-        assert!(home.contains("class=\"entry__title\""));
-        // The permalink appears in the galley link. (The leading `/` is HTML-escaped
-        // to `&#x2f;` by MiniJinja's `.html` autoescape — as in the letterpress theme
-        // — so match the slug substring, which is escaping-agnostic.)
-        assert!(home.contains("the-sleeping-doll"));
+        // The disk theme builds + renders with its own marker.
+        let engine = reg.build("aurora").expect("aurora builds");
+        let home = engine
+            .render("home.html", &sample_context(true, serde_json::json!([])))
+            .expect("aurora home renders");
+        assert!(
+            home.contains("AURORA-MARK"),
+            "the aurora base framed it: {home}"
+        );
     }
 
     #[test]
-    fn unknown_theme_falls_back_to_the_default() {
-        // A bogus / stale `appearance.theme` must never fail a build — it resolves to
-        // the default (letterpress), whose galley chrome differs from fellstone's.
-        let fallback = build_theme("does-not-exist").expect("fallback builds");
-        let letterpress = build_theme(THEME_LETTERPRESS).expect("letterpress builds");
-        let fb = fallback.render("home.html", &home_ctx()).unwrap();
-        let lp = letterpress.render("home.html", &home_ctx()).unwrap();
-        assert_eq!(fb, lp, "unknown id renders exactly the default theme");
-        // …and the default is NOT fellstone (no Gowun Batang display face).
-        assert!(!fb.contains("Gowun Batang"));
+    fn a_broken_theme_is_skipped_not_admitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Valid manifest + all four files, but base.html has a MiniJinja syntax error.
+        let dir = tmp.path().join("broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("theme.toml"), "id = \"broken\"\n").unwrap();
+        std::fs::write(
+            dir.join("base.html"),
+            "<html>{% block main %}{% endblock %}",
+        )
+        .unwrap();
+        // Unterminated tag -> add_template (compile) fails.
+        std::fs::write(
+            dir.join("single.html"),
+            "{% extends \"base.html\" %}{% block main %}{% if %}oops{% endblock %}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("home.html"),
+            "{% extends \"base.html\" %}{% block main %}{% endblock %}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("page-wide.html"),
+            "{% extends \"base.html\" %}{% block main %}{% endblock %}",
+        )
+        .unwrap();
+
+        let reg = ThemeRegistry::load_dir(tmp.path());
+        assert!(
+            !reg.choices().iter().any(|c| c.value == "broken"),
+            "a theme that fails to compile must NOT be registered",
+        );
+    }
+
+    #[test]
+    fn a_disk_theme_cannot_shadow_the_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_theme(tmp.path(), DEFAULT_THEME, "IMPOSTER"); // claims "letterpress"
+        let reg = ThemeRegistry::load_dir(tmp.path());
+        // Still exactly the built-in, and it is the REAL built-in (no imposter marker).
+        assert_eq!(reg.choices().len(), 1);
+        let home = reg
+            .build(DEFAULT_THEME)
+            .unwrap()
+            .render("home.html", &sample_context(true, serde_json::json!([])))
+            .unwrap();
+        assert!(!home.contains("IMPOSTER"), "the built-in is un-shadowable");
+    }
+
+    #[test]
+    fn unknown_id_builds_the_default() {
+        let reg = ThemeRegistry::builtin();
+        let unknown = reg.build("does-not-exist").unwrap();
+        let default = reg.build(DEFAULT_THEME).unwrap();
+        assert_eq!(
+            unknown
+                .render("home.html", &sample_context(true, serde_json::json!([])))
+                .unwrap(),
+            default
+                .render("home.html", &sample_context(true, serde_json::json!([])))
+                .unwrap(),
+            "an unknown id renders exactly the default theme",
+        );
+    }
+
+    #[test]
+    fn swap_to_rebuilds_only_on_a_real_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_theme(tmp.path(), "aurora", "AURORA-MARK");
+        let handle = ThemeHandle::new(ThemeRegistry::load_dir(tmp.path()), DEFAULT_THEME)
+            .expect("handle builds");
+
+        // Unchanged id: no rebuild (the engine Arc is pointer-identical).
+        let before = handle.current();
+        handle.swap_to(DEFAULT_THEME);
+        assert!(Arc::ptr_eq(&before, &handle.current()));
+        assert_eq!(handle.current_id(), DEFAULT_THEME);
+
+        // Real change: swaps to the disk theme.
+        handle.swap_to("aurora");
+        assert_eq!(handle.current_id(), "aurora");
+        let home = handle
+            .current()
+            .render("home.html", &sample_context(true, serde_json::json!([])))
+            .unwrap();
+        assert!(home.contains("AURORA-MARK"));
+
+        // Build "error" path is exercised by an unknown id: build() resolves it to the default
+        // engine, and the REQUESTED id is stored verbatim (self-healing).
+        handle.swap_to("ghost");
+        assert_eq!(handle.current_id(), "ghost");
+        let home = handle
+            .current()
+            .render("home.html", &sample_context(true, serde_json::json!([])))
+            .unwrap();
+        assert!(
+            !home.contains("AURORA-MARK"),
+            "unknown id renders the default, not aurora"
+        );
+    }
+
+    #[test]
+    fn choices_appends_an_unavailable_current_theme() {
+        // Active theme id that the registry does not know (its folder was removed).
+        let handle = ThemeHandle::new(ThemeRegistry::builtin(), "vanished").expect("handle builds");
+        let choices = handle.choices();
+        let current = choices.iter().find(|c| c.value == "vanished");
+        assert!(
+            current.is_some(),
+            "the current id is always offered so a PUT can't be rejected"
+        );
+        assert!(current.unwrap().label.contains("unavailable"));
     }
 }

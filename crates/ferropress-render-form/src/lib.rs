@@ -28,7 +28,7 @@ pub use refs::{EntityOption, MediaRef, SettingRefs};
 pub use schema::{
     Choice, Condition, Field, FieldError, FormSchema, FormSection, TextFormat, WidgetKind,
 };
-pub use settings::{DEFAULT_THEME, THEME_FELLSTONE, THEME_LETTERPRESS, schema_for_settings};
+pub use settings::{DEFAULT_THEME, THEME_LETTERPRESS, schema_for_settings};
 pub use site_settings::SiteSettings;
 
 #[cfg(test)]
@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn settings_schema_round_trips_through_json() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let wire = serde_json::to_string(&schema).expect("serialize");
         let back: FormSchema = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(schema, back, "FormSchema must survive a JSON round-trip");
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn defaults_cover_every_key() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let defaults = schema.defaults();
         for f in schema.fields() {
             assert!(
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn coerce_accepts_valid_values() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let mut raw = serde_json::Map::new();
         raw.insert("site.title".into(), json!("Ferropress"));
         raw.insert("site.admin_email".into(), json!("jane@example.com"));
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn coerce_rejects_unsafe_url() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let mut raw = serde_json::Map::new();
         raw.insert("site.url".into(), json!("javascript:alert(1)"));
         let errs = schema.coerce_values(&raw).expect_err("must reject");
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn coerce_rejects_bad_email_and_type_mismatch() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let mut raw = serde_json::Map::new();
         raw.insert("site.admin_email".into(), json!("not-an-email"));
         // a bool where a number is expected
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn coerce_clamps_number_into_range_and_stores_integer() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let mut raw = serde_json::Map::new();
         raw.insert("reading.posts_per_page".into(), json!(9999));
         let clean = schema.coerce_values(&raw).unwrap();
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn coerce_rejects_out_of_vocabulary_choice() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let mut raw = serde_json::Map::new();
         raw.insert("site.timezone".into(), json!("Mars/Olympus_Mons"));
         let errs = schema.coerce_values(&raw).expect_err("must reject");
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn coerce_ignores_unknown_keys() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let mut raw = serde_json::Map::new();
         raw.insert("site.title".into(), json!("ok"));
         raw.insert("evil.rce".into(), json!("rm -rf /"));
@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn coerce_accepts_empty_url_and_email() {
         // empty is "unset", not invalid.
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let mut raw = serde_json::Map::new();
         raw.insert("site.url".into(), json!(""));
         raw.insert("site.admin_email".into(), json!(""));
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn visible_when_is_carried_on_the_custom_format_field() {
-        let schema = schema_for_settings();
+        let schema = schema_for_settings(&[]);
         let f = schema
             .field("site.date_format_custom")
             .expect("field exists");

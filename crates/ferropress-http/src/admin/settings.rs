@@ -52,7 +52,9 @@ pub async fn get(
     who: AuthedUser,
 ) -> Result<Json<SettingsDto>, AdminError> {
     who.require(Capability::ManageSettings)?;
-    let schema = schema_for_settings();
+    // The Appearance picker's options are the runtime-loaded themes (plus the current id, so a
+    // removed active theme still round-trips) — supplied by the live theme handle.
+    let schema = schema_for_settings(&state.theme.choices());
     let values = read_values(&state).await?;
     Ok(Json(build_settings_dto(&state, schema, values).await?))
 }
@@ -67,7 +69,9 @@ pub async fn put(
     // Authorize BEFORE touching or validating anything.
     who.require(Capability::ManageSettings)?;
 
-    let schema = schema_for_settings();
+    // Build the schema with the live theme choices so a valid loaded-theme id (and the
+    // current-but-unlisted value, offered as "(unavailable)") passes Select coercion.
+    let schema = schema_for_settings(&state.theme.choices());
     // Validate + normalize against the schema. Unknown keys dropped; a type
     // mismatch / unsafe URL / out-of-vocabulary choice is a 400 (never persisted).
     let clean = schema.coerce_values(&body.values).map_err(|errs| {

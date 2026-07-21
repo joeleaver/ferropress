@@ -138,6 +138,14 @@ pub struct ServerConfig {
     #[arg(long, env = "FERROPRESS_PLUGINS_DIR", default_value = "./plugins/dist")]
     pub plugins_dir: PathBuf,
 
+    /// Directory of installed public themes — one subdirectory per theme, each with a
+    /// `theme.toml` manifest (`id` + optional `name`) and the four canonical templates
+    /// `base.html` / `single.html` / `home.html` / `page-wide.html`. Discovered at boot on
+    /// top of the always-present built-in default theme; a missing directory just means only
+    /// the built-in theme is available. (Themes are plain files — no build step.)
+    #[arg(long, env = "FERROPRESS_THEMES_DIR", default_value = "./themes")]
+    pub themes_dir: PathBuf,
+
     /// Directory holding the built wasm admin bundle (the `dist/` output of
     /// `cargo xtask build-admin`). Served at `/_fp/admin`; the SPA shell is at
     /// `/admin`. The admin API is enabled only when a signing secret is set (see
