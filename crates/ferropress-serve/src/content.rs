@@ -29,6 +29,7 @@
 //! and only block dispatch lives in `ferropress-render` (the one-shared-renderer
 //! invariant). Here we only orchestrate store lookup -> `render` -> theme.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use ferropress_core::error::CoreError;
@@ -47,7 +48,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::authors::AuthorDirectory;
 use crate::cache_key;
+use crate::content_index::ContentIndex;
 use crate::datefmt;
+use crate::menus::{MenuItemCtx, MenuSet};
 use crate::templates::{HOME_TEMPLATE, template_name_for};
 
 /// Build a [`ThemeEngine`] for the **default** theme (the built-in letterpress "Composing
@@ -208,22 +211,37 @@ pub fn slug_from_path(path: &str) -> &str {
 /// published `Post` then `Page` behind its slug, builds the [`CachedPage`]
 /// envelope, and composes chrome around it. The cache-first hot path is
 /// [`serve_path`]; this is the uncached form used by tests + `resolve` callers.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_path(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
-        return front_page(store, theme, custom, settings, authors).await;
+        return front_page(store, theme, custom, settings, authors, menus, index).await;
     }
     match build_page(store, custom, path).await {
-        Ok(Some(page)) => match compose_single(theme, settings, authors, &page, false, None) {
-            Ok(html) => Resolved::Found(html),
-            Err(e) => Resolved::Error(e),
-        },
+        Ok(Some(page)) => {
+            match compose_single(
+                theme,
+                settings,
+                authors,
+                menus,
+                index,
+                &page,
+                false,
+                None,
+                Some(path),
+            ) {
+                Ok(html) => Resolved::Found(html),
+                Err(e) => Resolved::Error(e),
+            }
+        }
         Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
     }
@@ -245,6 +263,7 @@ pub async fn resolve_path(
 /// request — it degrades to render-on-demand, never a 500. The change-driven regen
 /// loop ([`ServeEngine::regen_loop`](crate::ServeEngine::regen_loop)) keeps
 /// populated envelopes fresh.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_path(
     store: &Arc<dyn RhypeStore>,
     blobs: &Arc<dyn BlobStore>,
@@ -252,6 +271,8 @@ pub async fn serve_path(
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
@@ -259,7 +280,7 @@ pub async fn serve_path(
         // live from the current settings + author directory. `serve_front` is cache-first
         // (build + write-through on a miss); the change-driven regen loop EVICTS `/` when a
         // content/settings change can reshape it, and this read path is the sole populator.
-        return serve_front(store, blobs, theme, custom, settings, authors).await;
+        return serve_front(store, blobs, theme, custom, settings, authors, menus, index).await;
     }
 
     let key = cache_key(path);
@@ -270,7 +291,17 @@ pub async fn serve_path(
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedPage>(&bytes) {
             Ok(page) => {
-                return match compose_single(theme, settings, authors, &page, false, None) {
+                return match compose_single(
+                    theme,
+                    settings,
+                    authors,
+                    menus,
+                    index,
+                    &page,
+                    false,
+                    None,
+                    Some(path),
+                ) {
                     Ok(html) => Resolved::Found(html),
                     Err(e) => Resolved::Error(e),
                 };
@@ -309,7 +340,17 @@ pub async fn serve_path(
                     tracing::warn!(%path, error = %e, "could not serialize page envelope for the cache; serving uncached render");
                 }
             }
-            match compose_single(theme, settings, authors, &page, false, None) {
+            match compose_single(
+                theme,
+                settings,
+                authors,
+                menus,
+                index,
+                &page,
+                false,
+                None,
+                Some(path),
+            ) {
                 Ok(html) => Resolved::Found(html),
                 Err(e) => Resolved::Error(e),
             }
@@ -336,6 +377,7 @@ pub async fn serve_path(
 /// concurrent evict can re-cache pre-change content — the same best-effort read-vs-invalidate
 /// class the permalink path ([`serve_path`]) already carries; it self-clears on the next
 /// reshaping change (and a post/page/setting change is a broad trigger set).
+#[allow(clippy::too_many_arguments)]
 async fn serve_front(
     store: &Arc<dyn RhypeStore>,
     blobs: &Arc<dyn BlobStore>,
@@ -343,13 +385,15 @@ async fn serve_front(
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
 ) -> Resolved {
     let key = cache_key("/");
 
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedFront>(&bytes) {
             Ok(front) => {
-                return match compose_front(theme, settings, authors, &front) {
+                return match compose_front(theme, settings, authors, menus, index, &front) {
                     Ok(html) => Resolved::Found(html),
                     Err(e) => Resolved::Error(e),
                 };
@@ -381,7 +425,7 @@ async fn serve_front(
                     tracing::warn!(error = %e, "could not serialize the home envelope for the cache; serving uncached render");
                 }
             }
-            match compose_front(theme, settings, authors, &front) {
+            match compose_front(theme, settings, authors, menus, index, &front) {
                 Ok(html) => Resolved::Found(html),
                 Err(e) => Resolved::Error(e),
             }
@@ -427,18 +471,33 @@ pub(crate) async fn build_page(
 ///
 /// `mode` is [`RenderMode::Preview`]; `type_name` is the object's store type
 /// ([`POST_TYPE`]/[`PAGE_TYPE`]). The banner carries the object's status label.
+#[allow(clippy::too_many_arguments)]
 pub async fn render_preview(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
     type_name: &'static str,
     obj: &Object,
 ) -> Resolved {
     let label = status_label(obj);
     match cached_page_from_object(store, custom, RenderMode::Preview, type_name, obj).await {
-        Ok(page) => match compose_single(theme, settings, authors, &page, false, Some(&label)) {
+        // A preview shows the real theme's nav (composed from the live menus + index), but no
+        // item is ever "current": a draft has no public URL, so `current_path` is `None`.
+        Ok(page) => match compose_single(
+            theme,
+            settings,
+            authors,
+            menus,
+            index,
+            &page,
+            false,
+            Some(&label),
+            None,
+        ) {
             Ok(html) => Resolved::Found(html),
             Err(e) => Resolved::Error(e),
         },
@@ -537,13 +596,17 @@ pub(crate) async fn cached_page_from_object(
 /// preview banner (the template reads `preview_status`) and forces `noindex`
 /// regardless of the site's search-engine-visibility setting — a private,
 /// unpublished view must never be indexable.
+#[allow(clippy::too_many_arguments)]
 fn compose_single(
     theme: &ThemeEngine,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
     page: &CachedPage,
     is_home: bool,
     preview_status: Option<&str>,
+    current_path: Option<&str>,
 ) -> Result<String, CoreError> {
     let dateline = page
         .published_at
@@ -573,6 +636,7 @@ fn compose_single(
         site,
         is_home,
         preview_status,
+        nav: menus.compose(index, current_path),
         title: &page.title,
         dateline,
         kicker: None,
@@ -595,15 +659,18 @@ fn compose_single(
 /// tests): [`build_front`] the envelope, then [`compose_front`] it live. The cache-first
 /// hot path is [`serve_front`]; both share `build_front`/`compose_front`, so the cached and
 /// uncached front pages are byte-for-byte identical.
+#[allow(clippy::too_many_arguments)]
 async fn front_page(
     store: &Arc<dyn RhypeStore>,
     theme: &ThemeEngine,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
 ) -> Resolved {
     match build_front(store, custom, settings).await {
-        Ok(front) => match compose_front(theme, settings, authors, &front) {
+        Ok(front) => match compose_front(theme, settings, authors, menus, index, &front) {
             Ok(html) => Resolved::Found(html),
             Err(e) => Resolved::Error(e),
         },
@@ -658,10 +725,24 @@ fn compose_front(
     theme: &ThemeEngine,
     settings: &SiteSettings,
     authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
     front: &CachedFront,
 ) -> Result<String, CoreError> {
+    // The front page's own path is the site root, so nav items pointing at `/` are current.
+    let current_path = Some("/");
     match front {
-        CachedFront::Static(page) => compose_single(theme, settings, authors, page, true, None),
+        CachedFront::Static(page) => compose_single(
+            theme,
+            settings,
+            authors,
+            menus,
+            index,
+            page,
+            true,
+            None,
+            current_path,
+        ),
         CachedFront::Galley(rows) => {
             let posts: Vec<PostSummary> = rows
                 .iter()
@@ -689,6 +770,7 @@ fn compose_front(
                 site: SiteCtx::from(settings),
                 is_home: true,
                 preview_status: None,
+                nav: menus.compose(index, current_path),
                 posts,
             };
 
@@ -973,6 +1055,11 @@ struct SingleCtx<'a> {
     /// `Some(status label)` on the authenticated draft preview → the chrome shows the
     /// preview banner and the comments island is suppressed; `None` on public renders.
     preview_status: Option<&'a str>,
+    /// The composed nav menus, keyed by theme location (`"primary"`, `"footer"`, …). A
+    /// sibling field, NOT folded into [`SiteCtx`] (which stays a pure `SiteSettings`
+    /// projection). The theme loops the location(s) it declares, falling back to its default
+    /// chrome for any location absent from this map. See [`MenuSet::compose`].
+    nav: BTreeMap<String, Vec<MenuItemCtx>>,
     title: &'a str,
     dateline: Option<String>,
     kicker: Option<&'a str>,
@@ -992,6 +1079,10 @@ struct HomeCtx<'a> {
     /// Always `None` — the front page is never previewed; declared so the shared base
     /// chrome's `preview_status` reference resolves without relying on lenient-undefined.
     preview_status: Option<&'a str>,
+    /// The composed nav menus, keyed by theme location — the front-page twin of
+    /// [`SingleCtx::nav`], so the shared base chrome's `menus.*` loops resolve identically on
+    /// the galley and a single page.
+    nav: BTreeMap<String, Vec<MenuItemCtx>>,
     posts: Vec<PostSummary>,
 }
 

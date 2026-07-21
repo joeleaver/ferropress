@@ -64,3 +64,108 @@ pub struct MenuLocation {
     pub location: String,
     pub menu: Option<ObjectId>, // -> Menu
 }
+
+/// Validate a menu-item `Custom` link URL against a scheme allow-list, returning it
+/// trimmed on success or `None` when it must be rejected. THE single source for the
+/// two-layer XSS guard's URL half: the admin write path enforces it before storing a
+/// `Custom` target ([`sanitize_href`] there maps `None` to a 400), and the serve
+/// compose path re-checks it defensively before emitting an `href` (a stored value is
+/// never trusted blindly). Because both sides call THIS function, the write-time and
+/// render-time verdicts can never drift.
+///
+/// Permits a site-relative path (`/…`), a bare `#fragment` / `?query`, a scheme-less
+/// relative reference, and the `http` / `https` / `mailto` / `tel` schemes. Rejects a
+/// protocol-relative `//host` (and backslash variants some browsers treat alike), any
+/// control/whitespace char (which can smuggle a scheme past the check yet still be
+/// honored by a browser once stripped — `java\tscript:`), and every other scheme
+/// (`javascript:`, `data:`, `vbscript:`, `file:`, `blob:`, …).
+pub fn sanitize_href(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return None;
+    }
+    // No raw control/whitespace: an embedded tab/newline can smuggle a scheme past the
+    // check below yet still be honored by a browser once stripped.
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    // Protocol-relative `//host` (and backslash variants) inherit the page scheme — reject.
+    if url.starts_with("//") || url.starts_with("/\\") || url.starts_with('\\') {
+        return None;
+    }
+    match url_scheme(url) {
+        // No scheme → a relative / site-relative / fragment reference: safe.
+        None => Some(url.to_owned()),
+        Some(scheme) => match scheme.as_str() {
+            "http" | "https" | "mailto" | "tel" => Some(url.to_owned()),
+            _ => None,
+        },
+    }
+}
+
+/// The URL scheme (lowercased) iff `url` begins with a valid RFC-3986 scheme
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`), else `None` (a relative ref).
+fn url_scheme(url: &str) -> Option<String> {
+    let bytes = url.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' {
+            return Some(url[..i].to_ascii_lowercase());
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.') {
+            return None; // a non-scheme char before any ':' → no scheme
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_href;
+
+    #[test]
+    fn allows_safe_targets() {
+        for ok in [
+            "/about",
+            "/",
+            "#top",
+            "?q=1",
+            "about/team",
+            "http://example.com",
+            "https://example.com/x?y=1#z",
+            "HTTPS://EXAMPLE.COM",
+            "mailto:a@b.com",
+            "tel:+15551234",
+            "  /trimmed  ",
+        ] {
+            assert!(sanitize_href(ok).is_some(), "expected {ok:?} to be allowed");
+        }
+        // The returned value is trimmed.
+        assert_eq!(sanitize_href("  /x  ").as_deref(), Some("/x"));
+    }
+
+    #[test]
+    fn rejects_dangerous_targets() {
+        for bad in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "java\tscript:alert(1)",
+            "data:text/html,<script>",
+            "vbscript:msgbox",
+            "file:///etc/passwd",
+            "blob:https://x",
+            "//evil.example.com",
+            "/\\evil.example.com",
+            "\\\\evil",
+            "  ",
+            "",
+        ] {
+            assert!(
+                sanitize_href(bad).is_none(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+}

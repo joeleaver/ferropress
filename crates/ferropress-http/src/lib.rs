@@ -31,7 +31,10 @@ use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
 use ferropress_render_form::{NoPlugins, PluginCatalog};
-use ferropress_serve::{AuthorsHandle, RedirectHandle, Resolved, SettingsHandle, ThemeHandle};
+use ferropress_serve::{
+    AuthorsHandle, ContentIndexHandle, MenuHandle, RedirectHandle, Resolved, SettingsHandle,
+    ThemeHandle,
+};
 
 pub mod admin;
 pub mod feed;
@@ -78,6 +81,18 @@ pub struct AppState {
     /// rename's 301 is honored without page regeneration. Defaults to an empty table (no path
     /// redirects) until the composition root seeds it via [`with_redirects`](Self::with_redirects).
     pub redirects: RedirectHandle,
+    /// The live nav-menu set the public read path frames every page's navigation from. The
+    /// SAME handle is given to the `ServeEngine` regen loop, which full-reloads it on a
+    /// `Menu`/`MenuItem`/`MenuLocation` change — so a menu edit re-frames the nav with no page
+    /// regeneration (menus are live chrome). Defaults to an empty set (every location falls
+    /// back to its theme default) until seeded via [`with_menus`](Self::with_menus).
+    pub menus: MenuHandle,
+    /// The live content index the read path resolves nav targets (Post/Page id → href+title)
+    /// from. The SAME handle is given to the `ServeEngine` regen loop, which keeps it current
+    /// on a `Post`/`Page` change — so a page rename/publish is reflected in every menu
+    /// targeting it with no menu edit. Defaults to an empty index (targets resolve to nothing)
+    /// until seeded via [`with_content_index`](Self::with_content_index).
+    pub content_index: ContentIndexHandle,
     /// Directory holding the built wasm island bundle (the `wasm-bindgen` output
     /// of `ferropress-islands`). When set, it is served at `/_fp/islands`; `None`
     /// (e.g. in tests) simply omits that route.
@@ -125,6 +140,8 @@ impl AppState {
             settings: SettingsHandle::default(),
             authors: AuthorsHandle::default(),
             redirects: RedirectHandle::default(),
+            menus: MenuHandle::default(),
+            content_index: ContentIndexHandle::default(),
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
             hooks: Arc::new(NoHooks),
@@ -159,6 +176,24 @@ impl AppState {
     /// is immediately visible here.
     pub fn with_redirects(mut self, redirects: RedirectHandle) -> Self {
         self.redirects = redirects;
+        self
+    }
+
+    /// Share the live [`MenuHandle`] the public read path frames navigation from. The
+    /// composition root creates ONE handle (seeded from the store) and gives the same handle to
+    /// both this state and the `ServeEngine` regen loop, so a menu edit reloaded by the loop is
+    /// immediately visible here.
+    pub fn with_menus(mut self, menus: MenuHandle) -> Self {
+        self.menus = menus;
+        self
+    }
+
+    /// Share the live [`ContentIndexHandle`] the public read path resolves nav targets from.
+    /// The composition root creates ONE handle (seeded from the store) and gives the same handle
+    /// to both this state and the `ServeEngine` regen loop, so a page rename/publish reflected by
+    /// the loop is immediately visible here.
+    pub fn with_content_index(mut self, content_index: ContentIndexHandle) -> Self {
+        self.content_index = content_index;
         self
     }
 
@@ -332,6 +367,8 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
         state.custom.as_ref(),
         &state.settings.current(),
         &state.authors.current(),
+        &state.menus.current(),
+        &state.content_index.current(),
         &path,
     )
     .await

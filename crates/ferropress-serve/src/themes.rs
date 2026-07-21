@@ -35,8 +35,9 @@ use crate::templates::{
     SINGLE_SRC, SINGLE_TEMPLATE,
 };
 
-/// A theme's human label + its four template sources. A theme is fully described by these
-/// (the template NAMES + the render-context contract are shared across all themes).
+/// A theme's human label + its four template sources + the nav locations it declares. A
+/// theme is fully described by these (the template NAMES + the render-context contract are
+/// shared across all themes).
 #[derive(Clone)]
 struct ThemeSources {
     /// Human label shown in the Appearance picker.
@@ -45,6 +46,19 @@ struct ThemeSources {
     single: String,
     home: String,
     page_wide: String,
+    /// The nav locations this theme renders, `(key, human label)` in stable key order — the
+    /// admin's *assign a menu to a location* surface reads these. A theme that declares none
+    /// gets the default single `primary` location (every theme has a masthead). Purely an
+    /// admin-facing catalogue: the render path reads `nav.<key>` straight from the ctx, so an
+    /// undeclared-but-assigned location still renders (and a declared-but-unassigned one falls
+    /// back), the same permissive contract WordPress uses.
+    locations: Vec<(String, String)>,
+}
+
+/// The default nav location every theme has when its manifest declares no `[menus]` — a
+/// single primary (masthead) menu.
+fn default_locations() -> Vec<(String, String)> {
+    vec![("primary".to_owned(), "Primary Navigation".to_owned())]
 }
 
 /// A disk theme's `theme.toml` manifest (mirrors the plugin host's `plugin.toml`).
@@ -56,6 +70,9 @@ struct ThemeManifest {
     id: String,
     /// Human label; defaults to the id when absent/blank.
     name: Option<String>,
+    /// The nav locations the theme renders, as a `[menus]` table of `key = "Human Label"`.
+    /// Absent/empty → the default single `primary` location.
+    menus: Option<BTreeMap<String, String>>,
 }
 
 /// The built-in theme's sources — the "Composing Room" letterpress (the [`crate::templates`]
@@ -68,6 +85,11 @@ fn builtin_sources() -> ThemeSources {
         single: SINGLE_SRC.to_owned(),
         home: HOME_SRC.to_owned(),
         page_wide: PAGE_WIDE_SRC.to_owned(),
+        // The built-in renders a masthead (`primary`) + a colophon footer (`footer`).
+        locations: vec![
+            ("primary".to_owned(), "Primary Navigation".to_owned()),
+            ("footer".to_owned(), "Footer Navigation".to_owned()),
+        ],
     }
 }
 
@@ -149,12 +171,26 @@ impl ThemeRegistry {
     /// In practice infallible (only compilable themes are registered), but returns `Result`
     /// because template registration is fallible in principle.
     pub fn build(&self, id: &str) -> Result<ThemeEngine, ThemeError> {
-        let sources = self.themes.get(id).unwrap_or_else(|| {
+        register_engine(self.resolve(id))
+    }
+
+    /// The nav locations the theme `id` declares (`(key, label)`), for the admin's assign UI.
+    /// Resolves the id the SAME way [`build`](Self::build) does (an unknown/stale id falls back
+    /// to the default), so the locations offered always match the theme actually rendered.
+    pub fn locations(&self, id: &str) -> Vec<(String, String)> {
+        self.resolve(id).locations.clone()
+    }
+
+    /// The sources for `id`, falling back to the always-seeded built-in default for an
+    /// unknown/stale id (so a misspelled/removed `appearance.theme` degrades to the default
+    /// rather than erroring). The single fallback rule shared by [`build`](Self::build) and
+    /// [`locations`](Self::locations).
+    fn resolve(&self, id: &str) -> &ThemeSources {
+        self.themes.get(id).unwrap_or_else(|| {
             self.themes
                 .get(DEFAULT_THEME)
                 .expect("the built-in default theme is always seeded")
-        });
-        register_engine(sources)
+        })
     }
 
     /// The selectable themes as picker choices — the built-in default first, then the rest in
@@ -217,12 +253,20 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
         let path = dir.join(file);
         std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))
     };
+    // A `[menus]` table declares this theme's nav locations (key → human label); absent/empty
+    // falls back to the default single `primary`. Sorted by key for the stable order the admin
+    // assign UI lists them in.
+    let locations = match manifest.menus {
+        Some(map) if !map.is_empty() => map.into_iter().collect(),
+        _ => default_locations(),
+    };
     let sources = ThemeSources {
         label,
         base: read("base.html")?,
         single: read("single.html")?,
         home: read("home.html")?,
         page_wide: read("page-wide.html")?,
+        locations,
     };
 
     // registered ⇒ renderable: compile all four templates AND smoke-render each in EVERY
@@ -260,6 +304,23 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
 /// renders cleanly (MiniJinja is lenient on undefined, so the check flags structural errors — bad
 /// `extends`/`include`/block/syntax — not missing optional data).
 fn sample_context(is_home: bool, posts: serde_json::Value) -> serde_json::Value {
+    // A representative nav map covering every shape the theme's `nav.*` loops must render: a
+    // current top-level link, an external new-tab link, and an unresolvable PARENT (href:null)
+    // that survives as a label-only entry keeping a resolvable child — plus a footer location.
+    // So a theme whose masthead/footer loops are structurally broken (bad macro/extends/include)
+    // is caught at load, not on a live page (the `registered ⇒ renderable` invariant now covers nav).
+    let menus = serde_json::json!({
+        "primary": [
+            {"label": "Home", "href": "/", "new_tab": false, "aria_current": is_home, "children": []},
+            {"label": "Guides", "href": null, "new_tab": false, "aria_current": false, "children": [
+                {"label": "Getting Started", "href": "/guides/start", "new_tab": false, "aria_current": false, "children": []}
+            ]},
+            {"label": "External", "href": "https://example.com", "new_tab": true, "aria_current": false, "children": []}
+        ],
+        "footer": [
+            {"label": "Colophon", "href": "/colophon", "new_tab": false, "aria_current": false, "children": []}
+        ]
+    });
     serde_json::json!({
         "page_title": "Sample",
         "page_description": "A sample page.",
@@ -267,6 +328,7 @@ fn sample_context(is_home: bool, posts: serde_json::Value) -> serde_json::Value 
         "site": {"title": "Sample Site", "tagline": "A tagline", "url": "https://example.com", "logo": null, "noindex": false},
         "is_home": is_home,
         "preview_status": null,
+        "nav": menus,
         "title": "Sample Post",
         "dateline": "January 1, 2026",
         "kicker": "Notes",
@@ -289,6 +351,10 @@ struct ThemeState {
     /// re-detected as a change (self-healing). Do NOT read it as "the theme currently on screen".
     id: String,
     engine: Arc<ThemeEngine>,
+    /// The nav locations the CURRENTLY RENDERED theme declares (resolved via
+    /// [`ThemeRegistry::locations`], so a fallback to the default carries the default's
+    /// locations). Kept beside the engine so the admin assign UI + a theme swap stay in lockstep.
+    locations: Vec<(String, String)>,
 }
 
 /// A cheaply-cloneable handle to the current live public theme, bundling the boot-immutable
@@ -324,11 +390,13 @@ impl ThemeHandle {
                 registry.build(DEFAULT_THEME)?
             }
         };
+        let locations = registry.locations(id);
         Ok(Self {
             registry: Arc::new(registry),
             state: Arc::new(RwLock::new(ThemeState {
                 id: id.to_owned(),
                 engine: Arc::new(engine),
+                locations,
             })),
         })
     }
@@ -385,12 +453,21 @@ impl ThemeHandle {
         choices
     }
 
-    /// Replace the current theme (id + engine) under one short write lock. Private: the only
-    /// caller is [`swap_to`](Self::swap_to), which enforces the lock + single-writer discipline.
+    /// The nav locations the currently-rendered theme declares (`(key, human label)`), for
+    /// the admin's *assign a menu to a location* surface. Read under a short read lock.
+    pub fn locations(&self) -> Vec<(String, String)> {
+        self.state.read().locations.clone()
+    }
+
+    /// Replace the current theme (id + engine + declared locations) under one short write lock.
+    /// Private: the only caller is [`swap_to`](Self::swap_to), which enforces the lock +
+    /// single-writer discipline.
     fn set(&self, id: &str, engine: ThemeEngine) {
+        let locations = self.registry.locations(id);
         let mut state = self.state.write();
         state.id = id.to_owned();
         state.engine = Arc::new(engine);
+        state.locations = locations;
     }
 }
 

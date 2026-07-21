@@ -34,7 +34,7 @@ pub use comment::Comment;
 pub use media::{
     MEDIA_ID_ATTR, MEDIA_URL_PREFIX, Media, is_media_token, media_token_from_url, media_url,
 };
-pub use menu::{LinkTarget, Menu, MenuItem, MenuLocation};
+pub use menu::{LinkTarget, Menu, MenuItem, MenuLocation, sanitize_href};
 pub use page::Page;
 pub use post::Post;
 pub use redirect::Redirect;

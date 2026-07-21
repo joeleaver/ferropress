@@ -116,6 +116,23 @@ a { color: inherit; }
   padding: .15rem 0; border-bottom: 1.5px solid transparent; transition: color .14s, border-color .14s; }
 .mastnav a:hover { color: var(--ink); border-bottom-color: var(--minium); }
 .mastnav a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--ink); }
+/* Nav menus (masthead primary + footer) — a flat bar of links with hover/focus submenus. */
+.mastnav .navtree { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap;
+  align-items: center; justify-content: center; gap: 1.2rem; }
+.mastnav .navtree li { position: relative; }
+.navtree__label { font-family: var(--ff-ui); font-size: .78rem; font-weight: 600;
+  letter-spacing: .09em; text-transform: uppercase; color: var(--steel-2); padding: .15rem 0; }
+.mastnav .navtree .navtree { position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+  flex-direction: column; align-items: flex-start; gap: .6rem; min-width: 11rem; margin-top: .55rem;
+  padding: .75rem .95rem; background: var(--paper-raise); border: 1px solid var(--rule);
+  border-radius: var(--radius); box-shadow: var(--shadow); display: none; z-index: 50; }
+.mastnav .navtree li:hover > .navtree, .mastnav .navtree li:focus-within > .navtree { display: flex; }
+.colophon-nav .navtree { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap;
+  align-items: center; justify-content: center; gap: 1.3rem; }
+.colophon-nav .navtree a { font-family: var(--ff-mono); font-size: .72rem; font-weight: 500;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--steel); text-decoration: none; }
+.colophon-nav .navtree a:hover { color: var(--minium-deep); }
+.colophon-nav .navtree .navtree { gap: .5rem; }
 #fp-search:not(:empty) { display: inline-flex; }
 /* Front page — the galley */
 main { padding: 2.4rem 0 3rem; }
@@ -212,6 +229,7 @@ main { padding: 2.4rem 0 3rem; }
 {% endraw %}</style>
 </head>
 <body>
+{%- macro navtree(items) -%}<ul class="navtree">{% for item in items %}<li>{% if item.href %}<a href="{{ item.href }}"{% if item.aria_current %} aria-current="page"{% endif %}{% if item.new_tab %} target="_blank" rel="noopener noreferrer"{% endif %}>{{ item.label }}</a>{% else %}<span class="navtree__label">{{ item.label }}</span>{% endif %}{% if item.children %}{{ navtree(item.children) }}{% endif %}</li>{% endfor %}</ul>{%- endmacro -%}
 <a class="skip" href="#main">Skip to content</a>
 {% if preview_status %}<div class="preview-bar" role="status"><span class="preview-bar__tag">Preview</span><span class="preview-bar__msg">{{ preview_status }} &middot; a private draft, not the public page</span></div>
 {% endif %}<div class="ruler" aria-hidden="true"></div>
@@ -224,7 +242,7 @@ main { padding: 2.4rem 0 3rem; }
     {% else %}<a href="/" class="nameplate">{{ site.title }}</a>
     {% endif %}{% if site.tagline %}<p class="tagline">{{ site.tagline }}</p>{% endif %}
     <nav class="mastnav" aria-label="Primary">
-      <a href="/" {% if is_home %}aria-current="page"{% endif %}>Front page</a>
+      {% if nav.primary %}{{ navtree(nav.primary) }}{% else %}<a href="/" {% if is_home %}aria-current="page"{% endif %}>Front page</a>{% endif %}
       <div id="fp-search"></div>
     </nav>
   </div>
@@ -238,10 +256,11 @@ main { padding: 2.4rem 0 3rem; }
 <footer class="colophon">
   <div class="ruler" aria-hidden="true" style="opacity:.35"></div>
   <div class="gauge">
-    <div class="colophon__inner">
+    {% if nav.footer %}<nav class="colophon-nav" aria-label="Footer">{{ navtree(nav.footer) }}</nav>
+    {% else %}<div class="colophon__inner">
       <span class="colophon__mark"><span class="regmark"><svg width="13" height="13" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="6.2" stroke="currentColor" stroke-width="1.6"/><path d="M10 1.5v5M10 13.5v5M1.5 10h5M13.5 10h5" stroke="currentColor" stroke-width="1.6"/></svg></span> &copy; {{ site.title }}</span>
       <span>Set in Ferropress</span>
-    </div>
+    </div>{% endif %}
   </div>
 </footer>
 <script type="module">

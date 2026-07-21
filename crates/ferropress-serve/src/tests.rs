@@ -564,6 +564,8 @@ async fn serve_path_read_through_populates_cache() {
         &NoCustomBlocks,
         &SiteSettings::defaults(),
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         &path,
     )
     .await
@@ -636,6 +638,8 @@ async fn serve_path_cache_hit_composes_from_stored_envelope() {
         &NoCustomBlocks,
         &SiteSettings::defaults(),
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         &path,
     )
     .await
@@ -1625,6 +1629,8 @@ async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         &path,
     )
     .await;
@@ -1644,6 +1650,8 @@ async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         POST_TYPE,
         &obj,
     )
@@ -1699,6 +1707,8 @@ async fn front_page_renders_configured_static_page() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -1739,6 +1749,8 @@ async fn front_page_falls_back_to_galley_for_unpublished_target() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -1785,6 +1797,8 @@ async fn logo_resolves_and_renders_in_masthead() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         &format!("/{SLUG}"),
     )
     .await
@@ -1887,6 +1901,8 @@ async fn byline_resolves_live_from_the_author_directory_without_regen() {
         &NoCustomBlocks,
         &settings,
         &dir1,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         &path,
     )
     .await
@@ -1927,6 +1943,8 @@ async fn byline_resolves_live_from_the_author_directory_without_regen() {
         &NoCustomBlocks,
         &settings,
         &dir2,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         &path,
     )
     .await
@@ -2005,7 +2023,18 @@ async fn home_galley_byline_resolves_from_the_directory() {
     let settings = SiteSettings::defaults();
     let dir = crate::authors::load_author_directory(&store).await.unwrap();
 
-    match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, &dir, "/").await {
+    match content::resolve_path(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        "/",
+    )
+    .await
+    {
         crate::Resolved::Found(html) => {
             assert!(
                 html.contains("Grace Hopper"),
@@ -2064,6 +2093,8 @@ async fn legacy_format_envelope_is_rejected_and_self_heals() {
         &NoCustomBlocks,
         &SiteSettings::defaults(),
         &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         &path,
     )
     .await
@@ -2125,6 +2156,8 @@ async fn serve_front_galley_read_through_populates_cache() {
         &NoCustomBlocks,
         &SiteSettings::defaults(),
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2196,6 +2229,8 @@ async fn serve_front_cache_hit_composes_from_stored_galley() {
         &NoCustomBlocks,
         &SiteSettings::defaults(),
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2239,6 +2274,8 @@ async fn serve_front_static_read_through_then_hit() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2275,6 +2312,8 @@ async fn serve_front_static_read_through_then_hit() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2318,6 +2357,8 @@ async fn post_change_evicts_home_cache() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await;
@@ -2344,6 +2385,8 @@ async fn post_change_evicts_home_cache() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await;
@@ -2382,6 +2425,8 @@ async fn page_change_evicts_home_only_for_the_configured_front_page() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await;
@@ -2435,6 +2480,8 @@ async fn setting_change_evicts_home_only_for_front_shaping_keys() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await;
@@ -2494,6 +2541,8 @@ async fn home_galley_byline_stays_live_on_cached_front_without_regen() {
         &NoCustomBlocks,
         &settings,
         &dir1,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2536,6 +2585,8 @@ async fn home_galley_byline_stays_live_on_cached_front_without_regen() {
         &NoCustomBlocks,
         &settings,
         &dir2,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2583,6 +2634,8 @@ async fn corrupt_home_cache_entry_is_rejected_and_self_heals() {
         &NoCustomBlocks,
         &SiteSettings::defaults(),
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2625,6 +2678,8 @@ async fn delete_evicts_home_even_without_a_slug_on_the_change() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await;
@@ -2746,6 +2801,8 @@ async fn home_rebuild_honors_new_posts_per_page_after_eviction() {
         &NoCustomBlocks,
         &settings0,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await;
@@ -2780,6 +2837,8 @@ async fn home_rebuild_honors_new_posts_per_page_after_eviction() {
         &NoCustomBlocks,
         &settings1,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await;
@@ -2824,6 +2883,8 @@ async fn home_rebuild_reflects_edited_static_front_after_eviction() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2872,6 +2933,8 @@ async fn home_rebuild_reflects_edited_static_front_after_eviction() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -2929,6 +2992,8 @@ async fn structurally_drifted_home_envelope_is_rejected_and_self_heals() {
             &NoCustomBlocks,
             &SiteSettings::defaults(),
             &AuthorDirectory::default(),
+            &crate::MenuSet::default(),
+            &crate::ContentIndex::default(),
             "/",
         )
         .await
@@ -2992,11 +3057,21 @@ async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
     let settings = SiteSettings::defaults();
     let dir = crate::authors::load_author_directory(&store).await.unwrap();
 
-    let uncached =
-        match content::resolve_path(&store, &theme, &NoCustomBlocks, &settings, &dir, "/").await {
-            crate::Resolved::Found(h) => h,
-            other => panic!("expected Found (uncached), got {other:?}"),
-        };
+    let uncached = match content::resolve_path(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (uncached), got {other:?}"),
+    };
     let miss = match serve_path(
         &store,
         &blobs,
@@ -3004,6 +3079,8 @@ async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
         &NoCustomBlocks,
         &settings,
         &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -3018,6 +3095,8 @@ async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
         &NoCustomBlocks,
         &settings,
         &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await
@@ -3212,6 +3291,8 @@ async fn nested_page_resolves_at_its_full_path_only() {
                 &NoCustomBlocks,
                 &SiteSettings::defaults(),
                 &AuthorDirectory::default(),
+                &crate::MenuSet::default(),
+                &crate::ContentIndex::default(),
                 path,
             )
             .await
@@ -3391,6 +3472,8 @@ async fn a_page_template_renders_a_different_layout() {
                 &NoCustomBlocks,
                 &SiteSettings::defaults(),
                 &AuthorDirectory::default(),
+                &crate::MenuSet::default(),
+                &crate::ContentIndex::default(),
                 path,
             )
             .await
@@ -3455,6 +3538,8 @@ async fn front_page_that_is_a_page_honors_its_template() {
         &NoCustomBlocks,
         &settings,
         &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
         "/",
     )
     .await

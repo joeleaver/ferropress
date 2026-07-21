@@ -33,14 +33,17 @@ use ferropress_core::error::CoreError;
 use ferropress_core::query::{Compare, Edge, FilterSpec};
 use ferropress_core::role::Capability;
 use ferropress_core::value::{FieldMap, Object, ObjectId, TypeName, Value};
-use ferropress_core::{MENU_ITEM_TYPE, MENU_TYPE};
+use ferropress_core::{MENU_ITEM_TYPE, MENU_LOCATION_TYPE, MENU_TYPE};
 
 use super::{AdminError, AdminJson, AuthedUser, i32_field, str_field};
 use crate::AppState;
 
-/// The deepest a menu may nest. Well above any real menu; a submission past it is
-/// rejected rather than rendered as an unbounded dropdown.
-const MAX_MENU_DEPTH: usize = 10;
+/// The deepest a menu may nest (ancestor count; `MAX_MENU_DEPTH + 1` rendered levels). Kept at
+/// or below the theme render cap [`ferropress_serve::MAX_NAV_DEPTH`] so the admin can NEVER save a
+/// menu deeper than the public theme can render: the nav is composed live into a recursive
+/// template macro bounded by the theme sandbox's recursion limit, and a menu past that bound would
+/// 500 every page site-wide. Real nav menus are 2-3 levels, so this is still generous.
+const MAX_MENU_DEPTH: usize = ferropress_serve::MAX_NAV_DEPTH - 1;
 
 /// A hard cap on items per menu — a runaway/abusive submission guard.
 const MAX_MENU_ITEMS: usize = 500;
@@ -345,8 +348,9 @@ pub async fn save_items(
     let _guard = state.menu_lock.lock().await;
 
     // Existence check UNDER the lock (404 otherwise), serialized against delete() so
-    // this can't link items into a menu being concurrently removed.
-    state
+    // this can't link items into a menu being concurrently removed. Keep the object so we
+    // can bump its `meta._rev` at the end (see `touch_menu`).
+    let menu = state
         .store
         .get(&TypeName::from(MENU_TYPE), ObjectId(id))
         .await?;
@@ -469,10 +473,289 @@ pub async fn save_items(
         }
     }
 
+    // Bump the menu's `meta._rev` LAST — a reliable `Menu` Update ChangeEvent that fires
+    // AFTER every (eventless) item `link`/`unlink` above has committed. rhypedb's link/unlink
+    // emit no change event, so the serve regen loop's menu reload keys off object create/
+    // update/delete events; the individual item creates fire BEFORE their `link` to this menu
+    // commits, so a reload racing those creates could observe a partial forest with no trailing
+    // event to correct it. This touch guarantees a final event once the tree is fully linked,
+    // so the live `MenuHandle` always converges on the settled state.
+    touch_menu(&state, &menu).await?;
+
     Ok(Json(SaveItemsResponse {
         id,
         item_count: resolved.len(),
     }))
+}
+
+// ---- location assignment ----------------------------------------------------
+
+/// One row of the *assign a menu to a location* surface: a theme-declared location, its
+/// human label, and the menu currently bound to it (if any).
+#[derive(Serialize)]
+pub struct MenuLocationRow {
+    pub location: String,
+    pub label: String,
+    pub menu: Option<MenuRef>,
+    /// `true` when the active theme declares this location; `false` marks a STRANDED
+    /// assignment (a binding left over from a theme that declared a location the current one
+    /// does not) — surfaced so it can still be cleared, WP-style.
+    pub declared: bool,
+}
+
+/// `PUT /menus/locations/{location}` body: the menu to bind (or `null`/absent to clear).
+#[derive(Deserialize)]
+pub struct AssignLocationRequest {
+    #[serde(default)]
+    pub menu_id: Option<u64>,
+}
+
+/// `PUT /menus/locations/{location}` response: the resulting binding.
+#[derive(Serialize)]
+pub struct AssignLocationResponse {
+    pub location: String,
+    pub menu: Option<MenuRef>,
+}
+
+/// `GET /admin/api/menus/locations` — every location the ACTIVE theme declares, joined with
+/// its current menu binding (plus any stranded assignment so it can be cleared). Feeds the
+/// admin's location-assignment UI.
+pub async fn locations(
+    State(state): State<AppState>,
+    who: AuthedUser,
+) -> Result<Json<Vec<MenuLocationRow>>, AdminError> {
+    who.require(Capability::ManageMenus)?;
+
+    // The declared locations come from the live theme (matches what actually renders).
+    let declared = state.theme.locations();
+    // Current assignments: (location -> menu id), batched (no per-row link read).
+    let assigned = load_location_assignments(&state).await?;
+
+    // One batched fetch of every assigned menu, for its slug + name.
+    let menu_ids: Vec<ObjectId> = assigned.values().copied().collect();
+    let menu_objs = state
+        .store
+        .get_many(&TypeName::from(MENU_TYPE), &menu_ids)
+        .await?;
+    let menu_by_id: HashMap<u64, Object> = menu_objs.into_iter().map(|o| (o.id.0, o)).collect();
+    let menu_ref = |oid: ObjectId| -> Option<MenuRef> {
+        menu_by_id.get(&oid.0).map(|m| MenuRef {
+            id: oid.0,
+            slug: str_field(m, "slug").unwrap_or_default(),
+            name: str_field(m, "name").unwrap_or_default(),
+        })
+    };
+
+    let declared_keys: HashSet<&str> = declared.iter().map(|(k, _)| k.as_str()).collect();
+    let mut rows: Vec<MenuLocationRow> = declared
+        .iter()
+        .map(|(key, label)| MenuLocationRow {
+            location: key.clone(),
+            label: label.clone(),
+            menu: assigned.get(key).copied().and_then(menu_ref),
+            declared: true,
+        })
+        .collect();
+    // Stranded assignments (assigned but the current theme doesn't declare them).
+    let mut stranded: Vec<(&String, &ObjectId)> = assigned
+        .iter()
+        .filter(|(loc, _)| !declared_keys.contains(loc.as_str()))
+        .collect();
+    stranded.sort_by(|a, b| a.0.cmp(b.0));
+    for (loc, oid) in stranded {
+        rows.push(MenuLocationRow {
+            location: loc.clone(),
+            label: loc.clone(),
+            menu: menu_ref(*oid),
+            declared: false,
+        });
+    }
+    Ok(Json(rows))
+}
+
+/// `PUT /admin/api/menus/locations/{location}` — bind `location` to a menu (`menu_id`), or
+/// clear it (`menu_id` null/absent). One menu per location: `MenuLocation.location` is
+/// `@unique`, so this upserts the single row (create-then-link on first bind, reconcile its
+/// `menu` link on a rebind) under [`menu_lock`](crate::AppState::menu_lock).
+pub async fn assign_location(
+    State(state): State<AppState>,
+    who: AuthedUser,
+    Path(location): Path<String>,
+    AdminJson(body): AdminJson<AssignLocationRequest>,
+) -> Result<Json<AssignLocationResponse>, AdminError> {
+    who.require(Capability::ManageMenus)?;
+
+    let location = location.trim().to_owned();
+    if location.is_empty() {
+        return Err(AdminError::BadRequest(
+            "a location key is required".to_owned(),
+        ));
+    }
+
+    // Serialize against the whole-tree save + delete (they share this lock) so a bind can't
+    // race a concurrent menu delete into a dangling assignment.
+    let _guard = state.menu_lock.lock().await;
+    let existing = find_location_row(&state, &location).await?;
+
+    match body.menu_id {
+        Some(menu_id) => {
+            // The bound menu must exist (404 otherwise) — never assign a location to a ghost.
+            let menu = state
+                .store
+                .get(&TypeName::from(MENU_TYPE), ObjectId(menu_id))
+                .await?;
+            let menu_oid = ObjectId(menu_id);
+            match existing {
+                Some(row_id) => {
+                    super::reconcile_to_one(
+                        &state.store,
+                        &menu_location_edge(row_id),
+                        Some(menu_oid),
+                    )
+                    .await?;
+                }
+                None => {
+                    let mut fields = FieldMap::new();
+                    fields.insert("location".to_owned(), Value::String(location.clone()));
+                    let row_id = state
+                        .store
+                        .create(&TypeName::from(MENU_LOCATION_TYPE), fields)
+                        .await?;
+                    // Link the menu; on failure delete the orphan row we just made.
+                    if let Err(e) = state
+                        .store
+                        .link(&menu_location_edge(row_id), menu_oid, FieldMap::new())
+                        .await
+                    {
+                        let _ = state
+                            .store
+                            .delete(&TypeName::from(MENU_LOCATION_TYPE), row_id)
+                            .await;
+                        return Err(e.into());
+                    }
+                }
+            }
+            // A location binding is a `MenuLocation.menu` LINK, which emits no change event
+            // (rhypedb link/unlink are eventless), so a REBIND (reconcile_to_one = link+unlink,
+            // no object create/update/delete at all) would leave the serve regen loop's menu
+            // reload untriggered and the public nav stale on the OLD menu; a FIRST bind's create
+            // event also races the subsequent link. Bump the bound menu's `meta._rev` AFTER the
+            // link so a reliable `Menu` Update event fires once the binding is committed, forcing
+            // a settled reload. (A clear, below, deletes the row — which DOES emit — so it needs
+            // no touch.)
+            touch_menu(&state, &menu).await?;
+            Ok(Json(AssignLocationResponse {
+                location,
+                menu: Some(MenuRef {
+                    id: menu_id,
+                    slug: str_field(&menu, "slug").unwrap_or_default(),
+                    name: str_field(&menu, "name").unwrap_or_default(),
+                }),
+            }))
+        }
+        None => {
+            // Clear: drop the assignment row if one exists (idempotent otherwise).
+            if let Some(row_id) = existing {
+                state
+                    .store
+                    .delete(&TypeName::from(MENU_LOCATION_TYPE), row_id)
+                    .await?;
+            }
+            Ok(Json(AssignLocationResponse {
+                location,
+                menu: None,
+            }))
+        }
+    }
+}
+
+/// Bump a menu's `meta._rev` counter and persist it — a deliberate `Menu` Update that emits
+/// a ChangeEvent the serve regen loop reloads the live `MenuHandle` on.
+///
+/// This exists because rhypedb `link`/`unlink` are EVENTLESS: the item↔menu and location↔menu
+/// relationships are edges, so a save that only re-links (a location rebind) or whose final
+/// mutation is a bare `link` (a pure item append) produces no trailing change event, and the
+/// feed-driven reload — which is what keeps the invariant "a menu edit is reflected live" — would
+/// never fire (or would fire on a create that races its own link). Writing a genuinely-new
+/// `meta._rev` (monotonic, so the value always changes and the update always publishes) after all
+/// link work is committed guarantees exactly one settling event. `meta` is otherwise untouched, so
+/// this composes with any future flags stored there. Must be called UNDER `menu_lock`, last.
+async fn touch_menu(state: &AppState, menu: &Object) -> Result<(), AdminError> {
+    // Guarantee an object so `_rev` always has a home (a legacy/corrupt non-object meta is
+    // reset to a fresh object rather than erroring — the revision touch must never fail a save).
+    let mut meta = match menu.get("meta") {
+        Some(Value::Json(j)) if j.is_object() => j.clone(),
+        _ => serde_json::json!({}),
+    };
+    let rev = meta
+        .get("_rev")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        + 1;
+    meta.as_object_mut()
+        .expect("meta is an object by construction above")
+        .insert("_rev".to_owned(), serde_json::Value::from(rev));
+    let mut patch = FieldMap::new();
+    patch.insert("meta".to_owned(), Value::Json(meta));
+    state
+        .store
+        .update(&TypeName::from(MENU_TYPE), menu.id, patch)
+        .await?;
+    Ok(())
+}
+
+/// The `MenuLocation.menu` to-one edge for a location row.
+fn menu_location_edge(row_id: ObjectId) -> Edge {
+    Edge {
+        type_name: TypeName::from(MENU_LOCATION_TYPE),
+        id: row_id,
+        field: "menu".to_owned(),
+    }
+}
+
+/// The current `location -> bound menu id` assignments, batched (one scan + one
+/// `get_links_many`, no per-row link read). A row bound to no menu is skipped.
+async fn load_location_assignments(
+    state: &AppState,
+) -> Result<HashMap<String, ObjectId>, AdminError> {
+    let rows = state
+        .store
+        .scan(&TypeName::from(MENU_LOCATION_TYPE))
+        .await?;
+    let ids: Vec<ObjectId> = rows.iter().map(|r| r.id).collect();
+    let menu_links = state
+        .store
+        .get_links_many(&TypeName::from(MENU_LOCATION_TYPE), &ids, "menu")
+        .await?;
+    let mut out = HashMap::new();
+    for (row, menus) in rows.iter().zip(menu_links) {
+        let Some(location) = str_field(row, "location").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(menu_id) = menus.into_iter().next() {
+            // `location` is @unique, so a duplicate is impossible; last-wins is harmless.
+            out.insert(location, menu_id);
+        }
+    }
+    Ok(out)
+}
+
+/// The `MenuLocation` row id bound to `location`, if any (`location` is `@unique`, so ≤1).
+async fn find_location_row(
+    state: &AppState,
+    location: &str,
+) -> Result<Option<ObjectId>, AdminError> {
+    let rows = state
+        .store
+        .filter(FilterSpec {
+            type_name: TypeName::from(MENU_LOCATION_TYPE),
+            field: "location".to_owned(),
+            op: Compare::Eq,
+            value: Value::String(location.to_owned()),
+            limit: Some(2),
+        })
+        .await?;
+    Ok(rows.into_iter().next().map(|o| o.id))
 }
 
 // ---- forest validation (pure, pre-write) ------------------------------------
@@ -686,58 +969,18 @@ fn resolve_slug(explicit: Option<&str>, name: &str) -> Result<String, AdminError
     }
 }
 
-/// Validate a `Custom` link URL against a scheme allow-list, returning it trimmed.
-/// Permits a site-relative path (`/…`), a bare `#fragment`/`?query`, a relative
-/// reference (no scheme), and the `http`/`https`/`mailto`/`tel` schemes. Rejects a
-/// protocol-relative `//host`, any control/whitespace char (blocks `java\tscript:`
-/// obfuscation), and every other scheme (`javascript:`, `data:`, `vbscript:`,
-/// `file:`, `blob:`, …). The write-time half of the two-layer XSS guard.
+/// Validate a `Custom` link URL against the scheme allow-list, returning it trimmed
+/// or a 400. The actual allow-list lives in [`ferropress_core::sanitize_href`] — THE
+/// single source shared with the serve compose path (must-fix #6), so the write-time
+/// verdict here and the render-time re-check there can never drift. This is the
+/// write-time half of the two-layer XSS guard (render-time autoescape is the other).
 pub(crate) fn sanitize_href(raw: &str) -> Result<String, AdminError> {
-    let url = raw.trim();
-    if url.is_empty() {
-        return Err(AdminError::BadRequest(
-            "a custom link needs a URL".to_owned(),
-        ));
-    }
-    let reject =
-        || AdminError::BadRequest(format!("the URL {url:?} is not an allowed link target"));
-
-    // No raw control/whitespace: an embedded tab/newline can smuggle a scheme past
-    // the check below yet still be honored by a browser once stripped.
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err(reject());
-    }
-    // Protocol-relative `//host` (and backslash variants some browsers treat alike)
-    // inherit the page scheme — reject.
-    if url.starts_with("//") || url.starts_with("/\\") || url.starts_with('\\') {
-        return Err(reject());
-    }
-    match url_scheme(url) {
-        // No scheme → a relative / site-relative / fragment reference: safe.
-        None => Ok(url.to_owned()),
-        Some(scheme) => match scheme.as_str() {
-            "http" | "https" | "mailto" | "tel" => Ok(url.to_owned()),
-            _ => Err(reject()),
-        },
-    }
-}
-
-/// The URL scheme (lowercased) iff `url` begins with a valid RFC-3986 scheme
-/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`), else `None` (a relative ref).
-fn url_scheme(url: &str) -> Option<String> {
-    let bytes = url.as_bytes();
-    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
-        return None;
-    }
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b':' {
-            return Some(url[..i].to_ascii_lowercase());
-        }
-        if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.') {
-            return None; // a non-scheme char before any ':' → no scheme
-        }
-    }
-    None
+    ferropress_core::sanitize_href(raw).ok_or_else(|| {
+        AdminError::BadRequest(format!(
+            "the URL {:?} is not an allowed link target",
+            raw.trim()
+        ))
+    })
 }
 
 /// Shorthand for a 500 from an internal invariant violation (never author-facing).

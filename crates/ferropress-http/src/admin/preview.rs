@@ -86,6 +86,8 @@ async fn render(
         state.custom.as_ref(),
         &state.settings.current(),
         &state.authors.current(),
+        &state.menus.current(),
+        &state.content_index.current(),
         type_name,
         obj,
     )

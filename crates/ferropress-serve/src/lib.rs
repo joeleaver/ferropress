@@ -26,15 +26,20 @@ use ferropress_core::ports::{BlobKey, BlobStore};
 use ferropress_core::query::{Change, ChangeKind, SubscribeFilter};
 use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{Object, TypeName, Value};
-use ferropress_core::{BlockTree, PAGE_TYPE, POST_TYPE, REDIRECT_TYPE, USER_TYPE};
+use ferropress_core::{
+    BlockTree, MENU_ITEM_TYPE, MENU_LOCATION_TYPE, MENU_TYPE, PAGE_TYPE, POST_TYPE, REDIRECT_TYPE,
+    USER_TYPE,
+};
 use ferropress_render::CustomBlockRenderer;
 
 pub mod authors;
 pub mod content;
+pub mod content_index;
 pub mod datefmt;
 pub mod feed;
 pub mod hierarchy;
 pub mod hook_bridge;
+pub mod menus;
 pub mod redirects;
 pub mod settings;
 pub mod templates;
@@ -45,9 +50,11 @@ pub use content::{
     Resolved, default_theme, default_theme_handle, render_preview, resolve_path,
     resolve_published_entity, serve_path, slug_from_path,
 };
+pub use content_index::{ContentEntry, ContentIndex, ContentIndexHandle, load_content_index};
 pub use feed::{FeedFormat, serve_feed};
 pub use hierarchy::{BackfillReport, backfill_page_paths, join_page_path};
 pub use hook_bridge::HookBridge;
+pub use menus::{MAX_NAV_DEPTH, MenuHandle, MenuItemCtx, MenuNode, MenuSet, load_menus};
 pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects};
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
 pub use themes::{ThemeHandle, ThemeRegistry};
@@ -187,6 +194,20 @@ pub struct ServeEngine {
     /// eviction. `None` (tests, a boot without a theme wired) skips the swap. Same handle
     /// the HTTP read path holds, so a swap here is visible there.
     theme: Option<ThemeHandle>,
+    /// The live nav-menu set the read path frames every page's navigation from. When
+    /// present, a `Menu`/`MenuItem`/`MenuLocation` change on the feed FULL-reloads it (see
+    /// [`apply_change`](Self::apply_change)) — and evicts NO page: menus are live chrome, so a
+    /// menu edit is reflected on the next request without regenerating a single cached page.
+    /// `None` (tests, a boot without menus wired) skips the reload. Same handle the HTTP read
+    /// path holds.
+    menus: Option<menus::MenuHandle>,
+    /// The live content index the read path resolves nav targets (Post/Page id → href+title)
+    /// from. When present, a `Post`/`Page` change on the feed updates it incrementally (see
+    /// [`apply_change`](Self::apply_change)) ALONGSIDE the existing cache eviction — so a page
+    /// rename/publish is reflected in every menu that targets it with no menu edit and no menu
+    /// reload. `None` (tests) skips the update; targets resolve to nothing. Same handle the
+    /// HTTP read path holds.
+    content_index: Option<content_index::ContentIndexHandle>,
 }
 
 impl ServeEngine {
@@ -206,6 +227,8 @@ impl ServeEngine {
             authors: None,
             redirects: None,
             theme: None,
+            menus: None,
+            content_index: None,
         }
     }
 
@@ -242,6 +265,24 @@ impl ServeEngine {
     /// — is composed live; envelopes are theme-agnostic).
     pub fn with_theme(mut self, theme: ThemeHandle) -> Self {
         self.theme = Some(theme);
+        self
+    }
+
+    /// Wire the live [`MenuHandle`](menus::MenuHandle) so the regen loop FULL-reloads it
+    /// whenever a `Menu`/`MenuItem`/`MenuLocation` changes on the feed. Pass the SAME handle
+    /// the HTTP read path holds, so a menu edit re-frames every page's navigation on the next
+    /// request — evicting no cached page (menus are live chrome).
+    pub fn with_menus(mut self, menus: menus::MenuHandle) -> Self {
+        self.menus = Some(menus);
+        self
+    }
+
+    /// Wire the live [`ContentIndexHandle`](content_index::ContentIndexHandle) so the regen
+    /// loop keeps it current whenever a `Post`/`Page` changes on the feed. Pass the SAME
+    /// handle the HTTP read path holds, so a page rename/publish is reflected in every menu
+    /// that targets it (the target's live href/title) with no menu edit.
+    pub fn with_content_index(mut self, content_index: content_index::ContentIndexHandle) -> Self {
+        self.content_index = Some(content_index);
         self
     }
 
@@ -407,10 +448,42 @@ impl ServeEngine {
             return Ok(());
         }
 
-        // Only content types map to a page in permalinks v1.
+        // A `Menu`/`MenuItem`/`MenuLocation` change FULL-reloads the live menu set the read
+        // path frames navigation from — and EVICTS NOTHING. Menus are live chrome (composed at
+        // request time from this set + the content index, never baked into a page envelope), so
+        // a menu edit matches none of the cache-reshaping key sets and must not regenerate any
+        // page — the serving model's no-global-coupling guardrail, exactly like the redirect
+        // reload above. Full reload (not incremental): menus are low-volume, so a rescan is
+        // cheap and immune to structural-edit staleness (a re-parent/reorder/reassign is easiest
+        // to get right by rebuilding). Rides the default subscribe filter, so every instance
+        // converges off the shared feed.
         let ty = change.type_name.as_str();
+        if ty == MENU_TYPE || ty == MENU_ITEM_TYPE || ty == MENU_LOCATION_TYPE {
+            if let Some(menus) = &self.menus {
+                match menus::load_menus(&self.store).await {
+                    Ok(next) => {
+                        menus.set(next);
+                        tracing::debug!("reloaded nav menus from change feed");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to reload nav menus"),
+                }
+            }
+            return Ok(());
+        }
+
+        // Only content types map to a page in permalinks v1.
         if ty != POST_TYPE && ty != PAGE_TYPE {
             return Ok(());
+        }
+
+        // Keep the live content index current for nav-target resolution — ALONGSIDE (not
+        // instead of) the page-cache handling below. A menu item stores only a Post/Page *id*;
+        // its live href + title come from this index, so a rename/publish/unpublish is reflected
+        // in every menu targeting it with no menu edit and no menu reload. O(1), read straight
+        // off the change's scalar snapshot (no store round-trip) — the byline-directory
+        // discipline. Skipped when no index is wired (tests).
+        if let Some(index) = &self.content_index {
+            index.apply_content_change(change);
         }
 
         // The front page is a LISTING page this content change may also touch — a post

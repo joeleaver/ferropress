@@ -39,8 +39,9 @@ use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{
-    AuthorsHandle, HookBridge, RedirectHandle, ServeEngine, SettingsHandle, ThemeHandle,
-    ThemeRegistry, backfill_page_paths, load_author_directory, load_redirects, load_site_settings,
+    AuthorsHandle, ContentIndexHandle, HookBridge, MenuHandle, RedirectHandle, ServeEngine,
+    SettingsHandle, ThemeHandle, ThemeRegistry, backfill_page_paths, load_author_directory,
+    load_content_index, load_menus, load_redirects, load_site_settings,
 };
 use ferropress_store_embedded::EmbeddedStore;
 
@@ -142,6 +143,18 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     // site with NO page regeneration.
     let redirects = RedirectHandle::new(load_redirects(&store).await.context("loading redirects")?);
 
+    // Seed the live nav-menu set + content index from the store ONCE at boot. Both handles are
+    // shared with the HTTP read path (`AppState`) and the regen loop (`ServeEngine`): the loop
+    // full-reloads the menus on a `Menu`/`MenuItem`/`MenuLocation` change (evicting no page — menus
+    // are live chrome) and keeps the content index current on a `Post`/`Page` change (so a page
+    // rename/publish is reflected in every menu that targets it, with no menu edit).
+    let menus = MenuHandle::new(load_menus(&store).await.context("loading nav menus")?);
+    let content_index = ContentIndexHandle::new(
+        load_content_index(&store)
+            .await
+            .context("loading content index")?,
+    );
+
     // 2. Build the owned subsystems over the ports.
     // Discover the installed public themes from the themes dir (on top of the always-present
     // built-in default) and build the page-chrome theme named by the live `appearance.theme`
@@ -187,7 +200,9 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
         .with_settings(settings.clone())
         .with_authors(authors.clone())
         .with_redirects(redirects.clone())
-        .with_theme(theme.clone());
+        .with_theme(theme.clone())
+        .with_menus(menus.clone())
+        .with_content_index(content_index.clone());
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
     // The same plugin host is the custom-block renderer AND the hook dispatcher
@@ -197,6 +212,8 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
         .with_settings(settings.clone())
         .with_authors(authors.clone())
         .with_redirects(redirects.clone())
+        .with_menus(menus.clone())
+        .with_content_index(content_index.clone())
         .with_islands_dir(cfg.islands_dir.clone())
         .with_custom_renderer(plugins.clone())
         .with_hook_dispatcher(plugins.clone())
