@@ -419,12 +419,32 @@ const ADMIN_CSS: &str = r#"
 .menurow {
   display: grid; grid-template-columns: auto 1fr auto; gap: .75rem; align-items: start;
   padding: .55rem .65rem; background: var(--paper-raise); border: 1px solid var(--rule);
-  border-radius: var(--radius); margin-bottom: .45rem; position: relative;
+  border-radius: var(--radius); position: relative;
 }
 .menurow.is-child::before {
   content: ""; position: absolute; left: calc(-0.75rem + 2px); top: -.45rem; bottom: 50%;
   width: 1px; background: var(--rule);
 }
+/* drag-and-drop reorder/nest (the button reorder controls remain the keyboard path) */
+.menurow__grip {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 24px;
+  min-height: 24px; margin-right: 2px; color: var(--steel-2); cursor: grab; user-select: none;
+  border-radius: 2px; font-size: .9rem; line-height: 1; touch-action: none;
+}
+.menurow__grip:hover { color: var(--ink-2); background: var(--paper-sink); }
+.menurow.is-dragging { opacity: .45; }
+.menurow.is-droptarget { outline: 2px solid var(--minium); outline-offset: 1px; }
+/* Gaps provide ALL inter-row spacing (the row carries no margin), so each is a clean, non-
+   overlapping drop target between rows — a subtree dropped here becomes a sibling at this spot. */
+.dropgap { list-style: none; height: .7rem; border-radius: 3px; position: relative; }
+.dropgap.is-hint::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+  height: 3px; background: var(--minium); border-radius: 2px; box-shadow: 0 0 6px var(--minium);
+}
+.dropgap--end {
+  height: 1.6rem; margin: .1rem 0 0; border: 1px dashed transparent; border-radius: var(--radius);
+}
+.dropgap--end.is-hint { border-color: var(--minium); }
 .menurow__reorder { display: inline-flex; gap: 2px; align-self: center; }
 .rbtn {
   width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;

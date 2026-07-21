@@ -186,6 +186,11 @@ struct MenuCtx {
     /// Set on any structural or field edit; cleared on a successful save/reload. Gates
     /// the unsaved-changes confirm on every exit path (+ the `beforeunload` guard).
     dirty: Signal<bool>,
+    /// Drag-and-drop reorder/nest (rinch's pointer-synthesized element DnD). `drag` carries the
+    /// dragged row's cid (its whole subtree moves); `drop_hint` is the hovered zone's key
+    /// (`"gap:{cid}"` | `"into:{cid}"` | `"end"` | `""`) for the reactive drop-target highlight.
+    drag: DragContext<String>,
+    drop_hint: Signal<String>,
     // The add-item picker.
     picker_open: Signal<bool>,
     candidates: Signal<api::LinkCandidates>,
@@ -349,6 +354,8 @@ pub fn app() -> NodeHandle {
         load: Signal::new(Load::Loading),
         saving: Signal::new(false),
         dirty: Signal::new(false),
+        drag: DragContext::new(),
+        drop_hint: Signal::new(String::new()),
         picker_open: Signal::new(false),
         candidates: Signal::new(api::LinkCandidates::default()),
         candidates_state: Signal::new(Load::Loading),
@@ -1198,8 +1205,18 @@ pub fn app() -> NodeHandle {
                             }
                             ul { class: "tree",
                                 for row in menu.tree.get() {
-                                    MenuRowView {
+                                    // The insert-between gap is the FIRST child + carries the
+                                    // for-item key (so it moves with its row); MenuRowView follows.
+                                    DropGap {
                                         key: row.cid.clone(),
+                                        cid: row.cid.clone(),
+                                        tree: menu.tree,
+                                        dirty: menu.dirty,
+                                        saving: menu.saving,
+                                        drag: menu.drag,
+                                        drop_hint: menu.drop_hint,
+                                    }
+                                    MenuRowView {
                                         cid: row.cid.clone(),
                                         kind: row.kind.clone(),
                                         resolved: row.resolved.clone(),
@@ -1207,7 +1224,17 @@ pub fn app() -> NodeHandle {
                                         tree: menu.tree,
                                         dirty: menu.dirty,
                                         saving: menu.saving,
+                                        drag: menu.drag,
+                                        drop_hint: menu.drop_hint,
                                     }
+                                }
+                                // The trailing drop zone: drop here to append at the top level.
+                                // STATIC (after the `for`), so it needs no per-row key.
+                                li {
+                                    class: {move || if menu.drop_hint.get() == "end" { "dropgap dropgap--end is-hint" } else { "dropgap dropgap--end" }},
+                                    ondragenter: move || menu.drop_hint.set("end".to_owned()),
+                                    ondragleave: move || { if menu.drop_hint.get() == "end" { menu.drop_hint.set(String::new()); } },
+                                    ondrop: move || apply_drop(menu.saving, menu.tree, menu.dirty, menu.drag, menu.drop_hint, DropDest::End),
                                 }
                             }
                             if menu.tree.get().is_empty() {
@@ -2958,6 +2985,36 @@ fn MenuLocationView(row: api::MenuLocationRow, lc: LocCtx) -> NodeHandle {
     }
 }
 
+// ── the insert-between drop gap ─────────────────────────────────────────────────
+
+/// The thin drop zone rendered BEFORE each row — dropping a dragged subtree here re-inserts it as
+/// a sibling at that position ([`DropDest::Before`]). A `#[component]` (not inline `for`-body
+/// markup) so it can hold its own Copy `cid_sig` for the reactive highlight closure (which is
+/// re-created each effect run and so must capture only Copy). It is the FIRST child of the
+/// per-row `for` body and carries the for-item `key` (so the gap + its row reconcile as one unit
+/// and move together); the drop/hover handlers are stored once, so they may capture the non-Copy
+/// cid clones by move.
+#[component]
+fn DropGap(
+    cid: String,
+    tree: Signal<Vec<MenuRow>>,
+    dirty: Signal<bool>,
+    saving: Signal<bool>,
+    drag: DragContext<String>,
+    drop_hint: Signal<String>,
+) -> NodeHandle {
+    let cid_sig = Signal::new(cid.clone());
+    let (c_drop, c_enter, c_leave) = (cid.clone(), cid.clone(), cid.clone());
+    rsx! {
+        li {
+            class: {move || if drop_hint.get() == format!("gap:{}", cid_sig.get()) { "dropgap is-hint" } else { "dropgap" }},
+            ondragenter: move || drop_hint.set(format!("gap:{c_enter}")),
+            ondragleave: move || { if drop_hint.get() == format!("gap:{c_leave}") { drop_hint.set(String::new()); } },
+            ondrop: move || apply_drop(saving, tree, dirty, drag, drop_hint, DropDest::Before(c_drop.clone())),
+        }
+    }
+}
+
 // ── one tree row ──────────────────────────────────────────────────────────────
 
 /// One menu-item row in the editor tree. A `#[component]` (not inline `for`-body markup)
@@ -2977,6 +3034,10 @@ fn MenuRowView(
     /// True while a save is in flight — every mutation handler no-ops so a concurrent edit
     /// can't be silently clobbered by the post-save re-seed (must-fix B2).
     saving: Signal<bool>,
+    /// Drag-and-drop: this row's grip is the drag SOURCE (sets `drag`); the whole row is a
+    /// nest-drop TARGET ([`DropDest::Into`]). `drop_hint` drives the reactive drop highlight.
+    drag: DragContext<String>,
+    drop_hint: Signal<String>,
 ) -> NodeHandle {
     // This row's per-row edit signals (created at add/load; the invariant is that every
     // cid in the tree has one). A defensive empty row if somehow absent — never hit.
@@ -3065,12 +3126,35 @@ fn MenuRowView(
         cid.clone(),
         cid.clone(),
     );
+    // Clones for the drag grip (source) + the row's nest-drop (Into) handlers — stored once, so
+    // capturing the non-Copy cid by move is fine.
+    let (c_grip, c_into_drop, c_into_enter, c_into_leave) =
+        (cid.clone(), cid.clone(), cid.clone(), cid.clone());
 
     rsx! {
         li {
-            class: {move || if row_depth(&tree.get(), &cid_sig.get()) > 0 { "menurow is-child" } else { "menurow" }},
+            // Depth indent + the drag-source dim + the nest-drop highlight, all reactive (a keyed
+            // row isn't rebuilt on a tree/hint change; depth is excluded from `MenuRow`'s PartialEq).
+            class: {move || {
+                let c = cid_sig.get();
+                let mut s = if row_depth(&tree.get(), &c) > 0 { "menurow is-child".to_owned() } else { "menurow".to_owned() };
+                if drag.get().as_deref() == Some(c.as_str()) { s.push_str(" is-dragging"); }
+                if drop_hint.get() == format!("into:{c}") { s.push_str(" is-droptarget"); }
+                s
+            }},
             style: {move || format!("margin-left:{}rem", (row_depth(&tree.get(), &cid_sig.get()) as f32) * 1.5)},
+            // The whole row is a nest-drop target (drop → make the dragged subtree its last child).
+            ondragenter: move || drop_hint.set(format!("into:{c_into_enter}")),
+            ondragleave: move || { if drop_hint.get() == format!("into:{c_into_leave}") { drop_hint.set(String::new()); } },
+            ondrop: move || apply_drop(saving, tree, dirty, drag, drop_hint, DropDest::Into(c_into_drop.clone())),
             span { class: "menurow__reorder",
+                span {
+                    class: "menurow__grip", draggable: "true",
+                    aria-hidden: "true", title: "Drag to reorder or nest",
+                    ondragstart: move || drag.set(c_grip.clone()),
+                    ondragend: move || { drag.clear(); drop_hint.set(String::new()); },
+                    "\u{283F}"
+                }
                 button {
                     r#type: "button",
                     class: {move || rbtn_class(reorder_ok(tree, &cid_sig.get(), can_move_up))},
@@ -3819,6 +3903,81 @@ fn outdent(tree: &mut Vec<MenuRow>, i: usize) {
     }
 }
 
+/// Where a dragged subtree is dropped. `Before` = as a sibling AT the gap (the depth of the
+/// surviving row above it); `Into` = as the target's LAST child (its depth + 1); `End` = appended
+/// at the top level. The `String` is the anchor/target row's cid.
+enum DropDest {
+    Before(String),
+    Into(String),
+    End,
+}
+
+/// Move the subtree rooted at `src` to `dest`, re-basing every moved row's depth uniformly.
+/// Returns whether the tree changed. REJECTS (no-op) a drop whose anchor/target lies inside the
+/// moving subtree (the is-descendant guard — can't nest a node into its own subtree) and one that
+/// would push any moved row past [`MAX_MENU_DEPTH`] (bounce, never silently clamp — matching the
+/// keyboard indent's disable and the server's reject). Because it only reorders + re-depths
+/// EXISTING rows (unchanged cid/kind/resolved), the keyed `for` relocates their DOM without a
+/// rebuild (depth is excluded from `MenuRow`'s `PartialEq`, re-rendered by the reactive class).
+/// Fuzz-proven (invariant + cid-multiset preserved) in `design/move-subtree.fuzz.mjs`.
+fn move_subtree(tree: &mut Vec<MenuRow>, src: &str, dest: &DropDest) -> bool {
+    let Some(i) = index_of(tree, src) else {
+        return false;
+    };
+    let k = subtree_end(tree, i);
+    // is-descendant / self guard on the ORIGINAL tree: the anchor/target must survive the cut.
+    if let DropDest::Before(cid) | DropDest::Into(cid) = dest {
+        let Some(a) = index_of(tree, cid) else {
+            return false;
+        };
+        if a >= i && a < k {
+            return false;
+        }
+    }
+    let block: Vec<MenuRow> = tree[i..k].to_vec();
+    let mut post: Vec<MenuRow> = Vec::with_capacity(tree.len() - block.len());
+    post.extend_from_slice(&tree[..i]);
+    post.extend_from_slice(&tree[k..]);
+
+    // Insertion index + the moved root's new depth, computed in the POST-cut Vec so a gap's depth
+    // never reads a row that was inside the cut block (must-fix).
+    let (ins_at, new_root) = match dest {
+        DropDest::End => (post.len(), 0u32),
+        DropDest::Before(cid) => {
+            let a = index_of(&post, cid).expect("anchor survived the cut");
+            let root = if a == 0 { 0 } else { post[a - 1].depth };
+            (a, root)
+        }
+        DropDest::Into(cid) => {
+            let t = index_of(&post, cid).expect("target survived the cut");
+            (subtree_end(&post, t), post[t].depth + 1)
+        }
+    };
+    // Re-base by delta (may be negative); reject if the deepest moved row would exceed the cap.
+    let block_root = block[0].depth as i64;
+    let block_max = block.iter().map(|r| r.depth).max().unwrap_or(0) as i64;
+    let delta = new_root as i64 - block_root;
+    if block_max + delta > MAX_MENU_DEPTH as i64 {
+        return false;
+    }
+    let mut rebased = block;
+    for r in &mut rebased {
+        r.depth = (r.depth as i64 + delta) as u32;
+    }
+    post.splice(ins_at..ins_at, rebased);
+    // A genuine no-op (same order + depths) must not dirty the menu.
+    if post.len() == tree.len()
+        && post
+            .iter()
+            .zip(tree.iter())
+            .all(|(a, b)| a.cid == b.cid && a.depth == b.depth)
+    {
+        return false;
+    }
+    *tree = post;
+    true
+}
+
 /// Apply a gated reorder op to the row with `cid`, marking the tree dirty iff it changed.
 /// Gating lives HERE (in the handler), never on a `disabled:` attr (not reactive). A no-op
 /// while a save is in flight (B2) so a reorder can't race the post-save re-seed.
@@ -3841,6 +4000,34 @@ fn apply_op(
             op(t, i);
             changed = true;
         }
+    });
+    if changed {
+        dirty.set(true);
+    }
+}
+
+/// Apply a completed drag-drop: move the dragged subtree (from the [`DragContext`]) to `dest`,
+/// clearing the hover hint and marking the tree dirty iff it changed. A no-op while a save is in
+/// flight (B2, mirroring `apply_op`), and `drag.take()` always empties the payload so a bounced or
+/// mid-save drop can't leave a stale drag armed.
+fn apply_drop(
+    saving: Signal<bool>,
+    tree: Signal<Vec<MenuRow>>,
+    dirty: Signal<bool>,
+    drag: DragContext<String>,
+    drop_hint: Signal<String>,
+    dest: DropDest,
+) {
+    drop_hint.set(String::new());
+    let Some(src) = drag.take() else {
+        return;
+    };
+    if saving.get() {
+        return;
+    }
+    let mut changed = false;
+    tree.update(|t| {
+        changed = move_subtree(t, &src, &dest);
     });
     if changed {
         dirty.set(true);
