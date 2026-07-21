@@ -82,7 +82,7 @@ async fn render(
 ) -> Result<Response, AdminError> {
     match ferropress_serve::render_preview(
         &state.store,
-        &state.theme,
+        &state.theme.current(),
         state.custom.as_ref(),
         &state.settings.current(),
         &state.authors.current(),

@@ -42,15 +42,15 @@ pub mod themes;
 
 pub use authors::{AuthorDirectory, AuthorsHandle, load_author_directory};
 pub use content::{
-    Resolved, default_theme, render_preview, resolve_path, resolve_published_entity, serve_path,
-    slug_from_path,
+    Resolved, default_theme, default_theme_handle, render_preview, resolve_path,
+    resolve_published_entity, serve_path, slug_from_path,
 };
 pub use feed::{FeedFormat, serve_feed};
 pub use hierarchy::{BackfillReport, backfill_page_paths, join_page_path};
 pub use hook_bridge::HookBridge;
 pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects};
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
-pub use themes::build_theme;
+pub use themes::{ThemeHandle, build_theme};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it
@@ -180,6 +180,13 @@ pub struct ServeEngine {
     /// (tests, a boot without redirects wired) skips the reload; the table stays empty. Same
     /// handle the HTTP read path holds.
     redirects: Option<RedirectHandle>,
+    /// The live public theme the read path frames pages with. When present, an
+    /// `appearance.theme` change on the feed rebuilds + swaps it (see
+    /// [`apply_change`](Self::apply_change)) — so switching theme takes effect with no
+    /// restart and, because cached envelopes hold theme-agnostic body HTML, no page-cache
+    /// eviction. `None` (tests, a boot without a theme wired) skips the swap. Same handle
+    /// the HTTP read path holds, so a swap here is visible there.
+    theme: Option<ThemeHandle>,
 }
 
 impl ServeEngine {
@@ -198,6 +205,7 @@ impl ServeEngine {
             settings: None,
             authors: None,
             redirects: None,
+            theme: None,
         }
     }
 
@@ -224,6 +232,16 @@ impl ServeEngine {
     /// is honored on the public site without any page regeneration.
     pub fn with_redirects(mut self, redirects: RedirectHandle) -> Self {
         self.redirects = Some(redirects);
+        self
+    }
+
+    /// Wire the live [`ThemeHandle`] so the regen loop rebuilds + swaps it whenever the
+    /// `appearance.theme` setting changes on the feed. Pass the SAME handle the HTTP read
+    /// path holds, so switching theme re-frames every page on the next request without a
+    /// restart and without regenerating a single cached page (the chrome — the whole theme
+    /// — is composed live; envelopes are theme-agnostic).
+    pub fn with_theme(mut self, theme: ThemeHandle) -> Self {
+        self.theme = Some(theme);
         self
     }
 
@@ -281,19 +299,46 @@ impl ServeEngine {
     /// Split out of [`regen_loop`](Self::regen_loop) so a per-change failure is a
     /// recoverable `Err` the loop logs, not a loop-killing `?` at the top level.
     async fn apply_change(&self, change: &Change) -> ferropress_core::error::Result<()> {
-        // A `Setting` change refreshes the live snapshot the read path composes
-        // chrome from — NOT a broad page-cache eviction. Global chrome (title,
-        // tagline, robots) and date formatting are applied live at request time,
-        // so a settings edit is reflected without regenerating cached pages (the
-        // serving model's no-global-coupling guardrail). The ONE exception is the
-        // home page, whose cached CONTENT a few `reading.*` keys reshape (see the
-        // key-gated `evict_front` below); every other key still busts nothing.
+        // A `Setting` change refreshes the live snapshots the read path composes from — NOT
+        // a broad page-cache eviction. Global chrome (title, tagline, robots) and date
+        // formatting are applied live at request time, and the active THEME is likewise held
+        // in a live handle, so a settings edit — including a theme switch — is reflected
+        // without regenerating cached pages (the serving model's no-global-coupling
+        // guardrail; envelopes hold theme-agnostic body HTML). The ONE exception is the home
+        // page, whose cached CONTENT a few `reading.*` keys reshape (see the key-gated
+        // `evict_front` below); every other key still busts nothing.
         if change.type_name.as_str() == ferropress_core::SETTING_TYPE {
-            if let Some(handle) = &self.settings {
+            // Both the settings snapshot and the theme derive from ONE settings reload, so
+            // load once and drive both (either handle being wired justifies the read). Do the
+            // theme swap BEFORE `settings.set(next)` — that call consumes `next` — and read
+            // the theme id by CLONE, never partial-moving `next.theme` out from under it.
+            if self.settings.is_some() || self.theme.is_some() {
                 match settings::load_site_settings(&self.store).await {
                     Ok(next) => {
-                        handle.set(next);
-                        tracing::debug!("refreshed live site settings from change feed");
+                        // Live theme swap: rebuild + swap the shared handle ONLY when the
+                        // active theme id actually changed (not on every `Setting` write).
+                        // On a build failure keep the current theme (never serve a broken or
+                        // silently-defaulted one) and FALL THROUGH — a co-edited title must
+                        // not be dropped because a theme rebuild happened to fail.
+                        if let Some(theme) = &self.theme
+                            && theme.current_id() != next.theme
+                        {
+                            match build_theme(&next.theme) {
+                                Ok(engine) => {
+                                    theme.set(next.theme.as_str(), engine);
+                                    tracing::info!(theme = %next.theme, "swapped live public theme");
+                                }
+                                Err(e) => tracing::error!(
+                                    error = %e,
+                                    theme = %next.theme,
+                                    "failed to build the new theme; keeping the current one",
+                                ),
+                            }
+                        }
+                        if let Some(handle) = &self.settings {
+                            handle.set(next);
+                            tracing::debug!("refreshed live site settings from change feed");
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "failed to refresh site settings"),
                 }

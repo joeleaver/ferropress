@@ -37,7 +37,7 @@ fn boot(dir: &Path) -> (Arc<dyn RhypeStore>, AppState) {
     let store: Arc<dyn RhypeStore> =
         Arc::new(EmbeddedStore::open(dir.join("db")).expect("open store"));
     let blobs = Arc::new(LocalFsBlobStore::new(dir.join("blobs")));
-    let theme = Arc::new(ferropress_serve::default_theme().expect("theme"));
+    let theme = ferropress_serve::default_theme_handle().expect("theme");
     let admin = AdminConfig {
         signing_key: Arc::new(SigningKey::derive_from_secret(SECRET)),
         bundle_dir: None, // API tested without a built wasm bundle

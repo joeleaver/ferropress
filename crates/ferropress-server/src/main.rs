@@ -39,8 +39,8 @@ use ferropress_plugin_host::PluginHost;
 use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{
-    AuthorsHandle, HookBridge, RedirectHandle, ServeEngine, SettingsHandle, backfill_page_paths,
-    build_theme, load_author_directory, load_redirects, load_site_settings,
+    AuthorsHandle, HookBridge, RedirectHandle, ServeEngine, SettingsHandle, ThemeHandle,
+    backfill_page_paths, build_theme, load_author_directory, load_redirects, load_site_settings,
 };
 use ferropress_store_embedded::EmbeddedStore;
 
@@ -143,14 +143,19 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let redirects = RedirectHandle::new(load_redirects(&store).await.context("loading redirects")?);
 
     // 2. Build the owned subsystems over the ports.
-    // Build the page-chrome theme once (its templates registered) for the HTTP read
-    // path (`AppState`). The regen loop does NOT need it: it caches per-object
-    // envelopes, and chrome is composed live at request time.
-    // Build the page-chrome theme named by the live `appearance.theme` setting (an
-    // unknown id falls back to the default theme). Selected at boot; switching theme
-    // without a restart is a follow-up (a `ThemeHandle` mirroring `SettingsHandle`).
-    let theme =
-        Arc::new(build_theme(&settings.current().theme).context("building the page-chrome theme")?);
+    // Build the page-chrome theme named by the live `appearance.theme` setting (an unknown
+    // id falls back to the default theme) and hold it in a live `ThemeHandle`. The SAME
+    // handle is shared with the HTTP read path (`AppState`, which clones the engine per
+    // render) and the regen loop (`ServeEngine`, which rebuilds + swaps it on an
+    // `appearance.theme` change) — so switching theme takes effect with no restart. Seed the
+    // id from the SAME string the engine is built from, so the loop's change-detection has a
+    // consistent baseline. The regen loop does NOT frame pages itself: it caches per-object
+    // envelopes, and the theme chrome is composed live at request time.
+    let boot_theme = settings.current().theme.clone();
+    let theme = ThemeHandle::new(
+        boot_theme.clone(),
+        build_theme(&boot_theme).context("building the page-chrome theme")?,
+    );
 
     // The embedded plugin host: load installed plugins from the plugins dir, then
     // share it as the custom-block renderer for BOTH the read path (`AppState`) and
@@ -181,7 +186,8 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
     let serve = ServeEngine::new(Arc::clone(&store), Arc::clone(&blobs), plugins.clone())
         .with_settings(settings.clone())
         .with_authors(authors.clone())
-        .with_redirects(redirects.clone());
+        .with_redirects(redirects.clone())
+        .with_theme(theme.clone());
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
     // The same plugin host is the custom-block renderer AND the hook dispatcher

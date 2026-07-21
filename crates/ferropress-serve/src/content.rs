@@ -59,6 +59,16 @@ pub fn default_theme() -> Result<ThemeEngine, ThemeError> {
     crate::themes::build_theme(ferropress_render_form::DEFAULT_THEME)
 }
 
+/// A [`ThemeHandle`](crate::ThemeHandle) seeded with the **default** theme — the test /
+/// pre-settings seam paralleling [`default_theme`]. The composition root instead seeds the
+/// handle with the theme named by the live `appearance.theme` setting. There is deliberately
+/// no `impl Default for ThemeHandle`: building a theme is fallible, so the constructor stays
+/// honest (a `Result`) rather than papering over a parse failure with a panic in `Default`.
+pub fn default_theme_handle() -> Result<crate::themes::ThemeHandle, ThemeError> {
+    let id = ferropress_render_form::DEFAULT_THEME;
+    Ok(crate::themes::ThemeHandle::new(id, default_theme()?))
+}
+
 /// Outcome of resolving a request path to a fully rendered HTML document.
 ///
 /// The HTTP layer maps these to status codes (`Found` -> 200, `NotFound` -> 404,

@@ -94,7 +94,7 @@ fn boot_state(dir: &Path) -> (Arc<dyn RhypeStore>, AppState) {
         Arc::new(EmbeddedStore::open(dir.join("db")).expect("open embedded store"));
     let blobs = Arc::new(LocalFsBlobStore::new(dir.join("blobs")));
     // The EXACT chrome the server boots — not a test-local template.
-    let theme = Arc::new(ferropress_serve::default_theme().expect("default theme builds"));
+    let theme = ferropress_serve::default_theme_handle().expect("default theme builds");
     let state = AppState::new(Arc::clone(&store), blobs, theme);
     (store, state)
 }
@@ -416,7 +416,7 @@ async fn serves_wiki_block_resolving_links_via_capability() {
         Arc::new(EmbeddedStore::open(tmp.path().join("db")).expect("open embedded store"));
     let store: Arc<dyn RhypeStore> = store_concrete.clone();
     let blobs = Arc::new(LocalFsBlobStore::new(tmp.path().join("blobs")));
-    let theme = Arc::new(ferropress_serve::default_theme().expect("default theme builds"));
+    let theme = ferropress_serve::default_theme_handle().expect("default theme builds");
 
     // A real plugin host loaded from plugins/dist (wiki's plugin.toml grants
     // read_store; callout's grants plugin_settings), with the embedded store backing

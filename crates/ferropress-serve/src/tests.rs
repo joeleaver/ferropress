@@ -100,7 +100,12 @@ fn change(kind: ChangeKind, id: ObjectId) -> Change {
 
 /// Seed one `Setting` row, matching how the admin API stores them: `value` is a
 /// JSON-encoded String (so a string setting is passed here quoted, e.g. `"\"x\""`).
-async fn seed_setting(store: &Arc<dyn RhypeStore>, key: &str, json_encoded_value: &str) {
+/// Returns the new row's id so a test can later `delete` it (most callers ignore it).
+async fn seed_setting(
+    store: &Arc<dyn RhypeStore>,
+    key: &str,
+    json_encoded_value: &str,
+) -> ObjectId {
     let mut fields: HashMap<String, Value> = HashMap::new();
     fields.insert("key".to_owned(), Value::String(key.to_owned()));
     fields.insert(
@@ -111,7 +116,7 @@ async fn seed_setting(store: &Arc<dyn RhypeStore>, key: &str, json_encoded_value
     store
         .create(&TypeName::from(SETTING_TYPE), fields)
         .await
-        .expect("seeding a setting must succeed");
+        .expect("seeding a setting must succeed")
 }
 
 /// Seed one Page with the given slug + status + a single-paragraph body carrying
@@ -300,6 +305,183 @@ async fn regen_loop_refreshes_settings_snapshot_on_setting_change() {
 
     // The read path's handle now sees the new value — no cache regeneration.
     assert_eq!(handle.current().title, "Live Title");
+}
+
+/// A minimal `HomeCtx`-shaped context (see `content.rs` / `themes.rs`) as JSON, enough to
+/// render `home.html` so a test can assert *which* theme framed it (by a theme-only marker).
+fn minimal_home_ctx() -> serde_json::Value {
+    serde_json::json!({
+        "page_title": "Home",
+        "page_description": null,
+        "site": {"title": "Site", "tagline": "", "url": "", "logo": null, "noindex": false},
+        "is_home": true,
+        "preview_status": null,
+        "posts": []
+    })
+}
+
+/// A `Setting` change to `appearance.theme` rebuilds + swaps the live theme handle the read
+/// path frames pages with — with no restart. Because cached envelopes hold only theme-agnostic
+/// body HTML, this evicts nothing; the next request just re-frames the same body with the new
+/// theme. The twin of [`regen_loop_refreshes_settings_snapshot_on_setting_change`] for the
+/// theme half of the `Setting` branch.
+#[tokio::test]
+async fn setting_change_swaps_the_live_theme() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    assert_eq!(theme.current_id(), ferropress_render_form::DEFAULT_THEME);
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()))
+    .with_theme(theme.clone());
+
+    // The admin writes appearance.theme=fellstone (JSON-encoded), then the change arrives.
+    seed_setting(&store, "appearance.theme", "\"fellstone\"").await;
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "appearance.theme",
+        ))
+        .await
+        .expect("a theme Setting change must apply cleanly");
+
+    // The shared handle now NAMES and RENDERS fellstone — no page regeneration involved.
+    assert_eq!(theme.current_id(), ferropress_render_form::THEME_FELLSTONE);
+    let home = theme
+        .current()
+        .render("home.html", &minimal_home_ctx())
+        .expect("home renders through the swapped theme");
+    assert!(
+        home.contains("Gowun Batang"),
+        "the live engine is now fellstone (its display face), not the default: {home}"
+    );
+}
+
+/// A live theme swap evicts NOTHING: cached page envelopes hold theme-agnostic body HTML, so
+/// switching theme must not touch the prerender cache. Guards the increment-2 no-page-eviction
+/// guardrail (and the doc-comment's explicit "this evicts nothing" claim) against a future edit
+/// that wires the swap to an eviction, or adds `appearance.*` to a `setting_reshapes_*` gate —
+/// either of which would ship green past the other three tests (they only check `current_id` /
+/// engine `Arc` identity / render output).
+#[tokio::test]
+async fn theme_swap_evicts_no_cached_page() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    // Warm a cached page envelope (any key in the permalink namespace).
+    let key = cache_key("/hello");
+    blobs
+        .put(&key, b"cached-envelope".to_vec())
+        .await
+        .expect("warming the cache must succeed");
+
+    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()))
+    .with_theme(theme.clone());
+
+    seed_setting(&store, "appearance.theme", "\"fellstone\"").await;
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "appearance.theme",
+        ))
+        .await
+        .expect("a theme Setting change must apply cleanly");
+
+    // The theme actually swapped…
+    assert_eq!(theme.current_id(), ferropress_render_form::THEME_FELLSTONE);
+    // …yet the warmed cache entry is untouched — a swap regenerates/evicts no page.
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "a theme swap must evict no cached page (envelopes are theme-agnostic)",
+    );
+}
+
+/// A `Setting` change that does NOT alter `appearance.theme` (here `site.title`) leaves the
+/// live theme untouched — the id comparison short-circuits, so the engine is NOT rebuilt (the
+/// `Arc` is pointer-identical before and after).
+#[tokio::test]
+async fn non_theme_setting_change_does_not_rebuild_the_theme() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    let before = theme.current(); // capture the current engine's Arc identity
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()))
+    .with_theme(theme.clone());
+
+    seed_setting(&store, "site.title", "\"Live Title\"").await;
+    engine
+        .apply_change(&setting_change_with_key(ChangeKind::Update, "site.title"))
+        .await
+        .expect("a non-theme Setting change must apply cleanly");
+
+    // appearance.theme is unchanged (still the default), so the engine is NOT rebuilt.
+    assert_eq!(theme.current_id(), ferropress_render_form::DEFAULT_THEME);
+    assert!(
+        Arc::ptr_eq(&before, &theme.current()),
+        "the theme engine must not be rebuilt when appearance.theme did not change",
+    );
+}
+
+/// Deleting the `appearance.theme` row reverts the live theme to the default: the reload sees
+/// the row gone, `SiteSettings.theme` falls back to `DEFAULT_THEME`, and the id comparison
+/// rebuilds the default engine — a theme "unset" is a real state, not a stuck override.
+#[tokio::test]
+async fn deleting_the_theme_setting_reverts_to_the_default_theme() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, blobs, _) = boot(tmp.path());
+
+    let theme = crate::default_theme_handle().expect("default theme handle builds");
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(SiteSettings::defaults()))
+    .with_theme(theme.clone());
+
+    // Switch to fellstone first…
+    let setting_id = seed_setting(&store, "appearance.theme", "\"fellstone\"").await;
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "appearance.theme",
+        ))
+        .await
+        .expect("the theme switch must apply");
+    assert_eq!(theme.current_id(), ferropress_render_form::THEME_FELLSTONE);
+
+    // …then delete the row; the reload no longer sees it, so the theme reverts to default.
+    store
+        .delete(&TypeName::from(SETTING_TYPE), setting_id)
+        .await
+        .expect("deleting the setting row");
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Delete,
+            "appearance.theme",
+        ))
+        .await
+        .expect("a theme Setting delete must apply cleanly");
+    assert_eq!(theme.current_id(), ferropress_render_form::DEFAULT_THEME);
 }
 
 /// On a cache MISS, `serve_path` renders the published post AND populates the

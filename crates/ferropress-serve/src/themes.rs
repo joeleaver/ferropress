@@ -16,13 +16,80 @@
 //! Adding a theme = a new id + label in `ferropress_render_form` (the Appearance
 //! picker's single source of truth) and a matching [`ThemeDef`] here.
 
+use std::sync::Arc;
+
 use ferropress_render_form::THEME_FELLSTONE;
 use ferropress_theme::{SandboxLimits, ThemeEngine, ThemeError};
+use parking_lot::RwLock;
 
 use crate::templates::{
     BASE_SRC, BASE_TEMPLATE, HOME_SRC, HOME_TEMPLATE, PAGE_WIDE_SRC, PAGE_WIDE_TEMPLATE,
     SINGLE_SRC, SINGLE_TEMPLATE,
 };
+
+/// The current live theme: the built [`ThemeEngine`] paired with the `appearance.theme`
+/// id it was built from. The id is kept so the regen loop can rebuild the engine ONLY
+/// when the active theme actually changes, not on every `Setting` write.
+struct ThemeState {
+    /// The **requested** `appearance.theme` id this engine was built for — used solely
+    /// for change-detection. It may differ from the theme actually rendered: an unknown
+    /// id resolves to the default theme via [`theme_def`], yet the requested id is stored
+    /// verbatim so that later fixing the typo is re-detected as a change (self-healing).
+    /// Do NOT read it as "the theme currently on screen".
+    id: String,
+    engine: Arc<ThemeEngine>,
+}
+
+/// A cheaply-cloneable handle to the current live public [`ThemeEngine`], shared between
+/// the HTTP read path (which frames every page) and the [`ServeEngine`](crate::ServeEngine)
+/// regen loop (which rebuilds + swaps it when `appearance.theme` changes). This makes a
+/// theme switch take effect with no restart and — because cached page envelopes hold only
+/// theme-agnostic body HTML (chrome is composed live) — with no page-cache eviction.
+///
+/// Mirrors [`SettingsHandle`](crate::SettingsHandle): reads clone the inner `Arc` under a
+/// short read lock; a swap replaces it under a short write lock. The engine is read on every
+/// request and rebuilt only on a (rare) theme change, so a plain `RwLock` is ample. Holding
+/// the cloned `Arc` for the duration of one render means a concurrent swap can never tear an
+/// in-flight render — it keeps its engine; the next request sees the new one.
+///
+/// The [`current_id`](Self::current_id) → build → [`set`](Self::set) sequence the regen loop
+/// runs is race-free ONLY because that loop is the SOLE writer (the same single-consumer
+/// assumption the settings/authors/redirects handles already rely on). Parallelizing the
+/// consumer would need a compare-and-swap here instead.
+#[derive(Clone)]
+pub struct ThemeHandle(Arc<RwLock<ThemeState>>);
+
+impl ThemeHandle {
+    /// Seed the handle with the theme built for `id` (at startup, from the live
+    /// `appearance.theme` setting).
+    pub fn new(id: impl Into<String>, engine: ThemeEngine) -> Self {
+        Self(Arc::new(RwLock::new(ThemeState {
+            id: id.into(),
+            engine: Arc::new(engine),
+        })))
+    }
+
+    /// The current built theme engine. Cloning the `Arc` is cheap; hold it for the
+    /// duration of one render.
+    pub fn current(&self) -> Arc<ThemeEngine> {
+        Arc::clone(&self.0.read().engine)
+    }
+
+    /// The `appearance.theme` id the current engine was built from — for change-detection
+    /// (see [`ThemeState::id`]; it names the *requested* theme, which may differ from the
+    /// rendered one when the id is unknown).
+    pub fn current_id(&self) -> String {
+        self.0.read().id.clone()
+    }
+
+    /// Replace the current theme (called by the regen loop on an `appearance.theme`
+    /// change). Swaps the id and the engine together under one write lock.
+    pub fn set(&self, id: impl Into<String>, engine: ThemeEngine) {
+        let mut state = self.0.write();
+        state.id = id.into();
+        state.engine = Arc::new(engine);
+    }
+}
 
 /// A public theme: the four template sources registered under the canonical
 /// template names. The context contract + template names are shared, so a theme is

@@ -31,8 +31,7 @@ use ferropress_core::ports::BlobStore;
 use ferropress_core::store::RhypeStore;
 use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
 use ferropress_render_form::{NoPlugins, PluginCatalog};
-use ferropress_serve::{AuthorsHandle, RedirectHandle, Resolved, SettingsHandle};
-use ferropress_theme::ThemeEngine;
+use ferropress_serve::{AuthorsHandle, RedirectHandle, Resolved, SettingsHandle, ThemeHandle};
 
 pub mod admin;
 pub mod feed;
@@ -46,16 +45,21 @@ pub use admin::AdminConfig;
 /// (the theme host). The router itself is owned.
 ///
 /// `ThemeEngine` is not `Clone` and registering its templates per-request is
-/// wasteful, so it is built once at boot and shared as an `Arc`.
+/// wasteful, so it is built once at boot and held in a live [`ThemeHandle`] — an
+/// `Arc`-swapped engine the read path clones per render and the regen loop rebuilds
+/// on an `appearance.theme` change, so a theme switch takes effect with no restart.
 #[derive(Clone)]
 pub struct AppState {
     /// The typed object store (page resolution + island API).
     pub store: Arc<dyn RhypeStore>,
     /// Prerendered HTML + media originals. (Hot path / media serving: TODO.)
     pub blobs: Arc<dyn BlobStore>,
-    /// The sandboxed MiniJinja chrome host, with the built-in page template
-    /// already registered. Shared read-only across handlers.
-    pub theme: Arc<ThemeEngine>,
+    /// The live public theme the read path frames pages with. The SAME handle is given to
+    /// the `ServeEngine` regen loop, which rebuilds + swaps it on an `appearance.theme`
+    /// change — so switching theme is reflected on the next request without a restart and
+    /// without page regeneration (envelopes hold theme-agnostic body HTML; the theme chrome
+    /// is composed live). Cloned per render via [`ThemeHandle::current`].
+    pub theme: ThemeHandle,
     /// The live site-settings snapshot the public read path composes chrome from.
     /// The SAME handle is given to the `ServeEngine` regen loop, which refreshes it
     /// on a `Setting` change — so a settings edit is reflected on the public site
@@ -107,11 +111,7 @@ impl AppState {
     /// Assemble the shared state from the injected ports + theme host. Island asset
     /// serving is off until [`with_islands_dir`](Self::with_islands_dir); custom
     /// blocks render as placeholders until [`with_custom_renderer`](Self::with_custom_renderer).
-    pub fn new(
-        store: Arc<dyn RhypeStore>,
-        blobs: Arc<dyn BlobStore>,
-        theme: Arc<ThemeEngine>,
-    ) -> Self {
+    pub fn new(store: Arc<dyn RhypeStore>, blobs: Arc<dyn BlobStore>, theme: ThemeHandle) -> Self {
         Self {
             store,
             blobs,
@@ -321,7 +321,7 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
     match ferropress_serve::serve_path(
         &state.store,
         &state.blobs,
-        &state.theme,
+        &state.theme.current(),
         state.custom.as_ref(),
         &state.settings.current(),
         &state.authors.current(),
