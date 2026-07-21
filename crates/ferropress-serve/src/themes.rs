@@ -525,6 +525,51 @@ mod tests {
     }
 
     #[test]
+    fn builtin_nav_renders_apg_disclosure_and_no_aria_haspopup() {
+        // The sample nav's "Guides" is a label-only PARENT (href:null, one child) — the exact WP
+        // shape the a11y fix targets. In the PRIMARY (flyout) nav it must become a focusable
+        // disclosure <button aria-expanded aria-controls>, and its child <ul> must carry that id.
+        let engine = ThemeRegistry::builtin().build(DEFAULT_THEME).unwrap();
+        let html = engine
+            .render("home.html", &sample_context(true, serde_json::json!([])))
+            .expect("home renders");
+
+        // aria-haspopup is semantically wrong for a CSS/JS flyout of links — it must appear NOWHERE.
+        assert!(
+            !html.contains("aria-haspopup"),
+            "nav must not assert a role=menu widget via aria-haspopup"
+        );
+        // The label-only parent is a disclosure button controlling its submenu list.
+        assert!(
+            html.contains("class=\"navtree__label navsub-toggle\"")
+                && html.contains("aria-expanded=\"false\"")
+                && html.contains("aria-controls=\"nav-primary-2\""),
+            "the label-only primary parent renders an APG disclosure button: {html}"
+        );
+        assert!(
+            html.contains("<ul class=\"navtree\" id=\"nav-primary-2\">"),
+            "the controlled submenu <ul> carries the aria-controls id: {html}"
+        );
+        // Progressive enhancement: the fp-js gate + the disclosure controller ship in the page.
+        assert!(
+            html.contains("html:not(.fp-js)") && html.contains("classList.add('fp-js')"),
+            "the no-JS fallback gate + JS controller are present"
+        );
+        // The FOOTER nav (flyout=false) gets NO disclosure buttons — its submenus render inline.
+        // Bound the slice to the footer <nav>…</nav> only: the CSS `.colophon-nav` rule (in <head>)
+        // and the JS controller (`.navsub-toggle`, after the footer) both mention the class.
+        let f_start = html
+            .find("aria-label=\"Footer\"")
+            .expect("footer nav present");
+        let f_end = f_start + html[f_start..].find("</nav>").expect("footer nav closes");
+        let footer = &html[f_start..f_end];
+        assert!(
+            !footer.contains("navsub-toggle"),
+            "footer nav must not emit disclosure toggles"
+        );
+    }
+
+    #[test]
     fn load_dir_missing_is_builtin_only() {
         let reg = ThemeRegistry::load_dir(Path::new("/no/such/themes/dir"));
         assert_eq!(reg.choices().len(), 1);

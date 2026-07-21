@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferropress nav — APG Disclosure Navigation mockup</title>
+<!--
+  DESIGN + VERIFY the ARIA Authoring-Practices "Disclosure Navigation Menu (with top-level
+  links)" pattern for the public nav flyout, BEFORE porting the markup+JS to the two MiniJinja
+  themes (letterpress crates/ferropress-serve/src/templates.rs; fellstone
+  /home/joe/dev/fellstone-site/theme/fellstone/base.html).
+
+  Contract this proves:
+   - A submenu parent exposes a <button aria-expanded aria-controls> disclosure (label-only
+     parents ARE the button; linked parents get a companion button beside the <a>).
+   - Submenu reveals on :hover / :focus-within / [aria-expanded="true"] (works WITHOUT JS —
+     graceful degradation), and JS keeps aria-expanded TRUTHFUL across hover / focus / click.
+   - Escape closes the open submenu and returns focus to its button.
+   - Click outside closes. No lying aria-expanded, no role=menu (this is site nav, not a menu widget).
+   - Leaves are plain <a>. The footer (inline, always-visible submenus) uses NO disclosure buttons.
+-->
+<style>
+  :root { --paper:#F4F1E9; --ink:#1c1b19; --ink-2:#3a3733; --steel:#6b6560; --steel-2:#9a938a;
+    --minium:#b8462f; --rule:#d9d3c7; --paper-raise:#faf8f2; --radius:8px;
+    --shadow:0 8px 30px rgba(0,0,0,.14); --ff-ui:system-ui,sans-serif; --ff-mono:ui-monospace,monospace; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--paper); color:var(--ink); font-family:var(--ff-ui); padding:2rem; }
+  .gauge { max-width:64rem; margin:0 auto; }
+  h1 { font-size:1.2rem; }
+  .hint { font-family:var(--ff-mono); font-size:.8rem; color:var(--steel); margin:0 0 1.5rem; }
+
+  /* ── nav (mirrors letterpress .mastnav) ─────────────────────────────── */
+  .mastnav { display:flex; align-items:center; justify-content:center; flex-wrap:wrap;
+    gap:1.2rem; margin:1.5rem 0; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule);
+    padding:.9rem 0; }
+  .mastnav a, .navtree__label { font-family:var(--ff-ui); font-size:.82rem; font-weight:600;
+    letter-spacing:.09em; text-transform:uppercase; color:var(--steel); text-decoration:none;
+    padding:.15rem 0; border-bottom:1.5px solid transparent; background:none; border-top:0;
+    border-left:0; border-right:0; cursor:pointer; }
+  .mastnav a:hover, .navtree__label:hover { color:var(--ink); border-bottom-color:var(--minium); }
+  .mastnav a[aria-current="page"] { color:var(--ink); border-bottom-color:var(--ink); }
+
+  .mastnav .navtree { list-style:none; margin:0; padding:0; display:flex; flex-wrap:wrap;
+    align-items:center; justify-content:center; gap:1.2rem; }
+  .mastnav .navtree li { position:relative; display:inline-flex; align-items:center; gap:.15rem; }
+
+  /* disclosure toggle button */
+  .navsub-toggle { display:inline-flex; align-items:center; justify-content:center;
+    min-width:24px; min-height:24px; padding:0 .1rem; background:none; border:1px solid transparent;
+    border-radius:4px; color:var(--steel); cursor:pointer; }
+  .navsub-toggle:hover { color:var(--ink); }
+  .navsub-toggle:focus-visible { outline:2px solid var(--minium); outline-offset:2px; }
+  .navsub-toggle svg { transition:transform .15s; }
+  .navsub-toggle[aria-expanded="true"] svg { transform:rotate(180deg); }
+  /* a label-only parent: the button IS the label */
+  button.navtree__label { min-height:24px; }
+
+  /* the flyout submenu — hidden until revealed */
+  .mastnav .navtree .navtree { position:absolute; top:100%; left:50%; transform:translateX(-50%);
+    flex-direction:column; align-items:flex-start; gap:.6rem; min-width:12rem; margin-top:.55rem;
+    padding:.75rem .95rem; background:var(--paper-raise); border:1px solid var(--rule);
+    border-radius:var(--radius); box-shadow:var(--shadow); display:none; z-index:50; }
+  /* No-JS FALLBACK: reveal on hover / keyboard focus-within (aria-expanded can't be kept
+     truthful without JS, but the nested <ul> structure still conveys the submenu). */
+  html:not(.fp-js) .mastnav .navtree li:hover > .navtree,
+  html:not(.fp-js) .mastnav .navtree li:focus-within > .navtree { display:flex; }
+  /* JS path (the aria SOURCE OF TRUTH): reveal iff the toggle reports expanded. With JS active
+     the :focus-within/:hover rules above are disabled, so Escape (aria-expanded=false) truly
+     closes even while focus stays on the in-<li> button. JS syncs aria-expanded on hover too. */
+  .mastnav .navtree li > .navsub-toggle[aria-expanded="true"] + .navtree { display:flex; }
+
+  /* ── footer nav (inline, always-visible submenus, NO disclosure buttons) ── */
+  footer { margin-top:3rem; border-top:1px solid var(--rule); padding-top:1.4rem; }
+  .colophon-nav .navtree { list-style:none; margin:0; padding:0; display:flex; flex-wrap:wrap;
+    align-items:center; gap:1.3rem; }
+  .colophon-nav .navtree a { font-family:var(--ff-mono); font-size:.74rem; letter-spacing:.1em;
+    text-transform:uppercase; color:var(--steel); text-decoration:none; }
+  .colophon-nav .navtree .navtree { gap:.5rem; }
+
+  .log { margin-top:2rem; font-family:var(--ff-mono); font-size:.72rem; color:var(--steel);
+    white-space:pre-wrap; border-top:1px dashed var(--rule); padding-top:1rem; }
+</style>
+</head>
+<body>
+<div class="gauge">
+  <h1>Nav — APG Disclosure Navigation (with top-level links)</h1>
+  <p class="hint">Tab through: each submenu parent exposes a ▾ button (aria-expanded). Enter/Space toggles; Escape closes + refocuses the button; hover/focus also reveal (aria-expanded stays truthful). Leaves are plain links.</p>
+
+  <!-- PRIMARY nav = the flyout context (flyout=true). Rendered exactly as the ported macro will. -->
+  <nav class="mastnav" aria-label="Primary">
+    <ul class="navtree" id="nav-primary">
+      <!-- leaf: linked, no children -->
+      <li><a href="/">Home</a></li>
+
+      <!-- linked parent (has href AND children) → link + companion disclosure button -->
+      <li class="has-sub">
+        <a href="/the-world">The World</a>
+        <button type="button" class="navsub-toggle" aria-expanded="false" aria-controls="nav-primary-2" aria-label="Show submenu for The World">
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1 3l4 4 4-4" stroke="currentColor" stroke-width="1.4" fill="none"/></svg>
+        </button>
+        <ul class="navtree" id="nav-primary-2">
+          <li><a href="/the-world/geography">Geography</a></li>
+          <li><a href="/the-world/history">History</a></li>
+        </ul>
+      </li>
+
+      <!-- label-only parent (no href — an unresolvable parent kept as a grouping header) →
+           the button IS the label -->
+      <li class="has-sub">
+        <button type="button" class="navtree__label navsub-toggle" aria-expanded="false" aria-controls="nav-primary-3">
+          Guides
+          <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true" style="margin-left:.25rem"><path d="M1 3l4 4 4-4" stroke="currentColor" stroke-width="1.4" fill="none"/></svg>
+        </button>
+        <ul class="navtree" id="nav-primary-3">
+          <li><a href="/guides/start">Getting Started</a></li>
+          <!-- nested linked parent (two levels deep) -->
+          <li class="has-sub">
+            <a href="/guides/advanced">Advanced</a>
+            <button type="button" class="navsub-toggle" aria-expanded="false" aria-controls="nav-primary-3-2" aria-label="Show submenu for Advanced">
+              <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1 3l4 4 4-4" stroke="currentColor" stroke-width="1.4" fill="none"/></svg>
+            </button>
+            <ul class="navtree" id="nav-primary-3-2">
+              <li><a href="/guides/advanced/tricks">Tricks</a></li>
+            </ul>
+          </li>
+        </ul>
+      </li>
+
+      <!-- external leaf -->
+      <li><a href="https://example.com" target="_blank" rel="noopener noreferrer">External</a></li>
+    </ul>
+  </nav>
+
+  <!-- FOOTER nav = inline context (flyout=false): NO disclosure buttons, submenus always shown. -->
+  <footer>
+    <nav class="colophon-nav" aria-label="Footer">
+      <ul class="navtree">
+        <li><a href="/about">About</a></li>
+        <li>
+          <span class="navtree__label">Legal</span>
+          <ul class="navtree">
+            <li><a href="/privacy">Privacy</a></li>
+            <li><a href="/terms">Terms</a></li>
+          </ul>
+        </li>
+      </ul>
+    </nav>
+  </footer>
+
+  <div class="log" id="log">event log:\n</div>
+</div>
+
+<script>
+// ── The disclosure controller (this is what ports into base.html, verbatim in spirit) ──
+// Progressive enhancement: the CSS already reveals submenus on :hover/:focus-within, so the
+// nav is usable with JS disabled — this only makes aria-expanded TRUTHFUL and adds
+// click-toggle + Escape + click-outside. Scoped to flyout navs (data-fp-disclosure).
+// APG "Disclosure Navigation Menu (with top-level links)". Progressive enhancement: mark the
+// document so CSS switches from the no-JS hover/focus-within fallback to aria-expanded being the
+// SOLE visibility source. A submenu opens on button ACTIVATION (click / Enter / Space) or mouse
+// hover — NOT on plain keyboard focus (APG: a collapsed submenu is skipped by Tab; you activate
+// to enter it) — and closes on focus leaving the item, Escape (refocusing the button), or an
+// outside click.
+(function () {
+  document.documentElement.classList.add('fp-js');
+  var log = document.getElementById('log');
+  var say = function (m) { if (log) log.textContent += m + '\n'; };
+
+  function setExpanded(btn, open) {
+    if (!btn) return;
+    if ((btn.getAttribute('aria-expanded') === 'true') === open) return;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    say((open ? 'open  ' : 'close ') + '#' + (btn.getAttribute('aria-controls') || '?'));
+  }
+
+  var navs = document.querySelectorAll('[data-fp-disclosure], nav.mastnav');
+  navs.forEach(function (nav) {
+    nav.querySelectorAll('.navsub-toggle').forEach(function (btn) {
+      var li = btn.closest('li');
+      // Activation toggles (a native <button> gives Enter/Space + click for free).
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        setExpanded(btn, btn.getAttribute('aria-expanded') !== 'true');
+      });
+      // Mouse enhancement: hover opens; leaving closes unless focus is still inside.
+      li.addEventListener('pointerenter', function () { setExpanded(btn, true); });
+      li.addEventListener('pointerleave', function () {
+        if (!li.contains(document.activeElement)) setExpanded(btn, false);
+      });
+      // Tabbing focus OUT of the whole item closes it (deferred so activeElement settles).
+      // Note: we deliberately do NOT open on focusin — that would reopen right after Escape.
+      li.addEventListener('focusout', function () {
+        setTimeout(function () {
+          if (!li.contains(document.activeElement) && !li.matches(':hover')) setExpanded(btn, false);
+        }, 0);
+      });
+    });
+
+    // Escape closes the innermost open submenu and returns focus to its button.
+    nav.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      var open = nav.querySelectorAll('.navsub-toggle[aria-expanded="true"]');
+      if (!open.length) return;
+      var btn = open[open.length - 1];
+      setExpanded(btn, false);
+      btn.focus();
+      e.stopPropagation();
+    });
+  });
+
+  // An outside click closes every open submenu.
+  document.addEventListener('click', function (e) {
+    if (e.target.closest('nav.mastnav, [data-fp-disclosure]')) return;
+    document.querySelectorAll('nav.mastnav .navsub-toggle[aria-expanded="true"], [data-fp-disclosure] .navsub-toggle[aria-expanded="true"]')
+      .forEach(function (b) { b.setAttribute('aria-expanded', 'false'); });
+  });
+})();
+</script>
+</body>
+</html>

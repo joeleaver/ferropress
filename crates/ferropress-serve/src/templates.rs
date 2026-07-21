@@ -119,14 +119,28 @@ a { color: inherit; }
 /* Nav menus (masthead primary + footer) — a flat bar of links with hover/focus submenus. */
 .mastnav .navtree { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap;
   align-items: center; justify-content: center; gap: 1.2rem; }
-.mastnav .navtree li { position: relative; }
+.mastnav .navtree li { position: relative; display: inline-flex; align-items: center; gap: .1rem; }
 .navtree__label { font-family: var(--ff-ui); font-size: .78rem; font-weight: 600;
   letter-spacing: .09em; text-transform: uppercase; color: var(--steel-2); padding: .15rem 0; }
+button.navtree__label { border: 0; background: none; cursor: pointer; }
+/* Disclosure toggle for a submenu parent (APG Disclosure Navigation). >=24px hit target (WCAG 2.5.8). */
+.navsub-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 24px;
+  min-height: 24px; padding: 0; background: none; border: 1px solid transparent; border-radius: 3px;
+  color: var(--steel); cursor: pointer; }
+.navsub-toggle:hover { color: var(--ink); }
+.navsub-toggle:focus-visible { outline: 2px solid var(--minium); outline-offset: 2px; }
+.navsub-toggle svg { transition: transform .15s; }
+.navsub-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
 .mastnav .navtree .navtree { position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
   flex-direction: column; align-items: flex-start; gap: .6rem; min-width: 11rem; margin-top: .55rem;
   padding: .75rem .95rem; background: var(--paper-raise); border: 1px solid var(--rule);
   border-radius: var(--radius); box-shadow: var(--shadow); display: none; z-index: 50; }
-.mastnav .navtree li:hover > .navtree, .mastnav .navtree li:focus-within > .navtree { display: flex; }
+/* No-JS fallback: reveal on hover / keyboard focus-within. With JS, the controller adds `fp-js` to
+   <html>, disabling these so aria-expanded (kept truthful by the controller) is the sole reveal —
+   letting Escape close a submenu while focus stays on its in-<li> button. */
+html:not(.fp-js) .mastnav .navtree li:hover > .navtree,
+html:not(.fp-js) .mastnav .navtree li:focus-within > .navtree { display: flex; }
+.mastnav .navtree li > .navsub-toggle[aria-expanded="true"] + .navtree { display: flex; }
 .colophon-nav .navtree { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap;
   align-items: center; justify-content: center; gap: 1.3rem; }
 .colophon-nav .navtree a { font-family: var(--ff-mono); font-size: .72rem; font-weight: 500;
@@ -229,7 +243,7 @@ main { padding: 2.4rem 0 3rem; }
 {% endraw %}</style>
 </head>
 <body>
-{%- macro navtree(items) -%}<ul class="navtree">{% for item in items %}<li>{% if item.href %}<a href="{{ item.href }}"{% if item.aria_current %} aria-current="page"{% endif %}{% if item.new_tab %} target="_blank" rel="noopener noreferrer"{% endif %}>{{ item.label }}</a>{% else %}<span class="navtree__label">{{ item.label }}</span>{% endif %}{% if item.children %}{{ navtree(item.children) }}{% endif %}</li>{% endfor %}</ul>{%- endmacro -%}
+{%- macro navtree(items, listid, flyout) -%}<ul class="navtree"{% if listid and flyout %} id="{{ listid }}"{% endif %}>{% for item in items %}{% set subid = listid ~ "-" ~ loop.index %}<li{% if item.children and flyout %} class="has-sub"{% endif %}>{% if item.href %}<a href="{{ item.href }}"{% if item.aria_current %} aria-current="page"{% endif %}{% if item.new_tab %} target="_blank" rel="noopener noreferrer"{% endif %}>{{ item.label }}</a>{% if item.children and flyout %}<button type="button" class="navsub-toggle" aria-expanded="false" aria-controls="{{ subid }}" aria-label="Show submenu for {{ item.label }}"><svg width="9" height="9" viewBox="0 0 10 10" aria-hidden="true"><path d="M1 3l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></button>{% endif %}{% elif flyout and item.children %}<button type="button" class="navtree__label navsub-toggle" aria-expanded="false" aria-controls="{{ subid }}">{{ item.label }}<svg width="9" height="9" viewBox="0 0 10 10" aria-hidden="true" style="margin-left:.3rem"><path d="M1 3l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none"/></svg></button>{% else %}<span class="navtree__label">{{ item.label }}</span>{% endif %}{% if item.children %}{{ navtree(item.children, subid, flyout) }}{% endif %}</li>{% endfor %}</ul>{%- endmacro -%}
 <a class="skip" href="#main">Skip to content</a>
 {% if preview_status %}<div class="preview-bar" role="status"><span class="preview-bar__tag">Preview</span><span class="preview-bar__msg">{{ preview_status }} &middot; a private draft, not the public page</span></div>
 {% endif %}<div class="ruler" aria-hidden="true"></div>
@@ -241,8 +255,8 @@ main { padding: 2.4rem 0 3rem; }
     {% if site.logo %}<a href="/" class="nameplate nameplate--logo"><img src="{{ site.logo }}" alt="{{ site.title }}"></a>
     {% else %}<a href="/" class="nameplate">{{ site.title }}</a>
     {% endif %}{% if site.tagline %}<p class="tagline">{{ site.tagline }}</p>{% endif %}
-    <nav class="mastnav" aria-label="Primary">
-      {% if nav.primary %}{{ navtree(nav.primary) }}{% else %}<a href="/" {% if is_home %}aria-current="page"{% endif %}>Front page</a>{% endif %}
+    <nav class="mastnav" aria-label="Primary" data-fp-disclosure>
+      {% if nav.primary %}{{ navtree(nav.primary, "nav-primary", true) }}{% else %}<a href="/" {% if is_home %}aria-current="page"{% endif %}>Front page</a>{% endif %}
       <div id="fp-search"></div>
     </nav>
   </div>
@@ -256,13 +270,60 @@ main { padding: 2.4rem 0 3rem; }
 <footer class="colophon">
   <div class="ruler" aria-hidden="true" style="opacity:.35"></div>
   <div class="gauge">
-    {% if nav.footer %}<nav class="colophon-nav" aria-label="Footer">{{ navtree(nav.footer) }}</nav>
+    {% if nav.footer %}<nav class="colophon-nav" aria-label="Footer">{{ navtree(nav.footer, "nav-footer", false) }}</nav>
     {% else %}<div class="colophon__inner">
       <span class="colophon__mark"><span class="regmark"><svg width="13" height="13" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="6.2" stroke="currentColor" stroke-width="1.6"/><path d="M10 1.5v5M10 13.5v5M1.5 10h5M13.5 10h5" stroke="currentColor" stroke-width="1.6"/></svg></span> &copy; {{ site.title }}</span>
       <span>Set in Ferropress</span>
     </div>{% endif %}
   </div>
 </footer>
+<script>{% raw %}
+/* APG "Disclosure Navigation Menu (with top-level links)" controller. Progressive enhancement:
+   marks <html> `fp-js` so the stylesheet switches from the no-JS hover/focus-within fallback to
+   aria-expanded being the sole reveal. A submenu opens on button ACTIVATION (click/Enter/Space) or
+   mouse hover — never on plain keyboard focus (a collapsed submenu is Tab-skipped; you activate to
+   enter) — and closes on focus leaving the item, Escape (refocusing the button), or an outside click. */
+(function () {
+  document.documentElement.classList.add('fp-js');
+  function setExpanded(btn, open) {
+    if (!btn || (btn.getAttribute('aria-expanded') === 'true') === open) return;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  document.querySelectorAll('[data-fp-disclosure]').forEach(function (nav) {
+    nav.querySelectorAll('.navsub-toggle').forEach(function (btn) {
+      var li = btn.closest('li');
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        setExpanded(btn, btn.getAttribute('aria-expanded') !== 'true');
+      });
+      li.addEventListener('pointerenter', function () { setExpanded(btn, true); });
+      li.addEventListener('pointerleave', function () {
+        if (!li.contains(document.activeElement)) setExpanded(btn, false);
+      });
+      li.addEventListener('focusout', function () {
+        setTimeout(function () {
+          if (!li.contains(document.activeElement) && !li.matches(':hover')) setExpanded(btn, false);
+        }, 0);
+      });
+    });
+    nav.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      var open = nav.querySelectorAll('.navsub-toggle[aria-expanded="true"]');
+      if (!open.length) return;
+      var btn = open[open.length - 1];
+      setExpanded(btn, false);
+      btn.focus();
+      e.stopPropagation();
+    });
+  });
+  document.addEventListener('click', function (e) {
+    if (e.target.closest('[data-fp-disclosure]')) return;
+    document.querySelectorAll('[data-fp-disclosure] .navsub-toggle[aria-expanded="true"]').forEach(function (b) {
+      b.setAttribute('aria-expanded', 'false');
+    });
+  });
+})();
+{% endraw %}</script>
 <script type="module">
 import init from '/_fp/islands/ferropress_islands.js';
 init({ module_or_path: '/_fp/islands/ferropress_islands_bg.wasm' });
