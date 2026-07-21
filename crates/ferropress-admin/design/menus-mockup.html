@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ferropress · Menus (mockup)</title>
+<!--
+  HTML-first mockup for nav Increment 3 — the admin "Appearance → Menus" surface, in the
+  established "composing room" letterpress identity (tokens/classes lifted from
+  crates/ferropress-admin/src/styles.rs). Two jobs (CLAUDE.md §2):
+    1. Design the NEW `.menurow` tree-item + the link-candidate picker within the system.
+    2. VALIDATE the flat-with-depth reorder algorithm (move up/down/indent/outdent/add/
+       remove) interactively before porting the pure ops to rinch. The JS `tree` model +
+       ops below mirror what the rinch client will do to its structure signal.
+  The invariant this proves: rows are a pre-order sequence; row[0].depth==0; each row's
+  depth <= prev.depth+1; parent = nearest preceding row at depth-1. Every op preserves it.
+-->
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+:root{
+  --paper:#EEEFEA; --paper-sink:#E5E6E0; --paper-raise:#F5F6F1; --ink:#17191C; --ink-2:#383B40;
+  --steel:#6B6F76; --steel-2:#9CA0A6; --rule:#D3D4CD; --rule-ink:#2C2F34; --minium:#C23A18;
+  --minium-hi:#D6431E; --minium-deep:#9A2E11; --ochre:#8A6412; --green:#2E6A4E; --steel-tag:#566069;
+  --radius:3px; --shadow:0 1px 0 var(--rule),0 12px 32px -20px rgba(23,25,28,.4);
+  --ff-display:"Zilla Slab",Georgia,serif; --ff-ui:"IBM Plex Sans",system-ui,sans-serif; --ff-mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important} /* author rule beats a display:grid/flex class on a hidden node */
+body{margin:0;background:var(--paper);color:var(--ink-2);font-family:var(--ff-ui);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+button{font-family:inherit;cursor:pointer}
+.ruler{height:6px;background-image:repeating-linear-gradient(90deg,var(--rule-ink) 0 1px,transparent 1px 12px);opacity:.5}
+.regmark{display:inline-flex;align-items:center;color:var(--minium)}
+.masthead{background:var(--ink);color:#E7E8E2;border-bottom:1px solid #000}
+.masthead__bar{display:flex;align-items:center;gap:1rem;padding:0 1.25rem;height:52px;max-width:68rem;margin:0 auto}
+.masthead__brand{display:flex;align-items:center;gap:.5rem;font-family:var(--ff-display);font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:1.02rem;color:#F3F4EE}
+.masthead__sep{color:#4A4D53}
+.masthead__here{color:#A9ADB2;font-weight:500;font-size:.9rem}
+.masthead__spacer{flex:1}
+.masthead .btn--quiet{color:#A9ADB2}
+.masthead .btn--quiet:hover{color:#fff}
+.wrap{max-width:68rem;margin:0 auto;padding:2rem 1.25rem 4rem}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;padding:.5rem 1rem;border:1px solid transparent;border-radius:var(--radius);font-weight:600;font-size:.92rem}
+.btn:active{transform:translateY(1px)}
+.btn--primary{background:var(--minium);color:#FCF6F2;box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 1px 0 var(--minium-deep)}
+.btn--primary:hover{background:var(--minium-hi)}
+.btn--ghost{background:transparent;color:var(--ink-2);border-color:var(--rule)}
+.btn--ghost:hover{background:var(--paper-sink);border-color:var(--steel-2)}
+.btn--quiet{background:transparent;color:var(--steel);padding:.4rem .5rem}
+.btn--quiet:hover{color:var(--ink)}
+.btn--danger{background:transparent;color:var(--minium-deep);border-color:#D8C4BC}
+.btn--danger:hover{background:#F3E7E2;border-color:var(--minium)}
+
+.galley__head{display:flex;align-items:baseline;justify-content:space-between;border-bottom:2px solid var(--ink);padding-bottom:.6rem;margin-bottom:1rem}
+.galley__title{font-family:var(--ff-display);font-weight:600;font-size:1.7rem;color:var(--ink);margin:0}
+.galley__count{font-family:var(--ff-mono);font-size:.78rem;letter-spacing:.1em;text-transform:uppercase;color:var(--steel)}
+
+.panel{background:var(--paper-raise);border:1px solid var(--rule);border-radius:var(--radius);box-shadow:var(--shadow);padding:1.2rem 1.4rem;margin-bottom:1.5rem}
+.panel__title{font-family:var(--ff-display);font-weight:600;font-size:1.15rem;color:var(--ink);margin:0 0 .2rem;padding-bottom:.6rem;border-bottom:2px solid var(--ink)}
+.panel__note{margin:.5rem 0 0;font-size:.82rem;color:var(--steel)}
+
+.select{font-family:var(--ff-mono);font-size:.82rem;padding:.35rem 1.6rem .35rem .6rem;border:1px solid var(--rule);border-radius:var(--radius);color:var(--ink);
+  background:var(--paper-sink) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'><path d='M1 1l4 4 4-4' stroke='%236B6F76' stroke-width='1.5' fill='none'/></svg>") no-repeat right .55rem center;appearance:none;-webkit-appearance:none}
+.select:focus{outline:none;border-color:var(--minium)}
+.input{width:100%;padding:.45rem .6rem;background:var(--paper-sink);border:1px solid var(--rule);border-bottom:2px solid #C6C7C0;border-radius:var(--radius);color:var(--ink);font-family:var(--ff-ui);font-size:.92rem}
+.input:focus{outline:none;background:var(--paper-raise);border-color:var(--steel);border-bottom-color:var(--minium)}
+.input--mono{font-family:var(--ff-mono);font-size:.85rem}
+
+/* location assignment rows (settings-style set line) */
+.locrow{display:grid;grid-template-columns:14rem 1fr;gap:.4rem 1.4rem;align-items:center;padding:.8rem 0;border-bottom:1px solid var(--rule)}
+.locrow:last-child{border-bottom:0}
+.locrow__label{font-size:.8rem;font-weight:600;letter-spacing:.04em;color:var(--ink-2)}
+.locrow__label small{display:block;font-family:var(--ff-mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--steel);font-weight:500;margin-top:.15rem}
+.locrow--stranded .locrow__label{color:var(--ochre)}
+
+/* menu list rows */
+.mrow{display:grid;grid-template-columns:24px 1fr auto auto;align-items:center;gap:1rem;padding:.8rem .5rem;border-bottom:1px solid var(--rule);
+  width:100%;background:transparent;border-left:0;border-right:0;border-top:0;text-align:left;font:inherit;color:inherit}
+.mrow:hover{background:var(--paper-raise)}
+.mrow__mark{color:var(--minium);opacity:0}
+.mrow:hover .mrow__mark{opacity:1}
+.mrow__name{font-family:var(--ff-display);font-weight:500;font-size:1.12rem;color:var(--ink)}
+.mrow__slug{display:block;font-family:var(--ff-mono);font-size:.75rem;color:var(--steel);margin-top:.1rem}
+.mrow__count{font-family:var(--ff-mono);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:var(--steel)}
+.mrow__edit{font-size:.82rem;font-weight:600;color:var(--steel)}
+.mrow:hover .mrow__edit{color:var(--minium-deep)}
+
+/* ── THE TREE (.menurow) — the new component ─────────────────────────── */
+.tree{list-style:none;margin:1rem 0 0;padding:0}
+.menurow{display:grid;grid-template-columns:auto 1fr auto;gap:.75rem;align-items:start;
+  padding:.55rem .65rem;background:var(--paper-raise);border:1px solid var(--rule);border-radius:var(--radius);margin-bottom:.45rem;position:relative}
+.menurow.is-child::before{content:"";position:absolute;left:calc(-0.75rem + 2px);top:-.45rem;bottom:50%;width:1px;background:var(--rule)}
+.menurow__reorder{display:inline-flex;gap:2px;align-self:center}
+.rbtn{width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;background:transparent;border:1px solid var(--rule);border-radius:2px;color:var(--ink-2);font-size:.8rem;line-height:1}
+.rbtn:hover:not(.is-off){background:var(--paper-sink);border-color:var(--steel-2)}
+.rbtn.is-off{color:var(--steel-2);border-color:transparent;opacity:.4;cursor:default}
+.menurow__body{min-width:0;display:flex;flex-direction:column;gap:.3rem}
+.menurow__label{font-family:var(--ff-display);font-weight:500;font-size:1.02rem}
+.menurow__meta{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;font-family:var(--ff-mono);font-size:.72rem;color:var(--steel)}
+.tag{font-family:var(--ff-mono);font-size:.64rem;font-weight:500;letter-spacing:.1em;text-transform:uppercase;padding:.12rem .4rem;border-radius:2px;border:1.5px solid currentColor;white-space:nowrap}
+.tag--page{color:var(--green)}
+.tag--post{color:var(--steel-tag)}
+.tag--custom{color:var(--ochre)}
+.tag--term{color:var(--minium-deep);border-style:dashed}
+.menurow__href{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.menurow__warn{color:var(--minium-deep)}
+.menurow__actions{display:inline-flex;align-items:center;gap:.6rem;align-self:center}
+.xbtn{width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;background:transparent;border:1px solid transparent;border-radius:2px;color:var(--steel);font-size:1rem}
+.xbtn:hover{color:var(--minium-deep);border-color:#D8C4BC;background:#F3E7E2}
+
+/* mini toggle (form-view "switch" idiom, small) */
+.switch{display:inline-flex;align-items:center;gap:.45rem;cursor:pointer;font-family:var(--ff-mono);font-size:.66rem;letter-spacing:.06em;text-transform:uppercase;color:var(--steel)}
+.switch__track{position:relative;width:34px;height:19px;background:var(--paper-sink);border:1px solid #C6C7C0;border-radius:999px;transition:background .15s}
+.switch__knob{position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#FCFCF9;box-shadow:0 1px 2px rgba(23,25,28,.35);transition:transform .18s}
+.switch__track.is-on{background:var(--minium);border-color:var(--minium-deep)}
+.switch__track.is-on .switch__knob{transform:translateX(15px)}
+
+.editor__meta{display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap;padding-bottom:1rem;margin-bottom:.5rem;border-bottom:1px solid var(--rule)}
+.metaitem{display:flex;align-items:center;gap:.55rem}
+.metaitem>label{font-size:.7rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--steel)}
+.emptytree{padding:1.6rem;text-align:center;color:var(--steel);border:1px dashed var(--rule);border-radius:var(--radius)}
+
+/* picker modal (media-modal chrome) */
+.modal{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:2rem;background:rgba(23,25,28,.55)}
+.modal__plate{width:100%;max-width:40rem;max-height:82vh;display:flex;flex-direction:column;background:var(--paper-raise);border:1px solid var(--rule);border-radius:var(--radius);box-shadow:0 24px 60px -18px rgba(0,0,0,.55)}
+.modal__head{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;padding:1.1rem 1.3rem .7rem;border-bottom:2px solid var(--ink)}
+.modal__title{font-family:var(--ff-display);font-weight:600;font-size:1.25rem;color:var(--ink);margin:0}
+.modal__body{padding:1rem 1.3rem;overflow:auto}
+.modal__foot{display:flex;align-items:center;justify-content:flex-end;gap:.6rem;padding:.8rem 1.3rem;border-top:1px solid var(--rule)}
+.tabs{display:inline-flex;gap:.3rem;margin-bottom:.8rem}
+.tab{padding:.35rem .8rem;border:1px solid var(--rule);border-radius:2px;background:transparent;font-family:var(--ff-mono);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--steel)}
+.tab.is-on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.candidate{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;width:100%;text-align:left;padding:.5rem .6rem;background:transparent;border:0;border-bottom:1px solid var(--rule);color:inherit;font:inherit}
+.candidate:hover{background:var(--paper-sink)}
+.candidate__title{font-family:var(--ff-display);font-size:1rem;color:var(--ink)}
+.candidate__href{font-family:var(--ff-mono);font-size:.72rem;color:var(--steel)}
+.field{margin-bottom:.9rem}
+.field>label{display:block;font-size:.7rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--steel);margin-bottom:.35rem}
+.note{margin:.3rem 0 0;font-size:.8rem;color:var(--minium-deep)}
+.truncnote{font-family:var(--ff-mono);font-size:.72rem;color:var(--ochre);padding:.5rem .6rem}
+</style>
+</head>
+<body>
+<div class="ruler"></div>
+<header class="masthead">
+  <div class="masthead__bar">
+    <span class="masthead__brand"><span class="regmark" style="font-size:1.05rem">⊕</span> Ferropress</span>
+    <span class="masthead__sep">·</span>
+    <span class="masthead__here" id="crumb">Menus</span>
+    <span class="masthead__spacer"></span>
+    <button class="btn btn--quiet" id="navToggle">Toggle list ⇄ editor</button>
+    <button class="btn btn--primary" style="padding:.4rem .9rem" id="primaryBtn">＋ New menu</button>
+  </div>
+</header>
+
+<!-- ── VIEW: Menus list (cabinet) + Locations ─────────────────────────── -->
+<main class="wrap" id="listView">
+  <div class="panel">
+    <h2 class="panel__title">Locations</h2>
+    <div id="locations"></div>
+    <p class="panel__note">A location shows one menu; a menu can fill many locations. Clearing a location falls back to the theme default.</p>
+  </div>
+  <div class="galley__head">
+    <h2 class="galley__title">Menus</h2>
+    <span class="galley__count" id="menuCount"></span>
+  </div>
+  <div id="menuList"></div>
+</main>
+
+<!-- ── VIEW: Menu editor (the tree) ───────────────────────────────────── -->
+<main class="wrap" id="editorView" hidden>
+  <div class="editor__meta">
+    <div class="metaitem"><label>Name</label><input class="input" style="width:16rem" id="menuName" value="Primary Navigation"></div>
+    <div class="metaitem"><label>Slug</label><input class="input input--mono" style="width:12rem" id="menuSlug" value="primary-navigation"></div>
+    <span class="masthead__spacer" style="flex:1"></span>
+    <button class="btn btn--danger" id="deleteMenu">Delete menu</button>
+  </div>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin:.5rem 0 0">
+    <div class="galley__count" id="treeCount"></div>
+    <button class="btn btn--ghost" id="addItem">＋ Add item</button>
+  </div>
+  <ul class="tree" id="tree"></ul>
+  <div id="treeEmpty" class="emptytree" hidden>This menu is empty. Add a page, post, or custom link.</div>
+  <div style="margin-top:1.2rem;display:flex;gap:.6rem;align-items:center">
+    <button class="btn btn--primary" style="padding:.55rem 1.2rem" id="saveMenu">Save menu</button>
+    <span id="dirtyDot" style="font-family:var(--ff-mono);font-size:.72rem;color:var(--ochre)" hidden>● unsaved changes</span>
+  </div>
+</main>
+
+<!-- ── Picker modal ───────────────────────────────────────────────────── -->
+<div class="modal" id="picker" hidden>
+  <div class="modal__plate" role="dialog" aria-modal="true" aria-label="Add a menu item">
+    <div class="modal__head"><h3 class="modal__title">Add a menu item</h3><button class="btn btn--quiet" id="pickerX">✕</button></div>
+    <div class="modal__body">
+      <div class="tabs">
+        <button class="tab is-on" data-tab="pages">Pages</button>
+        <button class="tab" data-tab="posts">Posts</button>
+        <button class="tab" data-tab="custom">Custom link</button>
+      </div>
+      <div id="tabPages"></div>
+      <div id="tabPosts" hidden></div>
+      <div id="tabCustom" hidden>
+        <div class="field"><label>URL</label><input class="input input--mono" id="customUrl" placeholder="/free-reads or https://…"></div>
+        <div class="field"><label>Label</label><input class="input" id="customLabel" placeholder="Free Reads"></div>
+        <div class="note" id="customErr" hidden></div>
+        <button class="btn btn--primary" style="padding:.45rem 1rem" id="addCustom">Add custom link</button>
+      </div>
+    </div>
+    <div class="modal__foot"><button class="btn btn--ghost" id="pickerCancel">Done</button></div>
+  </div>
+</div>
+
+<script>
+// ── Fixtures mimicking GET /menus/link-candidates ─────────────────────────
+const CANDIDATES = {
+  pages: [
+    {kind:'page', id:11, title:'The World', href:'/the-world'},
+    {kind:'page', id:12, title:"Author's Bio", href:'/authors-bio'},
+    {kind:'page', id:13, title:'The Characters', href:'/the-characters'},
+    {kind:'page', id:14, title:'The Artist', href:'/the-artist'},
+  ],
+  posts: [
+    {kind:'post', id:31, title:'Book One is out', href:'/book-one-is-out'},
+    {kind:'post', id:32, title:'A giveaway', href:'/a-giveaway'},
+  ],
+  posts_truncated:false,
+};
+const MAX_MENU_DEPTH = 5; // ancestor count = ferropress_serve::MAX_NAV_DEPTH - 1
+
+// ── The flat-with-depth tree model (mirrors the rinch client's structure) ──
+// Each row: {cid, depth, label, kind, targetTitle, href, url, newTab}
+let nextCid = 0;
+const mkCid = () => 'n' + (nextCid++);
+let tree = [
+  row(0,'Home','custom',null,null,'/'),
+  row(0,'The World','page','The World','/the-world'),
+  row(1,'The Characters','page','The Characters','/the-characters'),
+  row(0,"Author's Blog",'custom',null,null,'/blog'),
+];
+function row(depth,label,kind,targetTitle,href,url){return {cid:mkCid(),depth,label,kind,targetTitle:targetTitle||'',href:href||null,url:url||'',newTab:false};}
+
+let dirty = false;
+function markDirty(){dirty=true;document.getElementById('dirtyDot').hidden=false;}
+
+// ── Subtree helpers ───────────────────────────────────────────────────────
+// subtree of row i = [i, k) where k = first index>i with depth<=depth[i]
+function subtreeEnd(i){const d=tree[i].depth;let k=i+1;while(k<tree.length&&tree[k].depth>d)k++;return k;}
+function maxDepthIn(i,k){let m=0;for(let j=i;j<k;j++)m=Math.max(m,tree[j].depth);return m;}
+// previous sibling start index, or -1
+function prevSibling(i){const d=tree[i].depth;for(let j=i-1;j>=0;j--){if(tree[j].depth<d)return -1;if(tree[j].depth===d)return j;}return -1;}
+// next sibling start index (== subtreeEnd if that row is same depth), or -1
+function nextSibling(i){const d=tree[i].depth;const k=subtreeEnd(i);if(k<tree.length&&tree[k].depth===d)return k;return -1;}
+
+function canMoveUp(i){return prevSibling(i)!==-1;}
+function canMoveDown(i){return nextSibling(i)!==-1;}
+function canIndent(i){const p=prevSibling(i);if(p===-1)return false;const k=subtreeEnd(i);return maxDepthIn(i,k)+1<=MAX_MENU_DEPTH;}
+function canOutdent(i){return tree[i].depth>0;}
+
+// ── Ops (each preserves the flat invariant by construction) ────────────────
+function moveUp(i){
+  const p=prevSibling(i); if(p===-1)return;
+  const k=subtreeEnd(i);              // this subtree = [i,k)
+  const block=tree.splice(i,k-i);     // remove it
+  tree.splice(p,0,...block);          // reinsert where the prev sibling started
+  markDirty();
+}
+function moveDown(i){
+  const n=nextSibling(i); if(n===-1)return;
+  const k=subtreeEnd(i);              // this subtree = [i,k) == [i,n)
+  const m=subtreeEnd(n);              // next sibling subtree = [n,m)
+  const mine=tree.slice(i,k), next=tree.slice(n,m);
+  tree.splice(i,m-i,...next,...mine); // swap the two blocks
+  markDirty();
+}
+function indent(i){
+  if(!canIndent(i))return;
+  const k=subtreeEnd(i);
+  for(let j=i;j<k;j++)tree[j].depth+=1; // whole subtree deepens by one
+  markDirty();
+}
+function outdent(i){
+  if(!canOutdent(i))return;
+  const k=subtreeEnd(i);
+  for(let j=i;j<k;j++)tree[j].depth-=1;
+  markDirty();
+}
+function removeRow(i){
+  const k=subtreeEnd(i);
+  const n=k-i-1; // descendants
+  if(n>0 && !confirm(`Remove “${tree[i].label||'(untitled)'}” and its ${n} sub-item${n===1?'':'s'}?`))return;
+  tree.splice(i,k-i);
+  markDirty();
+}
+function addItem(kind,title,href,url){
+  tree.push(row(0,kind==='custom'?(url||''):title,kind,title,href,url));
+  markDirty();
+}
+
+// validity check used by a self-test overlay
+function invariantOK(){
+  if(tree.length&&tree[0].depth!==0)return 'row0 depth!=0';
+  for(let i=1;i<tree.length;i++)if(tree[i].depth>tree[i-1].depth+1)return `row${i} depth ${tree[i].depth} > prev+1`;
+  for(const r of tree)if(r.depth<0||r.depth>MAX_MENU_DEPTH)return `depth out of range ${r.depth}`;
+  return 'OK';
+}
+
+// ── Render ────────────────────────────────────────────────────────────────
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function tagFor(kind){return {page:'tag tag--page',post:'tag tag--post',custom:'tag tag--custom',term:'tag tag--term'}[kind]||'tag';}
+function renderTree(){
+  const ul=document.getElementById('tree');
+  ul.innerHTML='';
+  document.getElementById('treeEmpty').hidden = tree.length>0;
+  document.getElementById('treeCount').textContent = tree.length? `${tree.length} item${tree.length===1?'':'s'}`:'';
+  tree.forEach((r,i)=>{
+    const li=document.createElement('li');
+    li.className='menurow'+(r.depth>0?' is-child':'');
+    li.style.marginLeft=(r.depth*1.5)+'rem';
+    const resolvedHref = r.kind==='custom'? r.url : r.href;
+    const willRender = r.kind==='custom' ? !!r.url : (r.kind==='page'||r.kind==='post') && !!r.href;
+    const metaHref = resolvedHref
+      ? `<span class="menurow__href">→ ${esc(resolvedHref)}</span>`
+      : `<span class="menurow__warn">→ won't render (unpublished/unlinkable)</span>`;
+    const off=(ok)=>ok?'':' is-off';
+    li.innerHTML=`
+      <span class="menurow__reorder">
+        <button class="rbtn${off(canMoveUp(i))}" data-op="up" data-i="${i}" aria-label="Move “${esc(r.label)}” up" title="Move up">↑</button>
+        <button class="rbtn${off(canMoveDown(i))}" data-op="down" data-i="${i}" aria-label="Move “${esc(r.label)}” down" title="Move down">↓</button>
+        <button class="rbtn${off(canOutdent(i))}" data-op="out" data-i="${i}" aria-label="Outdent “${esc(r.label)}”" title="Outdent">⇤</button>
+        <button class="rbtn${off(canIndent(i))}" data-op="in" data-i="${i}" aria-label="Indent “${esc(r.label)}”" title="Indent">⇥</button>
+      </span>
+      <span class="menurow__body">
+        <input class="input menurow__labelinput" data-i="${i}" value="${esc(r.label)}" placeholder="${esc(r.targetTitle||resolvedHref||'Label')}" aria-label="Label" style="font-family:var(--ff-display);max-width:22rem">
+        <span class="menurow__meta">
+          <span class="${tagFor(r.kind)}">${r.kind}</span>
+          ${r.kind==='custom'
+            ? `<input class="input input--mono menurow__urlinput" data-i="${i}" value="${esc(r.url)}" placeholder="/path" aria-label="URL" style="max-width:16rem;padding:.15rem .4rem">`
+            : `<span>${esc(r.targetTitle)}</span>`}
+          ${metaHref}
+        </span>
+      </span>
+      <span class="menurow__actions">
+        <label class="switch" title="Open in a new tab">
+          <input type="checkbox" ${r.newTab?'checked':''} data-i="${i}" class="menurow__newtab" style="position:absolute;opacity:0;width:0;height:0">
+          <span class="switch__track${r.newTab?' is-on':''}"><span class="switch__knob"></span></span>
+          new tab
+        </label>
+        <button class="xbtn" data-op="rm" data-i="${i}" aria-label="Remove “${esc(r.label)}”" title="Remove">✕</button>
+      </span>`;
+    ul.appendChild(li);
+  });
+  // self-test badge
+  let badge=document.getElementById('inv'); if(!badge){badge=document.createElement('div');badge.id='inv';badge.style.cssText='font-family:var(--ff-mono);font-size:.72rem;margin-top:.6rem;color:var(--green)';document.getElementById('editorView').appendChild(badge);}
+  const v=invariantOK(); badge.textContent='invariant: '+v; badge.style.color = v==='OK'?'var(--green)':'var(--minium-deep)';
+}
+function renderLocations(){
+  const locs=[
+    {location:'primary',label:'Primary Navigation',menu:'primary-navigation',declared:true},
+    {location:'footer',label:'Footer',menu:null,declared:true},
+    {location:'legacy-top',label:'legacy-top',menu:'old-menu',declared:false},
+  ];
+  const menus=[{slug:'primary-navigation',name:'Primary Navigation'},{slug:'old-menu',name:'Old Menu'}];
+  const el=document.getElementById('locations'); el.innerHTML='';
+  locs.forEach(l=>{
+    const div=document.createElement('div');
+    div.className='locrow'+(l.declared?'':' locrow--stranded');
+    const opts=['<option value="">— none —</option>',...menus.map(m=>`<option value="${m.slug}" ${m.slug===l.menu?'selected':''}>${esc(m.name)}</option>`)];
+    // out-of-vocab "(current)" fallback if the bound menu isn't in the list
+    if(l.menu && !menus.some(m=>m.slug===l.menu)) opts.push(`<option value="${l.menu}" selected>${esc(l.menu)} (current)</option>`);
+    div.innerHTML=`<div class="locrow__label">${esc(l.label)}${l.declared?'':'<small>theme no longer declares this</small>'}</div>
+      <div><select class="select">${opts.join('')}</select></div>`;
+    el.appendChild(div);
+  });
+}
+function renderMenuList(){
+  const menus=[{id:1,name:'Primary Navigation',slug:'primary-navigation',count:4},{id:2,name:'Footer Links',slug:'footer-links',count:3}];
+  document.getElementById('menuCount').textContent=`${menus.length} menus`;
+  const el=document.getElementById('menuList'); el.innerHTML='';
+  menus.forEach(m=>{
+    const b=document.createElement('button'); b.className='mrow';
+    b.innerHTML=`<span class="mrow__mark">⊕</span><span><span class="mrow__name">${esc(m.name)}</span><span class="mrow__slug">${esc(m.slug)}</span></span><span class="mrow__count">${m.count} items</span><span class="mrow__edit">Edit →</span>`;
+    b.onclick=()=>showEditor();
+    el.appendChild(b);
+  });
+}
+
+// ── Wiring ────────────────────────────────────────────────────────────────
+document.getElementById('tree').addEventListener('click',e=>{
+  const btn=e.target.closest('[data-op]'); if(!btn||btn.classList.contains('is-off'))return;
+  const i=+btn.dataset.i, op=btn.dataset.op;
+  ({up:moveUp,down:moveDown,in:indent,out:outdent,rm:removeRow}[op])(i);
+  renderTree();
+});
+document.getElementById('tree').addEventListener('input',e=>{
+  const i=+e.target.dataset.i; if(Number.isNaN(i))return;
+  if(e.target.classList.contains('menurow__labelinput')){tree[i].label=e.target.value;markDirty();}
+  else if(e.target.classList.contains('menurow__urlinput')){tree[i].url=e.target.value;markDirty();}
+  else if(e.target.classList.contains('menurow__newtab')){tree[i].newTab=e.target.checked;markDirty();renderTree();}
+});
+document.getElementById('addItem').onclick=()=>openPicker();
+document.getElementById('pickerX').onclick=document.getElementById('pickerCancel').onclick=()=>closePicker();
+document.getElementById('deleteMenu').onclick=()=>{ if(confirm('Delete “Primary Navigation”? It is bound to primary — the nav there will disappear.')) alert('(mock) deleted'); };
+document.getElementById('saveMenu').onclick=()=>{ dirty=false; document.getElementById('dirtyDot').hidden=true; alert('(mock) saved forest:\n'+JSON.stringify(tree.map(r=>({depth:r.depth,label:r.label,kind:r.kind})),null,1)); };
+document.getElementById('navToggle').onclick=()=>{ const l=document.getElementById('listView'); l.hidden=!l.hidden; document.getElementById('editorView').hidden=!document.getElementById('editorView').hidden; };
+document.getElementById('primaryBtn').onclick=()=>showEditor();
+function showEditor(){document.getElementById('listView').hidden=true;document.getElementById('editorView').hidden=false;document.getElementById('crumb').textContent='Primary Navigation';renderTree();}
+
+// picker
+let pickerTab='pages';
+function openPicker(){document.getElementById('picker').hidden=false;renderCandidates();document.querySelector('#tabCustom #customUrl')?.focus();}
+function closePicker(){document.getElementById('picker').hidden=true;}
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!document.getElementById('picker').hidden)closePicker();});
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{pickerTab=t.dataset.tab;document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('is-on',x===t));document.getElementById('tabPages').hidden=pickerTab!=='pages';document.getElementById('tabPosts').hidden=pickerTab!=='posts';document.getElementById('tabCustom').hidden=pickerTab!=='custom';});
+function renderCandidates(){
+  const mk=(list,elId)=>{const el=document.getElementById(elId);el.innerHTML='';list.forEach(c=>{const b=document.createElement('button');b.className='candidate';b.innerHTML=`<span class="candidate__title">${esc(c.title)}</span><span class="candidate__href">${esc(c.href)}</span>`;b.onclick=()=>{addItem(c.kind,c.title,c.href,null);renderTree();closePicker();};el.appendChild(b);});};
+  mk(CANDIDATES.pages,'tabPages');
+  mk(CANDIDATES.posts,'tabPosts');
+  if(CANDIDATES.posts_truncated){const n=document.createElement('div');n.className='truncnote';n.textContent='More posts exist — refine your search.';document.getElementById('tabPosts').appendChild(n);}
+}
+document.getElementById('addCustom').onclick=()=>{
+  const url=document.getElementById('customUrl').value.trim();
+  const err=document.getElementById('customErr');
+  // mirror ferropress_core::sanitize_href verdicts (whitespace vs scheme, distinct messages)
+  if(!url){err.textContent='Enter a URL.';err.hidden=false;return;}
+  if(/[\s\u0000-\u001f]/.test(url)){err.textContent="A URL can't contain spaces.";err.hidden=false;return;}
+  const scheme=(url.match(/^([a-z][a-z0-9+.-]*):/i)||[])[1];
+  if(scheme && !['http','https','mailto','tel'].includes(scheme.toLowerCase())){err.textContent='Use an http(s), mailto, tel, or site-relative link.';err.hidden=false;return;}
+  if(url.startsWith('//')){err.textContent='Use an http(s), mailto, tel, or site-relative link.';err.hidden=false;return;}
+  err.hidden=true;
+  addItem('custom',null,null,url);
+  document.getElementById('customUrl').value='';document.getElementById('customLabel').value='';
+  renderTree();closePicker();
+};
+
+renderLocations();renderMenuList();renderTree();
+// ── test hooks (fuzz the pure ops from the console) ───────────────────────
+window.__t={
+  get tree(){return tree;}, set tree(t){tree=t;},
+  invariant:invariantOK, subtreeEnd, prevSibling, nextSibling,
+  moveUp, moveDown, indent, outdent,
+  canMoveUp, canMoveDown, canIndent, canOutdent,
+  removeSub:(i)=>{const k=subtreeEnd(i);tree.splice(i,k-i);}, // confirm-free remove for fuzzing
+  addItem, row, mkCid,
+};
+</script>
+</body>
+</html>

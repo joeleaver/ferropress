@@ -646,6 +646,306 @@ pub async fn put_plugin_settings(
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
+// ── nav menus ────────────────────────────────────────────────────────────────────
+//
+// The menu editor's DTOs mirror `ferropress-http/src/admin/menus.rs`. The item
+// `target` REUSES `ferropress_core::LinkTarget` directly (the admin crate already deps
+// core) rather than a hand-mirrored enum, so the tagged JSON can't drift and a `Term`
+// (or any future variant) round-trips through GET→edit→PUT unchanged. The whole-tree PUT
+// returns the reconciled [`MenuDetail`] (authoritative) — the editor re-seeds from it.
+
+pub use ferropress_core::LinkTarget;
+
+/// One row of `GET /admin/api/menus`.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct MenuSummary {
+    pub id: u64,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub item_count: usize,
+}
+
+/// The lightweight menu identity from create/update (and embedded in a location row).
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct MenuRef {
+    pub id: u64,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A menu item's server-resolved DISPLAY: the target's title (always) + its public href
+/// (`Some` only when it currently resolves — `None` = won't render in the live nav). A
+/// `Custom` item carries none (its URL is the target). Output-only from the server.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct ResolvedTarget {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub href: Option<String>,
+}
+
+/// One menu item on the wire — the GET response shape AND the whole-tree PUT body.
+/// `id` present = an existing item; `client_id` is the payload-stable handle a child
+/// references via `parent_client_id`. `resolved` is server→client only (skipped on a PUT).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct MenuItemNode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_client_id: Option<String>,
+    pub label: String,
+    pub target: LinkTarget,
+    #[serde(default)]
+    pub new_tab: bool,
+    /// Server-computed display sidecar — read from a GET/save response, never sent in a
+    /// PUT body (`skip_serializing`), so `ResolvedTarget` needs no `Serialize`.
+    #[serde(default, skip_serializing)]
+    pub resolved: Option<ResolvedTarget>,
+}
+
+/// `GET /admin/api/menus/{id}` (and the `PUT .../items` save response) — a menu + its
+/// item forest (flat, `(item_order, id)`-ordered; the client rebuilds nesting from
+/// `parent_client_id`).
+#[derive(Deserialize)]
+pub struct MenuDetail {
+    pub id: u64,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub items: Vec<MenuItemNode>,
+}
+
+/// One row of `GET /admin/api/menus/locations`: a theme location + the menu bound to it.
+/// `declared: false` marks a STRANDED assignment (a binding from a theme that declared a
+/// location the current one does not) — shown so it can still be cleared. (`Default` only
+/// to satisfy the rinch `#[component]` macro — `MenuLocationView` takes it as a prop.)
+#[derive(Clone, PartialEq, Default, Deserialize)]
+pub struct MenuLocationRow {
+    pub location: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub menu: Option<MenuRef>,
+    #[serde(default)]
+    pub declared: bool,
+}
+
+/// One pickable target from `GET /admin/api/menus/link-candidates` — a PUBLISHED Post or
+/// Page, with the href it will resolve to.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct LinkCandidate {
+    #[serde(default)]
+    pub kind: String,
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub href: String,
+}
+
+/// `GET /admin/api/menus/link-candidates` response: Pages in full, Posts as a bounded,
+/// searchable slice (`posts_truncated` when more exist).
+#[derive(Default, Clone, Deserialize)]
+pub struct LinkCandidates {
+    #[serde(default)]
+    pub pages: Vec<LinkCandidate>,
+    #[serde(default)]
+    pub posts: Vec<LinkCandidate>,
+    #[serde(default)]
+    pub posts_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct MenuNameBody<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slug: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct SaveItemsBody<'a> {
+    items: &'a [MenuItemNode],
+}
+
+#[derive(Serialize)]
+struct AssignLocationBody {
+    menu_id: Option<u64>,
+}
+
+/// `GET /admin/api/menus` — every menu with its item count (Editor+; a 401 routes to login).
+pub async fn list_menus() -> Result<Vec<MenuSummary>, ApiError> {
+    let resp = Request::get("/admin/api/menus")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<Vec<MenuSummary>>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `GET /admin/api/menus/{id}` — one menu + its item forest, ready to edit.
+pub async fn get_menu(id: u64) -> Result<MenuDetail, ApiError> {
+    let resp = Request::get(&format!("/admin/api/menus/{id}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<MenuDetail>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `POST /admin/api/menus` — create a menu; returns its identity.
+pub async fn create_menu(name: &str, slug: Option<&str>) -> Result<MenuRef, ApiError> {
+    let built = Request::post("/admin/api/menus")
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&MenuNameBody { name, slug });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<MenuRef>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `PUT /admin/api/menus/{id}` — rename / re-slug a menu.
+pub async fn update_menu(id: u64, name: &str, slug: Option<&str>) -> Result<MenuRef, ApiError> {
+    let built = Request::put(&format!("/admin/api/menus/{id}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&MenuNameBody { name, slug });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<MenuRef>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `DELETE /admin/api/menus/{id}` — delete a menu (cascades its items + location bindings).
+pub async fn delete_menu(id: u64) -> Result<(), ApiError> {
+    let resp = Request::delete(&format!("/admin/api/menus/{id}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    Ok(())
+}
+
+/// `PUT /admin/api/menus/{id}/items` — reconcile the whole item forest; returns the
+/// reconciled [`MenuDetail`] (authoritative: every new item carries its real id).
+pub async fn save_menu_items(id: u64, items: &[MenuItemNode]) -> Result<MenuDetail, ApiError> {
+    let built = Request::put(&format!("/admin/api/menus/{id}/items"))
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&SaveItemsBody { items });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<MenuDetail>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `GET /admin/api/menus/locations` — theme locations + their current menu bindings.
+pub async fn list_menu_locations() -> Result<Vec<MenuLocationRow>, ApiError> {
+    let resp = Request::get("/admin/api/menus/locations")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<Vec<MenuLocationRow>>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `PUT /admin/api/menus/locations/{location}` — bind a menu to a location, or clear it
+/// (`menu_id` = None).
+pub async fn assign_location(location: &str, menu_id: Option<u64>) -> Result<(), ApiError> {
+    let built = Request::put(&format!("/admin/api/menus/locations/{location}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&AssignLocationBody { menu_id });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    Ok(())
+}
+
+/// `GET /admin/api/menus/link-candidates` — the published Post/Page targets for the "add
+/// item" picker (optionally search-filtered by `q`).
+pub async fn list_link_candidates(q: Option<&str>) -> Result<LinkCandidates, ApiError> {
+    let url = match q.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(q) => format!("/admin/api/menus/link-candidates?q={}", encode_query(q)),
+        None => "/admin/api/menus/link-candidates".to_owned(),
+    };
+    let resp = Request::get(&url)
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<LinkCandidates>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// Minimal percent-encoding for a query-string value (the search needle): encodes the
+/// characters that would break the `?q=` parameter. Enough for a title search; the
+/// server trims + lowercases anyway.
+fn encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Read a failed response's `{ error }` body, falling back to the status code.
 async fn error_message(resp: Response) -> String {
     let status = resp.status();

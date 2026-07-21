@@ -73,6 +73,11 @@ web-sys = { version = "0.3", features = [
     "File",
     "FileList",
     "FormData",
+    # Menu editor: an unsaved-changes beforeunload guard, Escape-to-close on the picker
+    # modal, and focus-on-open — all via document/window event listeners.
+    "EventTarget",
+    "BeforeUnloadEvent",
+    "KeyboardEvent",
 ] }
 
 # HTTP (fetch) + JSON + a small timer for the save toast.
