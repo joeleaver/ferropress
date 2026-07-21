@@ -250,9 +250,14 @@ pub async fn save(
         )));
     }
 
+    // Capture the pre-write parent + a title clone (title moves into the patch) for the auto-add
+    // hook: a page that BECOMES a published top-level page joins every auto-add menu.
+    let old_parent = parent_of(&state, ObjectId(id)).await?;
+    let title = body.title.clone();
+
     // Serialize hierarchy mutations from here: the cycle check + path-uniqueness pre-flight and
     // the writes must be atomic w.r.t. another concurrent re-parent.
-    let _guard = state.hierarchy_lock.lock().await;
+    let hierarchy_guard = state.hierarchy_lock.lock().await;
 
     // Validate the parent (exists, is a Page, not self, no cycle) and compute the new path.
     let parent_path = resolve_parent_path(&state, Some(ObjectId(id)), body.parent).await?;
@@ -331,6 +336,17 @@ pub async fn save(
 
     backfill_author(&state, ObjectId(id), &who, author).await;
 
+    // Release the hierarchy lock BEFORE the auto-add hook (it takes `menu_lock` itself). Fire when
+    // this save leaves the page as a published TOP-LEVEL page AND it just crossed into that state —
+    // either by becoming published (WordPress's transition trigger) or by re-parenting to top level.
+    drop(hierarchy_guard);
+    let now_published_top = new_status.is_publish_state() && body.parent.is_none();
+    let became_published = !current_status.is_publish_state() && new_status.is_publish_state();
+    let became_top_level = old_parent.is_some() && body.parent.is_none();
+    if now_published_top && (became_published || became_top_level) {
+        super::menus::auto_add_top_level_page(&state, id, &title).await;
+    }
+
     Ok(Json(SaveResponse {
         id,
         updated_at: now,
@@ -386,7 +402,13 @@ pub async fn create(
         ensure_media_exists(&state, mid).await?;
     }
 
-    let _guard = state.hierarchy_lock.lock().await;
+    // A top-level page published on creation joins every auto-add menu (below, once the hierarchy
+    // lock is released). Capture the facts + a title clone before `body.title` is moved into fields.
+    let published = status.is_publish_state();
+    let is_top_level = body.parent.is_none();
+    let title = body.title.clone();
+
+    let hierarchy_guard = state.hierarchy_lock.lock().await;
 
     // Validate the parent (no self on create; a fresh page has no id yet) and compute the path.
     let parent_path = resolve_parent_path(&state, None, body.parent).await?;
@@ -451,6 +473,13 @@ pub async fn create(
 
     // Shadow-guard: a live page now occupies this path → drop any stale 301 FROM it.
     content_ops::retire_redirects_at(&state, &path).await?;
+
+    // Release the hierarchy lock BEFORE the auto-add hook — it takes `menu_lock` itself, never
+    // nested under `hierarchy_lock`. A newly-published top-level page joins every auto-add menu.
+    drop(hierarchy_guard);
+    if published && is_top_level {
+        super::menus::auto_add_top_level_page(&state, id.0, &title).await;
+    }
 
     Ok(Json(CreateResponse {
         id: id.0,

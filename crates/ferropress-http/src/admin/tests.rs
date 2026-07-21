@@ -244,6 +244,62 @@ async fn do_create(
     (status, to_json(resp).await)
 }
 
+/// A generic authenticated JSON request against the real router → (status, body json).
+/// `body: None` sends an empty body (for GET/DELETE).
+async fn do_json(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    cookie: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, cookie);
+    let req = match body {
+        Some(j) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(j.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, to_json(resp).await)
+}
+
+/// Count a menu detail's items that target the given Page id (via GET /menus/{id}).
+async fn page_items_in_menu(
+    state: &AppState,
+    cookie: &str,
+    menu_id: u64,
+    page_id: u64,
+) -> (bool, usize) {
+    let (_, detail) = do_json(
+        state,
+        "GET",
+        &format!("/admin/api/menus/{menu_id}"),
+        cookie,
+        None,
+    )
+    .await;
+    let auto = detail["auto_add_pages"].as_bool().unwrap_or(false);
+    let n = detail["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|it| {
+                    it["target"]["kind"] == "page"
+                        && it["target"]["id"] == serde_json::json!(page_id)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    (auto, n)
+}
+
 /// POST /admin/api/login and return (status, set-cookie value, body json).
 async fn do_login(
     state: &AppState,
@@ -3077,4 +3133,189 @@ async fn menu_item_resolved_sidecar_names_and_links_targets() {
     // Custom item: no sidecar (its URL is already the target).
     let custom_item = by_label_target("custom");
     assert!(custom_item["resolved"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// Auto-add-new-pages hook (Increment 4, F3)
+// ---------------------------------------------------------------------------
+
+/// Create a menu (via the handler) and turn on its `auto_add_pages` flag. Returns the menu id.
+async fn create_auto_add_menu(state: &AppState, cookie: &str, name: &str) -> u64 {
+    let (st, m) = do_json(
+        state,
+        "POST",
+        "/admin/api/menus",
+        cookie,
+        Some(serde_json::json!({ "name": name })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create menu: {m}");
+    let id = m["id"].as_u64().unwrap();
+    let (st, _) = do_json(
+        state,
+        "PUT",
+        &format!("/admin/api/menus/{id}"),
+        cookie,
+        Some(serde_json::json!({ "name": name, "auto_add_pages": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "enable auto_add_pages");
+    id
+}
+
+#[tokio::test]
+async fn auto_add_appends_a_published_top_level_page_and_persists_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, sc, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&sc.unwrap());
+
+    let menu_id = create_auto_add_menu(&state, &cookie, "Primary").await;
+
+    // Publish a TOP-LEVEL page through the create handler.
+    let (st, p) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &cookie,
+        Some(serde_json::json!({
+            "title": "The World", "slug": "the-world", "status": "published",
+            "block_tree": one_paragraph("hi"), "parent": null,
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create page: {p}");
+    let page_id = p["id"].as_u64().unwrap();
+
+    // The menu now holds exactly one item pointing at that page, labeled with its title.
+    let (auto, n) = page_items_in_menu(&state, &cookie, menu_id, page_id).await;
+    assert!(auto, "the flag must round-trip as true");
+    assert_eq!(n, 1, "exactly one auto-added item for the page");
+
+    // A later rename PUT that omits `auto_add_pages` must PRESERVE the flag (meta read-merge,
+    // not clobber) — else the item-save path could silently lose it.
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/menus/{menu_id}"),
+        &cookie,
+        Some(serde_json::json!({ "name": "Main Nav" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (auto2, _) = page_items_in_menu(&state, &cookie, menu_id, page_id).await;
+    assert!(
+        auto2,
+        "omitting auto_add_pages in a rename must not clear it"
+    );
+}
+
+#[tokio::test]
+async fn auto_add_is_idempotent_and_selective() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, sc, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&sc.unwrap());
+
+    let on = create_auto_add_menu(&state, &cookie, "Auto").await;
+
+    // A menu WITHOUT the flag must never be touched.
+    let (st, m) = do_json(
+        &state,
+        "POST",
+        "/admin/api/menus",
+        &cookie,
+        Some(serde_json::json!({ "name": "Manual" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{m}");
+    let off = m["id"].as_u64().unwrap();
+
+    // Seed a published page directly, then fire the hook TWICE — the dup-guard must add it once.
+    let mut f: FieldMap = HashMap::new();
+    f.insert("slug".to_owned(), Value::String("guide".to_owned()));
+    f.insert("path".to_owned(), Value::String("/guide".to_owned()));
+    f.insert("title".to_owned(), Value::String("Guide".to_owned()));
+    f.insert(
+        "status".to_owned(),
+        Value::String(Status::Published.as_str().to_owned()),
+    );
+    f.insert("block_tree".to_owned(), Value::Json(one_paragraph("x")));
+    f.insert("created_at".to_owned(), Value::DateTime(now_millis()));
+    let page_id = store
+        .create(&TypeName::from(PAGE_TYPE), f)
+        .await
+        .expect("seed page")
+        .0;
+
+    crate::admin::menus::auto_add_top_level_page(&state, page_id, "Guide").await;
+    crate::admin::menus::auto_add_top_level_page(&state, page_id, "Guide").await;
+
+    let (_, n_on) = page_items_in_menu(&state, &cookie, on, page_id).await;
+    assert_eq!(
+        n_on, 1,
+        "dup-guard: the flagged menu holds exactly one copy"
+    );
+    let (_, n_off) = page_items_in_menu(&state, &cookie, off, page_id).await;
+    assert_eq!(n_off, 0, "a non-auto-add menu is never touched");
+}
+
+#[tokio::test]
+async fn auto_add_fires_on_a_draft_to_publish_transition_not_a_plain_resave() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "jane", "hunter2hunter2", "administrator").await;
+    let (_, sc, _) = do_login(&state, "jane", "hunter2hunter2").await;
+    let cookie = session_pair(&sc.unwrap());
+
+    let menu_id = create_auto_add_menu(&state, &cookie, "Primary").await;
+
+    // Create the page as a DRAFT top-level page → NOT auto-added (nothing published yet).
+    let (st, p) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &cookie,
+        Some(serde_json::json!({
+            "title": "Bio", "slug": "bio", "status": "draft",
+            "block_tree": one_paragraph("hi"), "parent": null,
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{p}");
+    let page_id = p["id"].as_u64().unwrap();
+    let (_, n0) = page_items_in_menu(&state, &cookie, menu_id, page_id).await;
+    assert_eq!(n0, 0, "a draft page is not auto-added");
+
+    // Save → published: the draft→publish transition fires the hook once.
+    let publish = serde_json::json!({
+        "title": "Bio", "slug": "bio", "status": "published",
+        "block_tree": one_paragraph("hi"), "parent": null, "menu_order": 0,
+    });
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{page_id}"),
+        &cookie,
+        Some(publish.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, n1) = page_items_in_menu(&state, &cookie, menu_id, page_id).await;
+    assert_eq!(n1, 1, "publish transition auto-adds the page");
+
+    // A plain re-save of the already-published top-level page is NOT a transition → no second add.
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{page_id}"),
+        &cookie,
+        Some(publish),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, n2) = page_items_in_menu(&state, &cookie, menu_id, page_id).await;
+    assert_eq!(n2, 1, "an ordinary re-save must not add a duplicate");
 }

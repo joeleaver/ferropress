@@ -202,6 +202,7 @@ fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
 
 /// The admin API's uniform error type (mirrors [`island::ApiError`](crate::island)
 /// with auth statuses added). Internal causes are logged, never serialized.
+#[derive(Debug)]
 pub enum AdminError {
     /// 400 — a client input problem; the message is author-controlled + safe.
     BadRequest(String),

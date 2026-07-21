@@ -75,6 +75,9 @@ pub struct MenuDetail {
     pub id: u64,
     pub slug: String,
     pub name: String,
+    /// WordPress's "Automatically add new top-level pages to this menu" flag (stored in
+    /// `Menu.meta.auto_add_pages`). Echoed so the editor reflects the persisted state.
+    pub auto_add_pages: bool,
     pub items: Vec<MenuItemNode>,
 }
 
@@ -131,6 +134,9 @@ pub struct UpdateMenuRequest {
     pub name: String,
     #[serde(default)]
     pub slug: Option<String>,
+    /// When present, sets `Menu.meta.auto_add_pages` (absent = leave it unchanged).
+    #[serde(default)]
+    pub auto_add_pages: Option<bool>,
 }
 
 /// `PUT /menus/{id}/items` body — the FULL desired item forest.
@@ -247,6 +253,7 @@ async fn load_menu_detail(state: &AppState, id: u64) -> Result<MenuDetail, Admin
         id,
         slug: str_field(&menu, "slug").unwrap_or_default(),
         name: str_field(&menu, "name").unwrap_or_default(),
+        auto_add_pages: menu_auto_add(&menu),
         items,
     })
 }
@@ -409,6 +416,19 @@ pub async fn update(
     let mut patch: FieldMap = FieldMap::new();
     patch.insert("slug".to_owned(), Value::String(slug.clone()));
     patch.insert("name".to_owned(), Value::String(name.clone()));
+    // Persist the auto-add flag when the request carries it. `meta` is one Value::Json field and
+    // `store.update` patches at field granularity, so read-modify-write the CURRENT meta (like
+    // `touch_menu`) — writing it from scratch would destroy `_rev` and any other keys.
+    if let Some(flag) = body.auto_add_pages {
+        let mut meta = match current.get("meta") {
+            Some(Value::Json(j)) if j.is_object() => j.clone(),
+            _ => serde_json::json!({}),
+        };
+        meta.as_object_mut()
+            .expect("meta is an object by construction above")
+            .insert("auto_add_pages".to_owned(), serde_json::Value::Bool(flag));
+        patch.insert("meta".to_owned(), Value::Json(meta));
+    }
     state
         .store
         .update(&TypeName::from(MENU_TYPE), ObjectId(id), patch)
@@ -938,6 +958,109 @@ async fn touch_menu(state: &AppState, menu: &Object) -> Result<(), AdminError> {
         .update(&TypeName::from(MENU_TYPE), menu.id, patch)
         .await?;
     Ok(())
+}
+
+/// Whether a menu carries the `auto_add_pages` flag (WP's "Automatically add new top-level
+/// pages"). Reads `Menu.meta.auto_add_pages`; any absent/non-object meta → `false`.
+fn menu_auto_add(menu: &Object) -> bool {
+    match menu.get("meta") {
+        Some(Value::Json(j)) => j
+            .get("auto_add_pages")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Append a Page-target [`MenuItem`] to `menu`'s top level (the auto-add-new-pages hook).
+/// IDEMPOTENT: if the menu already targets `page_id` this is a no-op, so a re-publish or
+/// re-parent can't add a duplicate. Mirrors `save_items`' create+link discipline — a failed
+/// `link` DELETES the just-created orphan (an unlinked `MenuItem` is invisible to
+/// `menu_item_ids`, never rendered, and never reclaimed) — and a successful append ends with
+/// `touch_menu` so the live `MenuHandle` reloads (rhypedb `link` emits no change event).
+/// `item_order` is one past the current max (the next whole-tree save renumbers contiguously).
+/// The caller holds `menu_lock`.
+async fn append_page_item(
+    state: &AppState,
+    menu: &Object,
+    page_id: u64,
+    label: &str,
+) -> Result<(), AdminError> {
+    let menu_id = menu.id;
+    let existing = menu_item_ids(state, menu_id).await?;
+    let objs = state
+        .store
+        .get_many(&TypeName::from(MENU_ITEM_TYPE), &existing)
+        .await?;
+    // Dup-guard + max `item_order` in a single pass over the current items.
+    let mut max_order: Option<i32> = None;
+    for o in &objs {
+        if let Some(LinkTarget::Page { id }) = target_from_field(o)
+            && id == page_id
+        {
+            return Ok(()); // already present — idempotent
+        }
+        let order = i32_field(o, "item_order");
+        max_order = Some(max_order.map_or(order, |m| m.max(order)));
+    }
+    let next_order = max_order.map_or(0, |m| m + 1);
+
+    let mut fields = FieldMap::new();
+    fields.insert("label".to_owned(), Value::String(label.to_owned()));
+    fields.insert("item_order".to_owned(), Value::I32(next_order));
+    fields.insert(
+        "target".to_owned(),
+        target_to_value(&LinkTarget::Page { id: page_id })?,
+    );
+    fields.insert(
+        "meta".to_owned(),
+        Value::Json(serde_json::json!({ "new_tab": false })),
+    );
+    let new_id = state
+        .store
+        .create(&TypeName::from(MENU_ITEM_TYPE), fields)
+        .await?;
+    // Link the item to the menu; on failure delete the orphan we just made (as `save_items` does).
+    if let Err(e) = state
+        .store
+        .link(&menu_edge(new_id), menu_id, FieldMap::new())
+        .await
+    {
+        let _ = state
+            .store
+            .delete(&TypeName::from(MENU_ITEM_TYPE), new_id)
+            .await;
+        return Err(e.into());
+    }
+    touch_menu(state, menu).await?;
+    Ok(())
+}
+
+/// Append a newly-published TOP-LEVEL page to every menu flagged `auto_add_pages` — WordPress's
+/// "Automatically add new top-level pages to this menu" behavior. Called SYNCHRONOUSLY from the
+/// page create/publish path (NEVER the regen loop), AFTER any `hierarchy_lock` is released: it
+/// acquires `menu_lock` itself, so nesting it under `hierarchy_lock` would establish a
+/// hierarchy→menu lock ordering the rest of the code deliberately avoids. Best-effort +
+/// per-menu isolated: a failure for one menu is logged and neither aborts the page write nor the
+/// other menus (a page create/save is `EditOwnContent`; auto-add is a `ManageMenus` convenience
+/// that must never fail the author's save).
+pub(crate) async fn auto_add_top_level_page(state: &AppState, page_id: u64, title: &str) {
+    let _guard = state.menu_lock.lock().await;
+    let menus = match state.store.scan(&TypeName::from(MENU_TYPE)).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(page_id, error = %e, "auto-add: scanning menus");
+            return;
+        }
+    };
+    for menu in menus {
+        if !menu_auto_add(&menu) {
+            continue;
+        }
+        if let Err(e) = append_page_item(state, &menu, page_id, title).await {
+            tracing::warn!(page_id, menu_id = menu.id.0, error = ?e, "auto-add: appending page to menu");
+        }
+    }
 }
 
 /// The `MenuLocation.menu` to-one edge for a location row.
