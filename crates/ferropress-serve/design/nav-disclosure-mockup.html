@@ -6,9 +6,10 @@
 <title>Ferropress nav — APG Disclosure Navigation mockup</title>
 <!--
   DESIGN + VERIFY the ARIA Authoring-Practices "Disclosure Navigation Menu (with top-level
-  links)" pattern for the public nav flyout, BEFORE porting the markup+JS to the two MiniJinja
-  themes (letterpress crates/ferropress-serve/src/templates.rs; fellstone
-  /home/joe/dev/fellstone-site/theme/fellstone/base.html).
+  links)" pattern for the public nav flyout, BEFORE porting the markup+JS into a theme's
+  `base.html` (the built-in letterpress lives at crates/ferropress-serve/src/templates.rs; any
+  on-disk theme discovered from FERROPRESS_THEMES_DIR adopts the same `navtree` macro + the shared
+  `[data-fp-disclosure]` controller).
 
   Contract this proves:
    - A submenu parent exposes a <button aria-expanded aria-controls> disclosure (label-only
