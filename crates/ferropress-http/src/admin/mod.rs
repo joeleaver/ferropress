@@ -46,6 +46,7 @@ pub mod preview;
 mod setting_refs;
 mod setting_store;
 pub mod settings;
+pub mod terms;
 
 #[cfg(test)]
 mod tests;
@@ -317,6 +318,16 @@ pub fn api_routes() -> Router<AppState> {
             get(menus::get_one).put(menus::update).delete(menus::delete),
         )
         .route("/admin/api/menus/{id}/items", put(menus::save_items))
+        // Taxonomies + terms (WP Categories/Tags). Reads are open to any content
+        // editor (the assignment panel needs the vocabulary); term writes are
+        // `ManageTerms` (Editor+). Taxonomy rows have NO create/delete endpoint —
+        // they are provisioned by the `ferropress-schema` migrate tool.
+        .route("/admin/api/taxonomies", get(terms::list_taxonomies))
+        .route("/admin/api/terms", get(terms::list).post(terms::create))
+        .route(
+            "/admin/api/terms/{id}",
+            put(terms::update).delete(terms::delete),
+        )
         // Site settings: read the schema + values, write a validated submission.
         // Both gated on `ManageSettings` (Administrator).
         .route("/admin/api/settings", get(settings::get).put(settings::put))

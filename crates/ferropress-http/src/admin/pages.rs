@@ -262,6 +262,10 @@ pub async fn save(
     // Validate the parent (exists, is a Page, not self, no cycle) and compute the new path.
     let parent_path = resolve_parent_path(&state, Some(ObjectId(id)), body.parent).await?;
     let new_path = join_page_path(parent_path.as_deref(), &slug);
+    // The ROOT segment must not be a reserved URL base (`page`/`feed` — pagination/
+    // feed grammar). Checked on the whole computed path, so a re-parent to top level
+    // can't smuggle a reserved slug in; descendants inherit an already-checked root.
+    content_ops::ensure_unreserved_root(&new_path)?;
     let old_path = str_field(&current, "path").unwrap_or_default();
 
     // If the path moved, recompute every descendant's new path from the (new) parent chain.
@@ -413,6 +417,8 @@ pub async fn create(
     // Validate the parent (no self on create; a fresh page has no id yet) and compute the path.
     let parent_path = resolve_parent_path(&state, None, body.parent).await?;
     let path = join_page_path(parent_path.as_deref(), &slug);
+    // A ROOT page must not occupy a reserved URL base (`page`/`feed`).
+    content_ops::ensure_unreserved_root(&path)?;
     if content_ops::is_taken(&state, &path, &[]).await? {
         return Err(AdminError::Conflict(format!(
             "the path {path:?} is already in use"

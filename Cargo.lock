@@ -1648,8 +1648,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ferropress-core",
  "ferropress-schema-sdl",
  "ferropress-store-embedded",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

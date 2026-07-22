@@ -3319,3 +3319,678 @@ async fn auto_add_fires_on_a_draft_to_publish_transition_not_a_plain_resave() {
     let (_, n2) = page_items_in_menu(&state, &cookie, menu_id, page_id).await;
     assert_eq!(n2, 1, "an ordinary re-save must not add a duplicate");
 }
+
+// ---------------------------------------------------------------------------
+// Taxonomies + terms (the taxonomy slice, Inc 1): term CRUD + post assignment
+// ---------------------------------------------------------------------------
+
+/// Seed a taxonomy row (the migrate tool's shape). Returns the new id.
+async fn seed_taxonomy(
+    store: &Arc<dyn RhypeStore>,
+    key: &str,
+    hierarchical: bool,
+    multiple: bool,
+) -> ObjectId {
+    let mut f: FieldMap = HashMap::new();
+    f.insert("key".to_owned(), Value::String(key.to_owned()));
+    f.insert("label".to_owned(), Value::String(key.to_owned()));
+    f.insert("hierarchical".to_owned(), Value::Bool(hierarchical));
+    f.insert("multiple".to_owned(), Value::Bool(multiple));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    store
+        .create(&TypeName::from("Taxonomy"), f)
+        .await
+        .expect("seed taxonomy")
+}
+
+/// Log a seeded user in and return the ready-to-send `Cookie` header value.
+async fn login_cookie(state: &AppState, slug: &str) -> String {
+    let (status, cookie, body) = do_login(state, slug, "hunter2hunter2").await;
+    assert_eq!(status, StatusCode::OK, "login body: {body}");
+    session_pair(&cookie.expect("login sets a cookie"))
+}
+
+/// A full, valid post-save body (the PUT requires every scalar); `extra` merges
+/// additional keys (e.g. `terms` / `new_terms`) on top.
+fn post_save_body(slug: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "title": format!("Title {slug}"),
+        "slug": slug,
+        "status": "draft",
+        "block_tree": one_paragraph("body"),
+    });
+    if let (Some(dst), Some(src)) = (body.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    body
+}
+
+#[tokio::test]
+async fn term_crud_hierarchy_per_sibling_uniqueness_and_promote_on_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    // Create a root, a child, and a grandchild.
+    let (st, fiction) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &cookie,
+        Some(serde_json::json!({"taxonomy": "category", "name": "Fiction"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create root: {fiction}");
+    let fiction_id = fiction["id"].as_u64().unwrap();
+    let (st, child) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &cookie,
+        Some(serde_json::json!({
+            "taxonomy": "category", "name": "Space Opera", "parent": fiction_id
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create child: {child}");
+    let child_id = child["id"].as_u64().unwrap();
+
+    // Per-SIBLING uniqueness (the WP model): the same slug under the SAME parent
+    // is a 409, but under a DIFFERENT parent it is legal.
+    let (st, dup) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &cookie,
+        Some(serde_json::json!({
+            "taxonomy": "category", "name": "Space Opera", "parent": fiction_id
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "duplicate sibling slug: {dup}");
+    let (st, cousin) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &cookie,
+        Some(serde_json::json!({"taxonomy": "category", "name": "Space Opera"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "same slug under a different parent (root) is legal: {cousin}"
+    );
+
+    // The flat-with-depth list: name-asc DFS — Fiction(0) → Space Opera(1), then
+    // the root-level Space Opera(0).
+    let (st, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=category",
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["name"], "Fiction");
+    assert_eq!(rows[0]["depth"], 0);
+    assert_eq!(rows[1]["id"].as_u64().unwrap(), child_id);
+    assert_eq!(rows[1]["depth"], 1, "child indents under its parent");
+    assert_eq!(rows[2]["depth"], 0);
+
+    // A cycle is rejected: re-parenting the root under its own child.
+    let (st, cyc) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/terms/{fiction_id}"),
+        &cookie,
+        Some(serde_json::json!({"name": "Fiction", "parent": child_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "cycle: {cyc}");
+
+    // Deleting the parent PROMOTES the child (SDL @on_delete(remove) on parent).
+    let (st, _) = do_json(
+        &state,
+        "DELETE",
+        &format!("/admin/api/terms/{fiction_id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=category",
+        &cookie,
+        None,
+    )
+    .await;
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "child survives its parent's deletion");
+    assert!(
+        rows.iter()
+            .all(|r| r["depth"] == 0 && r["parent"].is_null()),
+        "orphaned child is promoted to a root: {list}"
+    );
+}
+
+#[tokio::test]
+async fn term_write_gates_and_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ann", "hunter2hunter2", "author").await;
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    seed_taxonomy(&store, "tag", false, true).await;
+
+    // An Author (no ManageTerms) may READ the vocabulary but not WRITE terms.
+    let ann = login_cookie(&state, "ann").await;
+    let (st, _) = do_json(&state, "GET", "/admin/api/taxonomies", &ann, None).await;
+    assert_eq!(st, StatusCode::OK, "vocabulary readable by content editors");
+    let (st, _) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ann,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Nope"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "term create is ManageTerms-only");
+
+    let ed = login_cookie(&state, "ed").await;
+    // Reserved slugs (the pagination/feed URL grammar).
+    for reserved in ["page", "feed"] {
+        let (st, body) = do_json(
+            &state,
+            "POST",
+            "/admin/api/terms",
+            &ed,
+            Some(serde_json::json!({"taxonomy": "tag", "name": reserved})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "reserved {reserved:?}: {body}");
+    }
+    // A parent in a FLAT taxonomy is rejected.
+    let (st, tag_a) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Giveaway"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({
+            "taxonomy": "tag", "name": "Child", "parent": tag_a["id"].as_u64().unwrap()
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "flat-taxonomy parent: {body}");
+    // A parent from ANOTHER taxonomy is rejected (it isn't a member of this one).
+    let (st, body) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({
+            "taxonomy": "category", "name": "Crossed", "parent": tag_a["id"].as_u64().unwrap()
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "cross-taxonomy parent: {body}");
+    // An unknown taxonomy key is a 404.
+    let (st, _) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "genre", "name": "X"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn post_save_reconciles_terms_and_absent_field_leaves_them_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let ann = seed_user(&store, "ann", "hunter2hunter2", "author").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    let post = seed_post(&store, "reviewed", Status::Draft).await;
+    set_author(&store, post, ann).await;
+    let ed_store = &store;
+    seed_user(ed_store, "ed", "hunter2hunter2", "editor").await;
+    let ed = login_cookie(&state, "ed").await;
+    let (_, t1) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "category", "name": "Fiction"})),
+    )
+    .await;
+    let (_, t2) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "category", "name": "Reviews"})),
+    )
+    .await;
+    let (t1, t2) = (t1["id"].as_u64().unwrap(), t2["id"].as_u64().unwrap());
+
+    // The AUTHOR assigns both terms to their own post (no ManageTerms needed).
+    let ann_cookie = login_cookie(&state, "ann").await;
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "reviewed",
+            serde_json::json!({"terms": [t1, t2]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "assign: {body}");
+    let mut got: Vec<u64> = body["terms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_u64().unwrap())
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![t1.min(t2), t1.max(t2)]);
+
+    // A save WITHOUT the terms field leaves the membership untouched (the
+    // Option<Vec> contract — an absent field must never clear).
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body("reviewed", serde_json::json!({}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        body["terms"].as_array().unwrap().len(),
+        2,
+        "absent terms field must not strip the membership: {body}"
+    );
+
+    // A save with a SUBSET unlinks the removed term (set-reconcile)…
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "reviewed",
+            serde_json::json!({"terms": [t2]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let kept: Vec<u64> = body["terms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(kept, vec![t2], "set-reconcile drops the removed term");
+
+    // …and an explicit empty set clears.
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body("reviewed", serde_json::json!({"terms": []}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body["terms"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn post_terms_validation_rejects_foreign_ids_and_enforces_the_multiple_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let ann = seed_user(&store, "ann", "hunter2hunter2", "author").await;
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    // A NON-multiple taxonomy (one term per post) + the regular tag taxonomy.
+    seed_taxonomy(&store, "series", true, false).await;
+    seed_taxonomy(&store, "tag", false, true).await;
+    let post = seed_post(&store, "mine", Status::Draft).await;
+    set_author(&store, post, ann).await;
+    let ed = login_cookie(&state, "ed").await;
+    let (_, s1) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "series", "name": "Fellstone"})),
+    )
+    .await;
+    let (_, s2) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "series", "name": "Other"})),
+    )
+    .await;
+    let (_, tag) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Giveaway"})),
+    )
+    .await;
+    let (s1, s2, tag) = (
+        s1["id"].as_u64().unwrap(),
+        s2["id"].as_u64().unwrap(),
+        tag["id"].as_u64().unwrap(),
+    );
+
+    let ann_cookie = login_cookie(&state, "ann").await;
+    // A nonexistent term id is a 400 (not a silent skip, not a 404).
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "mine",
+            serde_json::json!({"terms": [999_999u64]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "bogus id: {body}");
+    // A FOREIGN ObjectId (a User, not a Term) is a 400 — the type assert.
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "mine",
+            serde_json::json!({"terms": [ann.0]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "foreign id: {body}");
+    // Two terms of a non-multiple taxonomy → 400; but one series + one tag is fine
+    // (the cap is PER-taxonomy — Post.terms is one shared edge).
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "mine",
+            serde_json::json!({"terms": [s1, s2]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "multiple=false cap: {body}");
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "mine",
+            serde_json::json!({"terms": [s1, tag]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "per-taxonomy cap, not global: {body}");
+
+    // No mutation happened on the rejected saves: the membership is exactly {s1, tag}.
+    let (_, detail) = do_get(&state, &ann_cookie, post.0).await;
+    assert_eq!(detail["terms"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn inline_new_tags_create_then_reuse_and_reject_hierarchical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let ann = seed_user(&store, "ann", "hunter2hunter2", "author").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    seed_taxonomy(&store, "tag", false, true).await;
+    let post = seed_post(&store, "tagged", Status::Draft).await;
+    set_author(&store, post, ann).await;
+    let ann_cookie = login_cookie(&state, "ann").await;
+
+    // An AUTHOR mints a new tag inline on their own post — no ManageTerms.
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "tagged",
+            serde_json::json!({"new_terms": [{"taxonomy": "tag", "name": "Space Opera"}]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "inline tag: {body}");
+    let terms = body["terms"].as_array().unwrap();
+    assert_eq!(terms.len(), 1);
+    assert_eq!(terms[0]["slug"], "space-opera");
+    assert_eq!(terms[0]["taxonomy"], "tag");
+    let tag_id = terms[0]["id"].as_u64().unwrap();
+
+    // The same name again REUSES the existing term (WP-style, by derived slug) —
+    // additive on top of the current membership, and no duplicate Term row.
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "tagged",
+            serde_json::json!({"new_terms": [{"taxonomy": "tag", "name": "Space  Opera!"}]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let terms = body["terms"].as_array().unwrap();
+    assert_eq!(terms.len(), 1, "reuse, not a duplicate: {body}");
+    assert_eq!(terms[0]["id"].as_u64().unwrap(), tag_id);
+
+    // Inline creation NEVER mints into a hierarchical taxonomy (categories go
+    // through the ManageTerms endpoint).
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(post_save_body(
+            "tagged",
+            serde_json::json!({"new_terms": [{"taxonomy": "category", "name": "Sneaky"}]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "tags-only: {body}");
+
+    // A CONTRIBUTOR can tag their own draft too (assignment rides the edit gate).
+    let cid = seed_user(&store, "con", "hunter2hunter2", "contributor").await;
+    let draft = seed_post(&store, "contrib-draft", Status::Draft).await;
+    set_author(&store, draft, cid).await;
+    let con_cookie = login_cookie(&state, "con").await;
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", draft.0),
+        &con_cookie,
+        Some(post_save_body(
+            "contrib-draft",
+            serde_json::json!({"new_terms": [{"taxonomy": "tag", "name": "Fresh"}]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "contributor tags own draft: {body}");
+
+    // …but NOT someone else's post (the ownership gate masks it as 404 before any
+    // term work runs).
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &con_cookie,
+        Some(post_save_body(
+            "tagged",
+            serde_json::json!({"new_terms": [{"taxonomy": "tag", "name": "Hijack"}]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reserved_root_slugs_and_archive_path_collisions_are_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    let ed = login_cookie(&state, "ed").await;
+
+    // Top-level content can't occupy the pagination/feed URL bases.
+    for reserved in ["page", "feed"] {
+        let (st, body) = do_create(
+            &state,
+            &ed,
+            serde_json::json!({
+                "title": "X", "slug": reserved, "block_tree": one_paragraph("x"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "post slug {reserved:?}: {body}"
+        );
+        let (st, body) = do_json(
+            &state,
+            "POST",
+            "/admin/api/pages",
+            &ed,
+            Some(serde_json::json!({
+                "title": "X", "slug": reserved, "block_tree": one_paragraph("x"),
+            })),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "root page {reserved:?}: {body}"
+        );
+    }
+
+    // A term whose computed archive path collides with an existing Page path is a
+    // 409 — the archive would silently shadow the page.
+    let (st, page) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "Category landing", "slug": "category",
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "seed parent page: {page}");
+    let (st, news) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "News", "slug": "news", "parent": page["id"].as_u64().unwrap(),
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "seed nested page: {news}");
+    let (st, body) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "category", "name": "News"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "term archive path category/news collides with the page: {body}"
+    );
+}
+
+#[tokio::test]
+async fn term_list_counts_are_published_only_and_direct() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let ann = seed_user(&store, "ann", "hunter2hunter2", "author").await;
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "tag", false, true).await;
+    let ed = login_cookie(&state, "ed").await;
+    let (_, t) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Counted"})),
+    )
+    .await;
+    let t = t["id"].as_u64().unwrap();
+
+    // One PUBLISHED post + one DRAFT post, both holding the term.
+    let pub_post = seed_post(&store, "pub", Status::Published).await;
+    let draft_post = seed_post(&store, "dra", Status::Draft).await;
+    for p in [pub_post, draft_post] {
+        set_author(&store, p, ann).await;
+    }
+    let ann_cookie = login_cookie(&state, "ann").await;
+    for (slug, id) in [("pub", pub_post), ("dra", draft_post)] {
+        let mut body = post_save_body(slug, serde_json::json!({"terms": [t]}));
+        if slug == "pub" {
+            body["status"] = serde_json::json!("published");
+        }
+        let (st, b) = do_json(
+            &state,
+            "PUT",
+            &format!("/admin/api/posts/{}", id.0),
+            &ann_cookie,
+            Some(body),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "assign {slug}: {b}");
+    }
+
+    let (_, list) = do_json(&state, "GET", "/admin/api/terms?taxonomy=tag", &ed, None).await;
+    assert_eq!(
+        list.as_array().unwrap()[0]["count"],
+        1,
+        "count is published-only (the draft doesn't leak): {list}"
+    );
+}

@@ -126,6 +126,16 @@ pub struct AppState {
     /// [`hierarchy_lock`](Self::hierarchy_lock) — a menu reorder and a page re-parent are
     /// unrelated and must not contend. Menu edits are rare, so this is near-uncontended.
     pub menu_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes taxonomy/term-mutating admin writes (term CRUD's per-sibling slug
+    /// uniqueness pre-check + create-then-link, and the post save's inline tag creation)
+    /// so two concurrent creates can't both pass the app-level uniqueness check —
+    /// `Term.slug` is `@indexed`, NOT `@unique` (the same slug may exist in different
+    /// taxonomies / under different parents), so the engine enforces nothing and the
+    /// pre-check + write must be atomic. SEPARATE from [`hierarchy_lock`](Self::hierarchy_lock)
+    /// and [`menu_lock`](Self::menu_lock) (unrelated surfaces must not contend), and never
+    /// nested with either — a handler takes at most ONE of the three. Term edits are rare,
+    /// so this is near-uncontended.
+    pub taxonomy_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -149,6 +159,7 @@ impl AppState {
             admin: None,
             hierarchy_lock: Arc::new(tokio::sync::Mutex::new(())),
             menu_lock: Arc::new(tokio::sync::Mutex::new(())),
+            taxonomy_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

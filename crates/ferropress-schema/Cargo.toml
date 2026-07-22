@@ -14,8 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 ferropress-schema-sdl = { workspace = true }
-# The embedded store is opened by `migrate` to run rhypedb's additive reconcile.
+# The embedded store is opened by `migrate` to run rhypedb's additive reconcile;
+# core supplies the RhypeStore verbs + type constants the default-taxonomy seed uses.
 ferropress-store-embedded = { workspace = true }
+ferropress-core = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# The seed drives async store verbs from a sync CLI (one small runtime).
+tokio = { workspace = true }
+serde_json = { workspace = true }

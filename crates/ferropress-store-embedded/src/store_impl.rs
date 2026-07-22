@@ -466,3 +466,173 @@ impl Stream for SubscriptionStream {
         Pin::new(&mut self.get_mut().inner).poll_next(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ferropress_core::query::Edge;
+    use ferropress_core::store::RhypeStore;
+    use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value};
+    use ferropress_core::{POST_TYPE, TAXONOMY_TYPE, TERM_TYPE};
+
+    use crate::EmbeddedStore;
+
+    fn edge(type_name: &str, id: ObjectId, field: &str) -> Edge {
+        Edge {
+            type_name: TypeName::from(type_name),
+            id,
+            field: field.to_owned(),
+        }
+    }
+
+    async fn seed_post(store: &EmbeddedStore, slug: &str) -> ObjectId {
+        let mut fields: FieldMap = FieldMap::new();
+        fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+        fields.insert("title".to_owned(), Value::String(slug.to_owned()));
+        fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+        fields.insert("status".to_owned(), Value::String("published".to_owned()));
+        RhypeStore::create(store, &TypeName::from(POST_TYPE), fields)
+            .await
+            .expect("seed post")
+    }
+
+    async fn seed_term(store: &EmbeddedStore, slug: &str) -> ObjectId {
+        let mut fields: FieldMap = FieldMap::new();
+        fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+        fields.insert("name".to_owned(), Value::String(slug.to_owned()));
+        RhypeStore::create(store, &TypeName::from(TERM_TYPE), fields)
+            .await
+            .expect("seed term")
+    }
+
+    /// The taxonomy archive backbone: `Term.objects @inverse(Post.terms)` — a TO-MANY
+    /// M:N inverse (every other inverse in the schema targets a to-one field) — must
+    /// traverse from the Term side via the plain `get_links` verb, with NO backfill
+    /// step: the reverse edge is written by `link()` itself, so linking Post→Term is
+    /// alone sufficient for Term→Post to resolve.
+    #[tokio::test]
+    async fn term_objects_inverse_traverses_post_terms_both_ways() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(EmbeddedStore::open(tmp.path().join("db")).expect("open"));
+
+        let post_a = seed_post(&store, "a-post").await;
+        let post_b = seed_post(&store, "b-post").await;
+        let term = seed_term(&store, "space-opera").await;
+
+        // Forward links: both posts carry the term.
+        for post in [post_a, post_b] {
+            store
+                .link(&edge(POST_TYPE, post, "terms"), term, FieldMap::new())
+                .await
+                .expect("link post->term");
+        }
+
+        // Inverse traversal from the TERM side returns both posts (ids only; the
+        // edge FieldMap on an inverse read carries source-object internals we
+        // deliberately ignore — consume IDS ONLY, per the design note).
+        let via_inverse: Vec<ObjectId> = store
+            .get_links(&edge(TERM_TYPE, term, "objects"))
+            .await
+            .expect("get_links Term.objects")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(via_inverse.contains(&post_a), "post_a via inverse");
+        assert!(via_inverse.contains(&post_b), "post_b via inverse");
+        assert_eq!(via_inverse.len(), 2);
+
+        // The batched id-only fast path works on the inverse too (the archive
+        // rollup query's shape).
+        let batched = store
+            .get_links_many(&TypeName::from(TERM_TYPE), &[term], "objects")
+            .await
+            .expect("get_links_many Term.objects");
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0].len(), 2);
+
+        // Unlinking the forward edge retires the inverse: membership REMOVAL is
+        // visible from the Term side (though eventless — the serve layer's blunt
+        // evict covers that; this asserts the DATA is right).
+        store
+            .unlink(&edge(POST_TYPE, post_a, "terms"), term)
+            .await
+            .expect("unlink");
+        let after: Vec<ObjectId> = store
+            .get_links(&edge(TERM_TYPE, term, "objects"))
+            .await
+            .expect("get_links after unlink")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(after, vec![post_b], "unlinked post gone from the inverse");
+
+        // The forward direction still resolves for the surviving link.
+        let forward: Vec<ObjectId> = store
+            .get_links(&edge(POST_TYPE, post_b, "terms"))
+            .await
+            .expect("forward get_links")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(forward, vec![term]);
+    }
+
+    /// `Term.parent @on_delete(remove)`: deleting a parent term PROMOTES its
+    /// children to roots (the parent link is removed) — it does NOT cascade-delete
+    /// them. The admin term-delete handler's contract depends on exactly this.
+    /// `Term.taxonomy @on_delete(cascade)` is the opposite: deleting a Taxonomy
+    /// deletes its terms.
+    #[tokio::test]
+    async fn deleting_a_parent_term_promotes_children_and_taxonomy_delete_cascades() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(EmbeddedStore::open(tmp.path().join("db")).expect("open"));
+
+        let parent = seed_term(&store, "parent").await;
+        let child = seed_term(&store, "child").await;
+        store
+            .link(&edge(TERM_TYPE, child, "parent"), parent, FieldMap::new())
+            .await
+            .expect("link child->parent");
+
+        store
+            .delete(&TypeName::from(TERM_TYPE), parent)
+            .await
+            .expect("delete parent");
+
+        // The child SURVIVES, promoted to a root (no parent link).
+        let obj = store
+            .get(&TypeName::from(TERM_TYPE), child)
+            .await
+            .expect("child survives its parent's deletion");
+        assert_eq!(obj.id, child);
+        let parents = store
+            .get_links(&edge(TERM_TYPE, child, "parent"))
+            .await
+            .expect("get_links parent");
+        assert!(parents.is_empty(), "child promoted to root");
+
+        // Taxonomy delete CASCADES to its terms.
+        let mut tax_fields: FieldMap = FieldMap::new();
+        tax_fields.insert("key".to_owned(), Value::String("category".to_owned()));
+        tax_fields.insert("label".to_owned(), Value::String("Categories".to_owned()));
+        tax_fields.insert("hierarchical".to_owned(), Value::Bool(true));
+        tax_fields.insert("multiple".to_owned(), Value::Bool(true));
+        let tax = store
+            .create(&TypeName::from(TAXONOMY_TYPE), tax_fields)
+            .await
+            .expect("create taxonomy");
+        store
+            .link(&edge(TERM_TYPE, child, "taxonomy"), tax, FieldMap::new())
+            .await
+            .expect("link term->taxonomy");
+        store
+            .delete(&TypeName::from(TAXONOMY_TYPE), tax)
+            .await
+            .expect("delete taxonomy");
+        assert!(
+            store.get(&TypeName::from(TERM_TYPE), child).await.is_err(),
+            "taxonomy delete cascades to its terms"
+        );
+    }
+}

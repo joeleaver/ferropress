@@ -25,6 +25,28 @@ use crate::AppState;
 /// The default redirect status a move records — a permanent move.
 const REDIRECT_STATUS: u32 = 301;
 
+/// Path bases the PUBLIC URL grammar reserves, which top-level content must not
+/// occupy: `page` is the home-pagination base (`/page/N` — a Page rooted at `page`
+/// would collide with it in both routing and, worse, the listing cache namespace)
+/// and `feed` is reserved beside the `/feed.xml`/`/feed.atom` routes for future
+/// feed surfaces. Terms reserve the same tokens at EVERY level (see
+/// `terms::RESERVED_TERM_SLUGS`) because the archive grammar strips a trailing
+/// `/page/{N}` anywhere; content paths only ever collide at the ROOT.
+const RESERVED_TOP_LEVEL_SLUGS: &[&str] = &["page", "feed"];
+
+/// Reject a public path whose ROOT segment is a reserved URL base. `path_key` is a
+/// trimmed path key (a Post slug, or a Page's full materialized path) — only its
+/// first segment is checked, so a nested `about/page` stays legal.
+pub(super) fn ensure_unreserved_root(path_key: &str) -> Result<(), AdminError> {
+    let first = path_key.split('/').next().unwrap_or(path_key);
+    if RESERVED_TOP_LEVEL_SLUGS.contains(&first) {
+        return Err(AdminError::BadRequest(format!(
+            "the slug {first:?} is reserved (pagination / feeds)"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate + normalize a slug so it is exactly ONE flat path segment. The nested-permalink
 /// resolver splits a request path on `/` and keys a page on its full materialized `path`, so a
 /// slug carrying a `/` would forge hierarchy and collide; whitespace/control chars and the

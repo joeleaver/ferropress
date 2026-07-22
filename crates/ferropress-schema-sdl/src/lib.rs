@@ -122,6 +122,7 @@ type Term {
 
     taxonomy: Taxonomy @on_delete(cascade)
     parent: Term @on_delete(remove)
+    objects: [Post] @inverse(Post.terms)
 }
 
 type Post {
