@@ -182,10 +182,12 @@
         e.preventDefault();
         setExpanded(btn, btn.getAttribute('aria-expanded') !== 'true');
       });
-      // Mouse enhancement: hover opens; leaving closes unless focus is still inside.
-      li.addEventListener('pointerenter', function () { setExpanded(btn, true); });
-      li.addEventListener('pointerleave', function () {
-        if (!li.contains(document.activeElement)) setExpanded(btn, false);
+      // Mouse-ONLY enhancement: hover opens; leaving closes unless focus is still inside. On
+      // touch, a tap's pointerenter+synthetic-click would open-then-close the submenu (its links
+      // would stay unreachable), so touch/pen fall through to the click-toggle.
+      li.addEventListener('pointerenter', function (e) { if (e.pointerType === 'mouse') setExpanded(btn, true); });
+      li.addEventListener('pointerleave', function (e) {
+        if (e.pointerType === 'mouse' && !li.contains(document.activeElement)) setExpanded(btn, false);
       });
       // Tabbing focus OUT of the whole item closes it (deferred so activeElement settles).
       // Note: we deliberately do NOT open on focusin — that would reopen right after Escape.

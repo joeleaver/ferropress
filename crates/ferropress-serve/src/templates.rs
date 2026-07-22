@@ -296,9 +296,13 @@ main { padding: 2.4rem 0 3rem; }
         e.preventDefault();
         setExpanded(btn, btn.getAttribute('aria-expanded') !== 'true');
       });
-      li.addEventListener('pointerenter', function () { setExpanded(btn, true); });
-      li.addEventListener('pointerleave', function () {
-        if (!li.contains(document.activeElement)) setExpanded(btn, false);
+      // Hover-open is a MOUSE-only enhancement: on touch, a tap's pointerenter would open the
+      // submenu and the ensuing synthetic click would immediately toggle it shut, leaving the
+      // child links unreachable (aria-expanded is the sole reveal once JS is active). Touch/pen
+      // fall through to the click-toggle, which opens on the first tap.
+      li.addEventListener('pointerenter', function (e) { if (e.pointerType === 'mouse') setExpanded(btn, true); });
+      li.addEventListener('pointerleave', function (e) {
+        if (e.pointerType === 'mouse' && !li.contains(document.activeElement)) setExpanded(btn, false);
       });
       li.addEventListener('focusout', function () {
         setTimeout(function () {

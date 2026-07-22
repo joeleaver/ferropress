@@ -44,7 +44,7 @@ function moveSubtree(tree, srcCid, dest) {
   } else if (dest.type === 'before') {
     const a = indexOf(post, dest.cid);
     insAt = a;
-    newRoot = a === 0 ? 0 : post[a - 1].depth; // depth of the SURVIVING row above the gap (MF2)
+    newRoot = post[a].depth; // the anchor's OWN depth (its previous-sibling level), NOT the row above
   } else { // into
     const t = indexOf(post, dest.cid);
     insAt = subtreeEnd(post, t);
@@ -84,6 +84,22 @@ function randomTree(n) {
 
 const key = (t) => t.map((r) => r.cid + ':' + r.depth).join('|');
 const multiset = (t) => t.map((r) => r.cid).sort().join(',');
+// parent cid of each row (nearest preceding shallower row) — the flat model's parent relation.
+function parentMap(t) {
+  const m = {};
+  for (let i = 0; i < t.length; i++) {
+    let p = null;
+    for (let j = i - 1; j >= 0; j--) if (t[j].depth < t[i].depth) { p = t[j].cid; break; }
+    m[t[i].cid] = p;
+  }
+  return m;
+}
+// After a move, ONLY the dragged root may change parent; every other row must keep its parent.
+// (This is the invariant that catches a silent reparent the plain validity check would miss.)
+function reparentedOthers(before, after, srcCid) {
+  for (const cid in before) if (cid !== srcCid && before[cid] !== after[cid]) return cid;
+  return null;
+}
 
 let moves = 0, rejects = 0, checks = 0;
 const ROUNDS = 60000;
@@ -91,6 +107,7 @@ for (let round = 0; round < ROUNDS; round++) {
   const tree = randomTree(1 + Math.floor(rnd() * 12));
   const before = key(tree);
   const beforeSet = multiset(tree);
+  const beforeParents = parentMap(tree);
   const src = pick(tree).cid;
   const destType = pick(['before', 'into', 'end', 'before', 'into']); // weight the interesting ones
   let dest;
@@ -104,6 +121,8 @@ for (let round = 0; round < ROUNDS; round++) {
     const v = invariantOK(tree);
     if (v !== 'OK') { console.error(`FAIL invariant after move: ${v}\n  before=${before}\n  src=${src} dest=${JSON.stringify(dest)}\n  after=${key(tree)}`); process.exit(1); }
     if (multiset(tree) !== beforeSet) { console.error(`FAIL cid multiset changed\n  before=${before} (${beforeSet})\n  after=${key(tree)} (${multiset(tree)})\n  src=${src} dest=${JSON.stringify(dest)}`); process.exit(1); }
+    const bad = reparentedOthers(beforeParents, parentMap(tree), src);
+    if (bad) { console.error(`FAIL silently reparented a non-dragged row '${bad}' (${beforeParents[bad]} -> ${parentMap(tree)[bad]})\n  before=${before}\n  after=${key(tree)}\n  src=${src} dest=${JSON.stringify(dest)}`); process.exit(1); }
   } else {
     rejects++;
     if (key(tree) !== before) { console.error(`FAIL rejected move mutated the tree\n  before=${before}\n  after=${key(tree)}\n  src=${src} dest=${JSON.stringify(dest)}`); process.exit(1); }
@@ -140,6 +159,19 @@ function expect(name, cond) { if (!cond) { console.error('FAIL ' + name); proces
              { cid: 'S', depth: 0 }, { cid: 's1', depth: 1 }];
   expect('at-cap into accepted', moveSubtree(t, 'S', { type: 'into', cid: 't3' }) === true && invariantOK(t) === 'OK' && maxDepthIn(t) === 5);
 }
+// Regression (code-review MF1): dropping a top-level item into the gap BEFORE a first-child row
+// must place it at the child's OWN depth (as its previous sibling), NOT reparent the child's
+// subtree. [Home:0, About:0, Team:1(child of About), Blog:0]; drag Blog before Team.
+{
+  const t = [{ cid: 'Home', depth: 0 }, { cid: 'About', depth: 0 }, { cid: 'Team', depth: 1 }, { cid: 'Blog', depth: 0 }];
+  const beforeP = parentMap(t);
+  expect('reparent-regression moved', moveSubtree(t, 'Blog', { type: 'before', cid: 'Team' }) === true);
+  const afterP = parentMap(t);
+  expect('Team stays a child of About (not reparented under Blog)', afterP['Team'] === 'About');
+  expect('Blog becomes About\'s child (anchor depth), the only reparent', afterP['Blog'] === 'About' && !reparentedOthers(beforeP, afterP, 'Blog'));
+  expect('invariant holds', invariantOK(t) === 'OK');
+}
+
 // End drop always lands a subtree at top level.
 {
   const t = [{ cid: 'A', depth: 0 }, { cid: 'B', depth: 1 }, { cid: 'C', depth: 0 }];

@@ -3980,17 +3980,19 @@ fn outdent(tree: &mut Vec<MenuRow>, i: usize) {
     }
 }
 
-/// Where a dragged subtree is dropped. `Before` = as a sibling AT the gap (the depth of the
-/// surviving row above it); `Into` = as the target's LAST child (its depth + 1); `End` = appended
-/// at the top level. The `String` is the anchor/target row's cid.
+/// Where a dragged subtree is dropped. `Before` = as the anchor row's PREVIOUS SIBLING (at the
+/// anchor's own depth); `Into` = as the target's LAST child (its depth + 1); `End` = appended at
+/// the top level. The `String` is the anchor/target row's cid.
 enum DropDest {
     Before(String),
     Into(String),
     End,
 }
 
-/// Move the subtree rooted at `src` to `dest`, re-basing every moved row's depth uniformly.
-/// Returns whether the tree changed. REJECTS (no-op) a drop whose anchor/target lies inside the
+/// Move the subtree rooted at `src` to `dest`, re-basing every moved row's depth uniformly so the
+/// only row that changes parent is the moved root (a `Before` drop places it at the anchor's own
+/// depth, a `Into` under the target, an `End` at the top). Returns whether the tree changed.
+/// REJECTS (no-op) a drop whose anchor/target lies inside the
 /// moving subtree (the is-descendant guard — can't nest a node into its own subtree) and one that
 /// would push any moved row past [`MAX_MENU_DEPTH`] (bounce, never silently clamp — matching the
 /// keyboard indent's disable and the server's reject). Because it only reorders + re-depths
@@ -4022,8 +4024,12 @@ fn move_subtree(tree: &mut Vec<MenuRow>, src: &str, dest: &DropDest) -> bool {
         DropDest::End => (post.len(), 0u32),
         DropDest::Before(cid) => {
             let a = index_of(&post, cid).expect("anchor survived the cut");
-            let root = if a == 0 { 0 } else { post[a - 1].depth };
-            (a, root)
+            // Insert as the anchor's PREVIOUS SIBLING → the anchor's OWN depth. (Using the row
+            // ABOVE the gap would land a first-child anchor's block at that shallower depth and
+            // silently REPARENT the anchor's whole subtree under the dropped item — a valid,
+            // cid-preserving tree the fuzz can't flag, so it's asserted in the fuzz's
+            // parent-preservation check instead.)
+            (a, post[a].depth)
         }
         DropDest::Into(cid) => {
             let t = index_of(&post, cid).expect("target survived the cut");
