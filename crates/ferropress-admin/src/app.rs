@@ -202,6 +202,10 @@ struct MenuCtx {
     picker_query: Signal<String>,
     /// 0 = Pages, 1 = Posts, 2 = Custom link.
     picker_tab: Signal<u8>,
+    /// The candidates checked for a BULK add (accumulates across searches within a tab; cleared on
+    /// open/close/tab-switch so a Pages selection can't leak into Posts). "Add N selected" commits
+    /// them all at once (dedup-guarded against items already in the tree).
+    picker_selected: Signal<Vec<api::LinkCandidate>>,
     custom_url: Signal<String>,
     custom_label: Signal<String>,
     picker_err: Signal<String>,
@@ -362,6 +366,7 @@ pub fn app() -> NodeHandle {
         candidates_gen: Signal::new(0u64),
         picker_query: Signal::new(String::new()),
         picker_tab: Signal::new(0u8),
+        picker_selected: Signal::new(Vec::<api::LinkCandidate>::new()),
         custom_url: Signal::new(String::new()),
         custom_label: Signal::new(String::new()),
         picker_err: Signal::new(String::new()),
@@ -1261,9 +1266,9 @@ pub fn app() -> NodeHandle {
                         }
                         div { class: "media-modal__body",
                             div { class: "tabs",
-                                button { class: {move || tab_class(menu.picker_tab.get(), 0)}, onclick: move || menu.picker_tab.set(0), "Pages" }
-                                button { class: {move || tab_class(menu.picker_tab.get(), 1)}, onclick: move || menu.picker_tab.set(1), "Posts" }
-                                button { class: {move || tab_class(menu.picker_tab.get(), 2)}, onclick: move || menu.picker_tab.set(2), "Custom link" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), 0)}, onclick: move || switch_picker_tab(menu, 0), "Pages" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), 1)}, onclick: move || switch_picker_tab(menu, 1), "Posts" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), 2)}, onclick: move || switch_picker_tab(menu, 2), "Custom link" }
                             }
                             // Search box (Pages/Posts tabs).
                             if menu.picker_tab.get() != 2 {
@@ -1278,15 +1283,12 @@ pub fn app() -> NodeHandle {
                             if matches!(menu.candidates_state.get(), Load::Loading) && menu.picker_tab.get() != 2 {
                                 div { class: "media-modal__state", "Loading targets\u{2026}" }
                             }
+                            // Pages/Posts: click a candidate to TOGGLE its checkbox (the picker
+                            // stays open); "Add N selected" in the footer commits them all at once.
                             match menu.picker_tab.get() {
                                 0 => div {
                                     for c in menu.candidates.get().pages {
-                                        button {
-                                            key: c.id, r#type: "button", class: "candidate",
-                                            onclick: { let cand = c.clone(); move || add_candidate_item(menu, cand.clone()) },
-                                            span { class: "candidate__title", {if c.title.is_empty() { c.href.clone() } else { c.title.clone() }} }
-                                            span { class: "candidate__href", {c.href.clone()} }
-                                        }
+                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree }
                                     }
                                     if matches!(menu.candidates_state.get(), Load::Ready) && menu.candidates.get().pages.is_empty() {
                                         div { class: "truncnote", "No matching pages." }
@@ -1294,12 +1296,7 @@ pub fn app() -> NodeHandle {
                                 },
                                 1 => div {
                                     for c in menu.candidates.get().posts {
-                                        button {
-                                            key: c.id, r#type: "button", class: "candidate",
-                                            onclick: { let cand = c.clone(); move || add_candidate_item(menu, cand.clone()) },
-                                            span { class: "candidate__title", {if c.title.is_empty() { c.href.clone() } else { c.title.clone() }} }
-                                            span { class: "candidate__href", {c.href.clone()} }
-                                        }
+                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree }
                                     }
                                     if menu.candidates.get().posts_truncated {
                                         div { class: "truncnote", "More posts exist \u{2014} refine your search." }
@@ -1333,6 +1330,15 @@ pub fn app() -> NodeHandle {
                             }
                         }
                         div { class: "media-modal__foot",
+                            // Bulk "Add to menu" for the Pages/Posts tabs (the Custom tab has its
+                            // own "Add custom link" button in its form).
+                            if menu.picker_tab.get() != 2 {
+                                button {
+                                    class: "btn btn--primary", style: "width:auto",
+                                    onclick: move || add_selected_items(menu),
+                                    {move || { let n = menu.picker_selected.get().len(); if n == 0 { "Add to menu".to_owned() } else { format!("Add {n} selected") } }}
+                                }
+                            }
                             button { class: "btn btn--quiet", style: "width:auto", onclick: move || close_picker(menu), "Done" }
                         }
                     }
@@ -3506,16 +3512,24 @@ fn open_picker(menu: MenuCtx) {
     }
     menu.picker_err.set(String::new());
     menu.picker_query.set(String::new());
+    menu.picker_selected.set(Vec::new());
     menu.picker_open.set(true);
     reload_candidates(menu);
     focus_first_modal_input();
 }
 
 /// Close the add-item picker, restoring focus to the opener (the "+ Add item" button) so a
-/// keyboard user isn't stranded on `document.body` (F7).
+/// keyboard user isn't stranded on `document.body` (F7). Clears any pending bulk selection.
 fn close_picker(menu: MenuCtx) {
+    menu.picker_selected.set(Vec::new());
     menu.picker_open.set(false);
     focus_add_item_button();
+}
+
+/// Switch the picker tab, clearing the bulk selection so a Pages selection can't leak into Posts.
+fn switch_picker_tab(menu: MenuCtx, tab: u8) {
+    menu.picker_tab.set(tab);
+    menu.picker_selected.set(Vec::new());
 }
 
 /// Fetch the link candidates for the current search query. Guards against out-of-order
@@ -3543,19 +3557,82 @@ fn reload_candidates(menu: MenuCtx) {
     });
 }
 
-/// Append a Post/Page item (from a picked candidate) at the top level.
-fn add_candidate_item(menu: MenuCtx, cand: api::LinkCandidate) {
-    let kind = if cand.kind == "page" {
+/// The [`RowKind`] a link candidate implies (`"page"` → Page, else Post).
+fn candidate_kind(cand: &api::LinkCandidate) -> RowKind {
+    if cand.kind == "page" {
         RowKind::Page(cand.id)
     } else {
         RowKind::Post(cand.id)
-    };
-    let resolved = Some(api::ResolvedTarget {
-        title: cand.title,
-        href: Some(cand.href),
-    });
-    add_row(menu, kind, resolved, String::new(), String::new());
+    }
+}
+
+/// Append every checked candidate at the top level in one batch (dedup-guarded against items
+/// already in the tree — defensive, since [`CandidateRow`] hides already-added ones), then clear
+/// the selection and close the picker. A no-op with nothing selected.
+fn add_selected_items(menu: MenuCtx) {
+    let selected = menu.picker_selected.get();
+    if selected.is_empty() {
+        return;
+    }
+    for cand in selected {
+        let kind = candidate_kind(&cand);
+        if menu.tree.get().iter().any(|r| r.kind == kind) {
+            continue; // already in the menu
+        }
+        let resolved = Some(api::ResolvedTarget {
+            title: cand.title,
+            href: Some(cand.href),
+        });
+        add_row(menu, kind, resolved, String::new(), String::new());
+    }
     close_picker(menu);
+}
+
+/// One pickable Post/Page candidate row (Pages/Posts tabs). Clicking TOGGLES its checkbox in the
+/// bulk `selected` list (the picker stays open); a candidate already in the tree renders as a
+/// non-interactive "already in menu" row (dedup at the source). Its own `#[component]` so the
+/// toggle closure can own the non-Copy candidate while the reactive checkbox reads only Copy state.
+#[component]
+fn CandidateRow(
+    cand: api::LinkCandidate,
+    selected: Signal<Vec<api::LinkCandidate>>,
+    tree: Signal<Vec<MenuRow>>,
+) -> NodeHandle {
+    let id = cand.id;
+    let kind = candidate_kind(&cand);
+    let title = if cand.title.is_empty() {
+        cand.href.clone()
+    } else {
+        cand.title.clone()
+    };
+    let href = cand.href.clone();
+    // Already in the tree? The tree can't change while the picker is open, so a one-shot read.
+    if tree.get().iter().any(|r| r.kind == kind) {
+        return rsx! {
+            div { class: "candidate is-added",
+                span { class: "candidate__check", "\u{2713}" }
+                span { class: "candidate__title", {title} }
+                span { class: "candidate__href", "already in menu" }
+            }
+        };
+    }
+    let cand_toggle = cand.clone();
+    rsx! {
+        button {
+            r#type: "button",
+            class: {move || if selected.get().iter().any(|c| c.id == id) { "candidate is-selected" } else { "candidate" }},
+            onclick: move || selected.update(|v| {
+                if let Some(pos) = v.iter().position(|c| c.id == id) {
+                    v.remove(pos);
+                } else {
+                    v.push(cand_toggle.clone());
+                }
+            }),
+            span { class: "candidate__check", {move || if selected.get().iter().any(|c| c.id == id) { "\u{2611}" } else { "\u{2610}" }} }
+            span { class: "candidate__title", {title} }
+            span { class: "candidate__href", {href} }
+        }
+    }
 }
 
 /// Validate + append a Custom-link item (an empty label is fine — it falls back to the URL).

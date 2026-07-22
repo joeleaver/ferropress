@@ -742,8 +742,9 @@ pub struct MenuLocationRow {
 }
 
 /// One pickable target from `GET /admin/api/menus/link-candidates` — a PUBLISHED Post or
-/// Page, with the href it will resolve to.
-#[derive(Clone, PartialEq, Deserialize)]
+/// Page, with the href it will resolve to. (`Default` only to satisfy the rinch `#[component]`
+/// macro — `CandidateRow` takes it as a prop.)
+#[derive(Clone, PartialEq, Default, Deserialize)]
 pub struct LinkCandidate {
     #[serde(default)]
     pub kind: String,

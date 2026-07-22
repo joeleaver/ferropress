@@ -497,12 +497,17 @@ const ADMIN_CSS: &str = r#"
 }
 .tab.is-on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 .candidate {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; width: 100%;
-  text-align: left; padding: .5rem .6rem; background: transparent; border: 0; border-bottom: 1px solid var(--rule); color: inherit; font: inherit;
+  display: flex; align-items: center; gap: .6rem; width: 100%;
+  text-align: left; padding: .5rem .6rem; background: transparent; border: 0; border-bottom: 1px solid var(--rule); color: inherit; font: inherit; cursor: pointer;
 }
 .candidate:hover { background: var(--paper-sink); }
-.candidate__title { font-family: var(--ff-display); font-size: 1rem; color: var(--ink); }
-.candidate__href { font-family: var(--ff-mono); font-size: .72rem; color: var(--steel); }
+.candidate.is-selected { background: var(--paper-sink); }
+.candidate.is-added { cursor: default; opacity: .55; }
+.candidate__check { flex: 0 0 auto; width: 1.15rem; font-size: 1rem; line-height: 1; color: var(--steel); }
+.candidate.is-selected .candidate__check { color: var(--minium-deep); }
+.candidate.is-added .candidate__check { color: var(--green); }
+.candidate__title { flex: 1 1 auto; font-family: var(--ff-display); font-size: 1rem; color: var(--ink); }
+.candidate__href { flex: 0 0 auto; font-family: var(--ff-mono); font-size: .72rem; color: var(--steel); }
 .truncnote { font-family: var(--ff-mono); font-size: .72rem; color: var(--ochre); padding: .5rem .6rem; }
 .pickerfield { margin-bottom: .9rem; }
 .pickerfield > label { display: block; font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--steel); margin-bottom: .35rem; }
