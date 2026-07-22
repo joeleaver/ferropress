@@ -3867,3 +3867,146 @@ async fn plugin_setting_change_does_not_evict_the_feed_for_a_draft_only_match() 
         "a plugin used only by a DRAFT post must NOT evict the feed (published-only membership)",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Taxonomies: the live TaxonomyHandle reload + the blunt archive-subtree evict
+// ---------------------------------------------------------------------------
+
+/// Seed a Taxonomy row + one Term linked to it (the migrate tool's / admin's
+/// shape, reduced to the fields the serve loader reads). Returns the term's id.
+async fn seed_term(
+    store: &Arc<dyn RhypeStore>,
+    taxonomy_key: &str,
+    slug: &str,
+    name: &str,
+) -> ObjectId {
+    let mut t: HashMap<String, Value> = HashMap::new();
+    t.insert("key".to_owned(), Value::String(taxonomy_key.to_owned()));
+    t.insert("label".to_owned(), Value::String(taxonomy_key.to_owned()));
+    t.insert("hierarchical".to_owned(), Value::Bool(true));
+    t.insert("multiple".to_owned(), Value::Bool(true));
+    t.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let tax_id = store
+        .create(&TypeName::from(ferropress_core::TAXONOMY_TYPE), t)
+        .await
+        .expect("seed taxonomy");
+
+    let mut f: HashMap<String, Value> = HashMap::new();
+    f.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    f.insert("name".to_owned(), Value::String(name.to_owned()));
+    f.insert("description".to_owned(), Value::String(String::new()));
+    f.insert("plaintext".to_owned(), Value::String(name.to_owned()));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let term_id = store
+        .create(&TypeName::from(ferropress_core::TERM_TYPE), f)
+        .await
+        .expect("seed term");
+    store
+        .link(
+            &Edge {
+                type_name: TypeName::from(ferropress_core::TERM_TYPE),
+                id: term_id,
+                field: "taxonomy".to_owned(),
+            },
+            tax_id,
+            HashMap::new(),
+        )
+        .await
+        .expect("link term to taxonomy");
+    term_id
+}
+
+#[tokio::test]
+async fn a_term_change_reloads_the_handle_and_blunt_evicts_only_the_archive_subtree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, _theme) = boot(tmp.path());
+    let term_id = seed_term(&store, "category", "news", "News").await;
+
+    // A stale handle (empty) + a warmed cache: two fake archive entries under the
+    // term subtree, plus a permalink and the front page that must SURVIVE.
+    let handle = crate::TaxonomyHandle::default();
+    assert!(handle.current().is_empty());
+    let archive1 =
+        ferropress_core::ports::BlobKey("prerender/listing/term/category/news.html".to_owned());
+    let archive2 = ferropress_core::ports::BlobKey(
+        "prerender/listing/term/category/news/page/2.html".to_owned(),
+    );
+    let permalink = cache_key("/hello-world");
+    let front = cache_key("/");
+    for key in [&archive1, &archive2, &permalink, &front] {
+        blobs.put(key, b"cached".to_vec()).await.unwrap();
+    }
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_taxonomies(handle.clone());
+
+    engine
+        .apply_change(&Change {
+            version: 1,
+            kind: ChangeKind::Update,
+            type_name: TypeName::from(ferropress_core::TERM_TYPE),
+            object_id: term_id,
+            fields: None,
+            origin: None,
+        })
+        .await
+        .expect("term change applies");
+
+    // The handle was full-reloaded from the store…
+    let set = handle.current();
+    assert_eq!(
+        set.archive_href(term_id.0).as_deref(),
+        Some("/category/news"),
+        "the reloaded set resolves the seeded term",
+    );
+    assert_eq!(set.resolve_archive_path("category/news"), Some(term_id.0));
+    // …the whole archive subtree is gone…
+    assert!(!blobs.exists(&archive1).await.unwrap());
+    assert!(!blobs.exists(&archive2).await.unwrap());
+    // …and nothing else was touched.
+    assert!(
+        blobs.exists(&permalink).await.unwrap(),
+        "permalinks survive"
+    );
+    assert!(
+        blobs.exists(&front).await.unwrap(),
+        "the front page survives"
+    );
+}
+
+#[tokio::test]
+async fn a_post_change_blunt_evicts_the_archive_subtree_too() {
+    // A post's archive membership lives in eventless Post.terms links absent from
+    // the change snapshot, so ANY post change must evict every archive (the
+    // pinned blunt strategy) — while permalink handling proceeds as before.
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, _theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Published).await;
+
+    let archive =
+        ferropress_core::ports::BlobKey("prerender/listing/term/category/news.html".to_owned());
+    blobs.put(&archive, b"cached".to_vec()).await.unwrap();
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    );
+    engine
+        .apply_change(&change(ChangeKind::Update, id))
+        .await
+        .expect("post change applies");
+
+    assert!(
+        !blobs.exists(&archive).await.unwrap(),
+        "a post change must blunt-evict the term-archive subtree",
+    );
+    assert!(
+        blobs.exists(&cache_key(&format!("/{SLUG}"))).await.unwrap(),
+        "the post's own permalink regen still ran (write-through)",
+    );
+}

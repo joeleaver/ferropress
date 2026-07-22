@@ -28,7 +28,7 @@ use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{Object, TypeName, Value};
 use ferropress_core::{
     BlockTree, MENU_ITEM_TYPE, MENU_LOCATION_TYPE, MENU_TYPE, PAGE_TYPE, POST_TYPE, REDIRECT_TYPE,
-    USER_TYPE,
+    TAXONOMY_TYPE, TERM_TYPE, USER_TYPE,
 };
 use ferropress_render::CustomBlockRenderer;
 
@@ -42,6 +42,7 @@ pub mod hook_bridge;
 pub mod menus;
 pub mod redirects;
 pub mod settings;
+pub mod taxonomies;
 pub mod templates;
 pub mod themes;
 
@@ -57,6 +58,7 @@ pub use hook_bridge::HookBridge;
 pub use menus::{MAX_NAV_DEPTH, MenuHandle, MenuItemCtx, MenuNode, MenuSet, load_menus};
 pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects};
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
+pub use taxonomies::{TaxonomyHandle, TaxonomyInfo, TaxonomySet, TermEntry, load_taxonomies};
 pub use themes::{ThemeHandle, ThemeRegistry};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
@@ -71,6 +73,16 @@ pub struct OutputPage {
 /// The `BlobKey` namespace prefix for prerendered pages. Keeps the rendered-HTML
 /// cache in its own subtree of the blob root, away from media originals.
 const CACHE_PREFIX: &str = "prerender";
+
+/// The LISTING subtree every term-archive page is cached under — the unit of the
+/// taxonomy slice's blunt subtree eviction (see
+/// [`ServeEngine::evict_term_archives`]). Inside `listing/` (which no permalink
+/// slug can reach — see [`cache_key`]) with its own `term/` segment, so evicting
+/// every archive touches neither the front page, the feed, nor any permalink.
+/// Archive keys are `{prefix}/{term_path}.html` (page 1) and
+/// `{prefix}/{term_path}/page/{n}.html` — a term slugged `page` is unrepresentable
+/// (reserved at create), so the two shapes can never collide.
+pub(crate) const TERM_ARCHIVE_CACHE_PREFIX: &str = "prerender/listing/term";
 
 /// Map a request path to its deterministic, traversal-safe prerender-cache key.
 ///
@@ -208,6 +220,13 @@ pub struct ServeEngine {
     /// reload. `None` (tests) skips the update; targets resolve to nothing. Same handle the
     /// HTTP read path holds.
     content_index: Option<content_index::ContentIndexHandle>,
+    /// The live taxonomy set the read path resolves term archives, chips, and nav Term
+    /// targets from. When present, a `Taxonomy`/`Term` change on the feed FULL-reloads it
+    /// (see [`apply_change`](Self::apply_change)); the SAME change also blunt-evicts the
+    /// whole term-archive cache subtree (`prerender/listing/term/`) — that eviction is NOT
+    /// gated on the handle (the read path caches archives regardless). `None` (tests) skips
+    /// the reload; no archive resolves. Same handle the HTTP read path holds.
+    taxonomies: Option<taxonomies::TaxonomyHandle>,
 }
 
 impl ServeEngine {
@@ -229,6 +248,7 @@ impl ServeEngine {
             theme: None,
             menus: None,
             content_index: None,
+            taxonomies: None,
         }
     }
 
@@ -283,6 +303,16 @@ impl ServeEngine {
     /// that targets it (the target's live href/title) with no menu edit.
     pub fn with_content_index(mut self, content_index: content_index::ContentIndexHandle) -> Self {
         self.content_index = Some(content_index);
+        self
+    }
+
+    /// Wire the live [`TaxonomyHandle`](taxonomies::TaxonomyHandle) so the regen loop
+    /// FULL-reloads it whenever a `Taxonomy`/`Term` changes on the feed. Pass the SAME handle
+    /// the HTTP read path holds, so a term rename/re-parent re-resolves every chip, archive
+    /// heading, and nav Term target on the next request. (The accompanying blunt archive-cache
+    /// evict runs whether or not a handle is wired.)
+    pub fn with_taxonomies(mut self, taxonomies: taxonomies::TaxonomyHandle) -> Self {
+        self.taxonomies = Some(taxonomies);
         self
     }
 
@@ -471,6 +501,33 @@ impl ServeEngine {
             return Ok(());
         }
 
+        // A `Taxonomy`/`Term` change FULL-reloads the live taxonomy set (chips, archive
+        // headings, and nav Term targets re-resolve live — no permalink is evicted for a
+        // rename, the byline discipline) AND blunt-evicts the whole term-archive cache
+        // subtree. The blunt evict is the pinned strategy, not imprecision: membership
+        // edits are eventless links invisible to any precise scheme (a re-parent is
+        // link-only even with the `_rev` touch; unlink emits nothing), rollup couples
+        // every ancestor archive to a descendant move, and a slug change moves its own +
+        // all descendants' URLs — so ANY Term change evicts ALL archives. Over-evicting
+        // ~dozens of lazily-rebuilt listing pages is cheap; a stale rolled-up archive is
+        // silent wrongness. Permalinks are never touched. Reload BEFORE evict so a
+        // rebuild racing the evict composes from the fresh forest.
+        if ty == TAXONOMY_TYPE || ty == TERM_TYPE {
+            if let Some(taxonomies) = &self.taxonomies {
+                match taxonomies::load_taxonomies(&self.store).await {
+                    Ok(next) => {
+                        taxonomies.set(next);
+                        tracing::debug!("reloaded taxonomy set from change feed");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to reload taxonomy set"),
+                }
+            }
+            // NOT gated on the handle: the read path caches archives regardless of what
+            // THIS engine holds (the evict_front discipline).
+            self.evict_term_archives().await;
+            return Ok(());
+        }
+
         // Only content types map to a page in permalinks v1.
         if ty != POST_TYPE && ty != PAGE_TYPE {
             return Ok(());
@@ -500,8 +557,16 @@ impl ServeEngine {
         // the pushed-out post needs no event). Evict here (before the slug-gated permalink
         // handling below, so even a slug-less post DELETE still evicts); the read path rebuilds.
         // A PAGE change never touches the feed. Best-effort, like `evict_front`.
+        //
+        // The same post change also blunt-evicts EVERY term archive: the post's membership
+        // (which archives list it) lives in eventless `Post.terms` links absent from this
+        // change's scalar snapshot — precise eviction could see terms JOINED but never LEFT —
+        // and the save's settling Update fires after the links precisely so THIS evict runs
+        // against the reconciled membership. Any-post-change (not published-only): an
+        // unpublish must evict, and the previous status isn't on the snapshot.
         if ty == POST_TYPE {
             self.evict_feed().await;
+            self.evict_term_archives().await;
         }
 
         match change.kind {
@@ -631,6 +696,19 @@ impl ServeEngine {
     async fn evict_feed(&self) {
         if let Err(e) = self.blobs.delete(&feed::feed_cache_key()).await {
             tracing::warn!(error = %e, "evicting the syndication feed prerender cache failed");
+        }
+    }
+
+    /// Blunt-evict the ENTIRE term-archive cache subtree ([`TERM_ARCHIVE_CACHE_PREFIX`]) —
+    /// one recursive `delete_prefix`, the taxonomy slice's pinned invalidation strategy
+    /// (membership/hierarchy edits are eventless links no precise scheme can track; see the
+    /// call sites). **Best-effort** like [`evict_front`](Self::evict_front): archives are
+    /// lazily rebuilt on the next request, so a cache fault is logged, never propagated.
+    /// Idempotent (an empty subtree is a no-op).
+    async fn evict_term_archives(&self) {
+        let prefix = BlobKey(TERM_ARCHIVE_CACHE_PREFIX.to_owned());
+        if let Err(e) = self.blobs.delete_prefix(&prefix).await {
+            tracing::warn!(error = %e, "evicting the term-archive prerender cache subtree failed");
         }
     }
 

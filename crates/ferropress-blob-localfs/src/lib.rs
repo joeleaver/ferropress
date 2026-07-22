@@ -387,7 +387,10 @@ mod tests {
             "prerender/listing/term/category/news/page/2.html",
             "prerender/listing/term/tag/rust.html",
         ] {
-            assert!(!store.exists(&BlobKey(gone.into())).await.unwrap(), "{gone}");
+            assert!(
+                !store.exists(&BlobKey(gone.into())).await.unwrap(),
+                "{gone}"
+            );
         }
         for kept in ["prerender/listing/index.html", "prerender/page/about.html"] {
             assert!(store.exists(&BlobKey(kept.into())).await.unwrap(), "{kept}");
@@ -430,7 +433,12 @@ mod tests {
     #[tokio::test]
     async fn list_prefix_walks_sorted_and_skips_tmp_files() {
         let (_dir, store) = store();
-        for k in ["t/b/two.html", "t/a/one.html", "t/zero.html", "other/x.html"] {
+        for k in [
+            "t/b/two.html",
+            "t/a/one.html",
+            "t/zero.html",
+            "other/x.html",
+        ] {
             store.put(&BlobKey(k.into()), b"x".to_vec()).await.unwrap();
         }
         // A lingering in-flight temp file (crashed put) must not be listed.
