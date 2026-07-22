@@ -27,8 +27,13 @@
 //! * **Archive-path collision guard**: a term's computed public archive path
 //!   (`{taxonomy_key}/{ancestor slugs…}/{slug}`) must not equal an existing Post slug
 //!   or Page path (any status — a draft that later publishes would collide), or the
-//!   term archive would silently shadow live content. Checked for the term AND — on a
-//!   rename/re-parent — every descendant (their paths move too).
+//!   term archive would silently shadow live content. Checked for every path that
+//!   MOVES: on create, on a rename/re-parent (the term + every descendant), and on a
+//!   delete (the re-homed children + their subtrees). An UNCHANGED path is never
+//!   re-checked — a later-arising occupant must not brick name-only edits. The guard
+//!   is BIDIRECTIONAL: the page handlers run the reverse check
+//!   ([`all_term_archive_paths`]) under this same lock, so neither creation order
+//!   can land a page and a term archive on one path.
 //! * **Reserved slugs**: `page` (the pagination path token — `/…/page/2` must never
 //!   be parseable as a term) and `feed` (future per-archive feeds) are forbidden term
 //!   slugs at every level.
@@ -315,6 +320,14 @@ pub async fn update(
     };
 
     let rows = load_term_rows(&state, taxonomy_id).await?;
+    let old_parent = rows.get(&id).and_then(|r| r.parent);
+    let old_slug = str_field(&current, "slug").unwrap_or_default();
+    // Whether this write moves the term in the path namespace at all. A name/
+    // description-only edit keeps (slug, parent) — and therefore every archive
+    // path — byte-identical, so the collision guards below are SKIPPED for it:
+    // re-checking an UNCHANGED path would let an externally-arising occupant (or
+    // pre-existing corrupt data) permanently brick ordinary edits of this term.
+    let path_moved = slug != old_slug || body.parent != old_parent;
 
     // Parent guards (same rules as create, plus the self/descendant cycle check and
     // the moved-subtree depth budget).
@@ -347,30 +360,47 @@ pub async fn update(
         }
     }
 
-    // Per-sibling uniqueness under the DESIRED parent, excluding self.
-    if sibling_slug_taken(&rows, body.parent, &slug, Some(id)) {
-        return Err(AdminError::Conflict(format!(
-            "a sibling term with the slug {slug:?} already exists"
-        )));
-    }
-
-    // The term's archive path — and every descendant's — after this write. Simulate
-    // the post-write tree and collision-check each moved path against the permalink
-    // namespace (a Page at `category/news` must not be shadowed).
-    let mut next = rows.clone();
-    if let Some(row) = next.get_mut(&id) {
-        row.slug = slug.clone();
-        row.parent = body.parent;
-    }
-    let mut moved: Vec<u64> = vec![id];
-    moved.extend(descendants_of(&next, id));
-    for term in moved {
-        let path = archive_path(&taxonomy_key, &next, term);
-        if content_ops::is_taken(&state, &path, &[]).await? {
+    if path_moved {
+        // Per-sibling uniqueness under the DESIRED parent, excluding self.
+        if sibling_slug_taken(&rows, body.parent, &slug, Some(id)) {
             return Err(AdminError::Conflict(format!(
-                "the archive path {path:?} is already used by a post or page"
+                "a sibling term with the slug {slug:?} already exists"
             )));
         }
+
+        // The term's archive path — and every descendant's — after this write.
+        // Simulate the post-write tree and collision-check each moved path against
+        // the permalink namespace (a Page at `category/news` must not be shadowed).
+        let mut next = rows.clone();
+        if let Some(row) = next.get_mut(&id) {
+            row.slug = slug.clone();
+            row.parent = body.parent;
+        }
+        let mut moved: Vec<u64> = vec![id];
+        moved.extend(descendants_of(&next, id));
+        for term in moved {
+            let path = archive_path(&taxonomy_key, &next, term);
+            if content_ops::is_taken(&state, &path, &[]).await? {
+                return Err(AdminError::Conflict(format!(
+                    "the archive path {path:?} is already used by a post or page"
+                )));
+            }
+        }
+    }
+
+    // Relation work FIRST, the scalar update LAST — the posts.rs save discipline:
+    // the parent re-link is eventless (rhypedb link/unlink emit nothing), so the
+    // scalar Update below doubles as the settling event, fired only AFTER the link
+    // work committed. A re-link fault here leaves the term entirely UNTOUCHED
+    // (old parent, old slug) instead of the reverse order's unvalidated
+    // (old-parent, new-slug) stranding.
+    if body.parent != old_parent {
+        super::reconcile_to_one(
+            &state.store,
+            &term_edge(ObjectId(id), "parent"),
+            body.parent.map(ObjectId),
+        )
+        .await?;
     }
 
     let mut patch: FieldMap = FieldMap::new();
@@ -384,22 +414,33 @@ pub async fn update(
         "plaintext".to_owned(),
         Value::String(term_plaintext(&name, &body.description)),
     );
-    state
+    // The scalar write IS the settling event (one real Term Update after the link
+    // work — no separate touch needed). If it faults after a successful re-link,
+    // revert the link so the term is never stranded at the unvalidated
+    // (new-parent, old-slug) combination; both link ops are eventless, so a
+    // successful revert is a net zero the live handle never needs to see.
+    if let Err(e) = state
         .store
         .update(&TypeName::from(TERM_TYPE), ObjectId(id), patch)
-        .await?;
-
-    // Reconcile the to-one parent link to the desired value (link-new-first idiom).
-    super::reconcile_to_one(
-        &state.store,
-        &term_edge(ObjectId(id), "parent"),
-        body.parent.map(ObjectId),
-    )
-    .await?;
-
-    // Settle: the parent reconcile is eventless link work; end with one real Term
-    // Update so the (Inc-2) live handle reload sees the finished state.
-    touch_term(&state, ObjectId(id)).await?;
+        .await
+    {
+        if body.parent != old_parent
+            && let Err(revert) = super::reconcile_to_one(
+                &state.store,
+                &term_edge(ObjectId(id), "parent"),
+                old_parent.map(ObjectId),
+            )
+            .await
+        {
+            tracing::error!(
+                error = ?revert,
+                term_id = id,
+                "failed to revert the parent re-link after a scalar-update fault; \
+                 the term is stranded at (new parent, old slug) until a retry"
+            );
+        }
+        return Err(e.into());
+    }
 
     Ok(Json(TermRef {
         id,
@@ -409,10 +450,20 @@ pub async fn update(
     }))
 }
 
-/// `DELETE /admin/api/terms/{id}` — delete a term (`ManageTerms`). By SDL policy the
-/// children are PROMOTED to roots (`parent @on_delete(remove)` unlinks, never
-/// cascades — proven in the store tests) and every post's membership link is
-/// dropped (`Post.terms @on_delete(remove)`). 404 for a term that never existed.
+/// `DELETE /admin/api/terms/{id}` — delete a term (`ManageTerms`). Child handling
+/// is WP-faithful (`wp_delete_term`): the children are RE-PARENTED to the deleted
+/// term's OWN parent first; for a root term that means becoming roots, which the
+/// SDL default (`parent @on_delete(remove)` unlinks, never cascades — proven in
+/// the store tests) already produces without any re-link. Every post's membership
+/// link is dropped (`Post.terms @on_delete(remove)`). 404 for a term that never
+/// existed.
+///
+/// Re-homing changes every child's (parent, slug) pair AND shortens its (and its
+/// whole subtree's) archive path — the same moves `update` guards — so delete runs
+/// the same checks over the simulated post-delete tree and 409s (naming the
+/// offending child) rather than silently violating per-sibling uniqueness or
+/// landing a promoted archive path on a live post/page. Delete must not be the one
+/// mutation that can break the invariants every other mutation enforces.
 pub async fn delete(
     State(state): State<AppState>,
     who: AuthedUser,
@@ -425,11 +476,114 @@ pub async fn delete(
         .store
         .get(&TypeName::from(TERM_TYPE), ObjectId(id))
         .await?;
-    state
+
+    // A taxonomy-less term is corrupt data (create links one, cascade deletes it);
+    // deleting it can only help — skip the guards and just drop it.
+    let (rows, taxonomy_key) =
+        match single_link(&state, TERM_TYPE, ObjectId(id), "taxonomy").await? {
+            Some(tid) => {
+                let taxonomy = state.store.get(&TypeName::from(TAXONOMY_TYPE), tid).await?;
+                (
+                    load_term_rows(&state, tid).await?,
+                    str_field(&taxonomy, "key").unwrap_or_default(),
+                )
+            }
+            None => (HashMap::new(), String::new()),
+        };
+
+    let new_parent = rows.get(&id).and_then(|r| r.parent);
+    let children: Vec<u64> = rows
+        .iter()
+        .filter(|(_, row)| row.parent == Some(id))
+        .map(|(cid, _)| *cid)
+        .collect();
+
+    if !children.is_empty() {
+        // Simulate the post-delete tree: the term gone, its children re-homed.
+        let mut next = rows.clone();
+        next.remove(&id);
+        for cid in &children {
+            if let Some(row) = next.get_mut(cid) {
+                row.parent = new_parent;
+            }
+        }
+        // (a) Each re-homed child's slug must stay unique among its NEW siblings.
+        // (The children were already unique among THEMSELVES as siblings of the
+        // deleted term; only clashes with the new parent's existing children can
+        // arise.) Depth can only shrink, so no depth re-check is needed.
+        for cid in &children {
+            let child_slug = next[cid].slug.clone();
+            if sibling_slug_taken(&next, new_parent, &child_slug, Some(*cid)) {
+                return Err(AdminError::Conflict(format!(
+                    "deleting this term would move its child {child_slug:?} next to \
+                     an existing sibling with the same slug — re-slug or re-parent \
+                     the child first"
+                )));
+            }
+        }
+        // (b) Every re-homed subtree's archive path shortens by one segment — none
+        // may land on a live post/page (the same shadow guard create/update run).
+        let mut moved: Vec<u64> = children.clone();
+        for cid in &children {
+            moved.extend(descendants_of(&next, *cid));
+        }
+        for term in moved {
+            let path = archive_path(&taxonomy_key, &next, term);
+            if content_ops::is_taken(&state, &path, &[]).await? {
+                return Err(AdminError::Conflict(format!(
+                    "deleting this term would move a child's archive path to \
+                     {path:?}, which is already used by a post or page — re-slug \
+                     or re-parent the child first"
+                )));
+            }
+        }
+        // Re-home the children BEFORE the delete (only needed when the term has a
+        // parent — a root term's children reach the same end state via the SDL
+        // `@on_delete(remove)`). The re-links are eventless, but the Term Delete
+        // event below fires AFTER them and settles the (Inc-2) handle reload.
+        if new_parent.is_some() {
+            for cid in &children {
+                if let Err(e) = super::reconcile_to_one(
+                    &state.store,
+                    &term_edge(ObjectId(*cid), "parent"),
+                    new_parent.map(ObjectId),
+                )
+                .await
+                {
+                    settle_children(&state, &children).await;
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    if let Err(e) = state
         .store
         .delete(&TypeName::from(TERM_TYPE), ObjectId(id))
-        .await?;
+        .await
+    {
+        // The delete would have been the settling event for the eventless re-links
+        // above — without it they'd stay invisible to the (Inc-2) live handle.
+        settle_children(&state, &children).await;
+        return Err(e.into());
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Best-effort settle of re-homed children after a delete-path fault: the parent
+/// re-links are eventless, and the Term Delete that would have settled them never
+/// fired — touch each child so the (Inc-2) live handle still reloads onto the
+/// committed state. Failures are logged, never mask the original error.
+async fn settle_children(state: &AppState, children: &[u64]) {
+    for cid in children {
+        if let Err(e) = touch_term(state, ObjectId(*cid)).await {
+            tracing::error!(
+                error = ?e,
+                term_id = cid,
+                "failed to settle a re-homed child term after a delete fault"
+            );
+        }
+    }
 }
 
 // ---- the shared creation core (admin create + the post save's inline tags) ---
@@ -656,6 +810,31 @@ pub(super) async fn load_term_rows(
     Ok(rows)
 }
 
+/// Every term's computed archive path, across ALL taxonomies — the REVERSE
+/// direction of the archive-path collision guard. Term create/update/delete refuse
+/// a term path landing on a live post/page ([`content_ops::is_taken`]); the page
+/// handlers call THIS (under `taxonomy_lock`, nested inside `hierarchy_lock` — the
+/// one sanctioned nesting, see [`AppState::taxonomy_lock`]) to refuse a page path
+/// landing on a live term archive. One direction alone leaves the collision state
+/// reachable by simply creating the page second. Posts need no such check: a post
+/// slug is a single segment, an archive path always `{key}/…` (≥ 2 segments).
+pub(super) async fn all_term_archive_paths(
+    state: &AppState,
+) -> Result<HashSet<String>, AdminError> {
+    let mut out = HashSet::new();
+    for tax in state.store.scan(&TypeName::from(TAXONOMY_TYPE)).await? {
+        let key = str_field(&tax, "key").unwrap_or_default();
+        if key.is_empty() {
+            continue; // corrupt row — no key means no archive namespace
+        }
+        let rows = load_term_rows(state, tax.id).await?;
+        for id in rows.keys() {
+            out.insert(archive_path(&key, &rows, *id));
+        }
+    }
+    Ok(out)
+}
+
 /// Whether another sibling (same `parent`) already holds `slug`, excluding `exclude`
 /// (the caller's own id on an update).
 fn sibling_slug_taken(
@@ -827,9 +1006,14 @@ pub(super) fn resolve_term_slug(slug: Option<&str>, name: &str) -> Result<String
 }
 
 /// Validate a term slug: the shared single-segment shape rules PLUS the reserved
-/// set (`page`, `feed` — see [`RESERVED_TERM_SLUGS`]).
+/// set (`page`, `feed` — see [`RESERVED_TERM_SLUGS`]). Case-NORMALIZES first
+/// (lowercase — WP's `sanitize_title` discipline): the inline tag-create path's
+/// reuse-by-slug compares byte-exactly against slugify-derived (lowercase) slugs,
+/// so a mixed-case explicit slug would mint an unreachable near-duplicate the
+/// reuse machinery can never match — and `Page`/`Feed` would dodge the reserved
+/// set.
 fn validate_term_slug(slug: &str) -> Result<String, AdminError> {
-    let s = content_ops::validate_slug(slug)?;
+    let s = content_ops::validate_slug(&slug.to_lowercase())?;
     if RESERVED_TERM_SLUGS.contains(&s.as_str()) {
         return Err(AdminError::BadRequest(format!(
             "the slug {s:?} is reserved (archive pagination / feeds)"

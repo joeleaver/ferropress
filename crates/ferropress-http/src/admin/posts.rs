@@ -234,10 +234,8 @@ pub async fn save(
     AdminJson(body): AdminJson<SaveRequest>,
 ) -> Result<Json<SaveResponse>, AdminError> {
     // Validate the request shape (independent of the stored resource) first. A post slug must be
-    // a single flat path segment (the resolver's flat-vs-nested split assumes it), and never a
-    // reserved URL base (`page`/`feed` — the pagination + feed grammar).
+    // a single flat path segment (the resolver's flat-vs-nested split assumes it).
     let slug = content_ops::validate_slug(&body.slug)?;
-    content_ops::ensure_unreserved_root(&slug)?;
     let new_status = parse_status(&body.status)
         .ok_or_else(|| AdminError::BadRequest(format!("unknown status {:?}", body.status)))?;
     let tree = BlockTree::from_json_value(body.block_tree.clone())
@@ -277,6 +275,15 @@ pub async fn save(
     // per-taxonomy `multiple` cap must hold — all BEFORE any mutation.
     let terms_plan = plan_terms(&state, Some(ObjectId(id)), &body.terms, &body.new_terms).await?;
 
+    // Reserved URL bases (`page`/`feed` — the pagination + feed grammar) are enforced
+    // only when the slug CHANGES: a post grandfathered at a reserved slug (created
+    // before the reservation existed) must stay editable in place — a typo fix must
+    // never 400 or force an unrequested permalink change. Only moving INTO the
+    // reserved namespace is refused.
+    if slug != old_slug {
+        content_ops::ensure_unreserved_root(&slug)?;
+    }
+
     // Reject a slug already held in the permalink namespace by ANOTHER entity — a different
     // post OR a page at the same path (cross-entity: both share one cache key + resolver slot).
     if content_ops::is_taken(&state, &slug, &[ObjectId(id)]).await? {
@@ -298,15 +305,25 @@ pub async fn save(
     // loop rebuilds the page envelope from — ordered after the links, it can never
     // observe (and bake) a pre-reconcile membership/featured state. This is the
     // menus `touch_menu` discipline with the save's own scalar write as the touch.
-    // (Failure semantics improve too: a relation fault now fails the save with the
-    // scalars UNWRITTEN, instead of yesterday's half-saved post.)
-    set_featured(&state, ObjectId(id), body.featured_media).await?;
-
-    // The planned term work (validated above): inline tags create-or-reuse under
-    // `taxonomy_lock` (each created Term settles itself via its own touch), then
-    // the membership set-reconcile.
-    if let Some(action) = terms_plan {
-        apply_terms(&state, ObjectId(id), action).await?;
+    //
+    // Term work runs BEFORE the featured reconcile: after plan_terms' pre-checks
+    // (and apply_terms' own under-lock re-verification) the term path has no
+    // user-input-triggerable failure left, but it is still the likelier fault
+    // (races, more moving parts) — ordering it first keeps a term fault from
+    // stranding a half-persisted featured change. And whatever DOES fault: any
+    // relation work already committed is eventless, so the error path fires a
+    // best-effort settling update — a torn save may be neither-old-nor-new, but it
+    // is never event-INVISIBLE (the cache always converges to the store).
+    let relation_work: Result<(), AdminError> = async {
+        if let Some(action) = terms_plan {
+            apply_terms(&state, ObjectId(id), action).await?;
+        }
+        set_featured(&state, ObjectId(id), body.featured_media).await
+    }
+    .await;
+    if let Err(e) = relation_work {
+        settle_post(&state, ObjectId(id), &current).await;
+        return Err(e);
     }
 
     let now = now_millis();
@@ -711,6 +728,34 @@ async fn set_featured(
     Ok(())
 }
 
+/// Best-effort settling event after a relation fault mid-save: re-emit the post's
+/// CURRENT effective timestamp (value-unchanged — an `update()` emits its event
+/// regardless, the create-settle precedent) so any relation work that DID commit
+/// before the fault is re-baked/evicted by the regen loop. Without this, a torn
+/// save would be event-INVISIBLE: link/unlink emit nothing, the failed save never
+/// reaches its scalar write, and e.g. a persisted featured-image change would
+/// diverge from the baked envelope indefinitely while the client believes the save
+/// was rejected wholesale. A failure here is logged, never masks the original error.
+async fn settle_post(state: &AppState, id: ObjectId, current: &Object) {
+    let mut patch: FieldMap = HashMap::new();
+    patch.insert(
+        "updated_at".to_owned(),
+        Value::DateTime(effective_time(current).unwrap_or_else(now_millis)),
+    );
+    if let Err(e) = state
+        .store
+        .update(&TypeName::from(POST_TYPE), id, patch)
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            post_id = id.0,
+            "failed to emit the settling update after a relation fault; any \
+             committed link work stays cache-invisible until the next save"
+        );
+    }
+}
+
 // ---- term assignment (the Post.terms M:N membership) ------------------------
 
 /// The `Post.terms` relation edge for `post_id` (the to-many M:N join to `Term`).
@@ -871,8 +916,24 @@ async fn plan_terms(
             match reused {
                 // Reuse collapses onto the id — exact cap counting, and the entry
                 // stays in `creates` so the under-lock pass makes the final call.
-                Some(id) => prospective.insert((tax.id.0, MemberKey::Id(id))),
-                None => prospective.insert((tax.id.0, MemberKey::Slug(slug.clone()))),
+                Some(id) => {
+                    prospective.insert((tax.id.0, MemberKey::Id(id)));
+                }
+                None => {
+                    // Advisory archive-path pre-check (the authoritative re-check
+                    // runs under `taxonomy_lock` in `create_term_core`). This is
+                    // the ONE user-input-triggerable 409 on the inline path, so it
+                    // must fire HERE, before the save mutates anything — deferred
+                    // to apply_terms it would strike mid-mutation and tear the
+                    // save (relations persisted, scalars not, no settling event).
+                    let path = format!("{key}/{slug}");
+                    if content_ops::is_taken(state, &path, &[]).await? {
+                        return Err(AdminError::Conflict(format!(
+                            "the archive path {path:?} is already used by a post or page"
+                        )));
+                    }
+                    prospective.insert((tax.id.0, MemberKey::Slug(slug.clone())));
+                }
             };
             tax_ids.push(tax.id);
             creates.push((tax.clone(), name.to_owned(), slug));
@@ -880,16 +941,31 @@ async fn plan_terms(
     }
 
     // The per-taxonomy `multiple` cap over the full prospective membership.
+    check_multiple_cap(state, tax_ids, &prospective).await?;
+
+    Ok(Some(TermsAction { explicit, creates }))
+}
+
+/// Enforce the per-taxonomy `multiple = false` cap over a prospective membership
+/// (grouped per taxonomy — `Post.terms` is one shared edge carrying every
+/// taxonomy's assignments at once; a global cap would forbid tagging a categorized
+/// post). Checked twice by design: advisorily in [`plan_terms`] (fail fast, before
+/// the save mutates anything) and authoritatively in [`apply_terms`] under
+/// `taxonomy_lock` — one shared fn so the two can never drift.
+async fn check_multiple_cap(
+    state: &AppState,
+    mut tax_ids: Vec<ObjectId>,
+    prospective: &std::collections::HashSet<(u64, MemberKey)>,
+) -> Result<(), AdminError> {
     tax_ids.sort_unstable();
     tax_ids.dedup();
-    let tax_objs = if tax_ids.is_empty() {
-        Vec::new() // e.g. an explicit clear (`terms: []`) — nothing to cap.
-    } else {
-        state
-            .store
-            .get_many(&TypeName::from(TAXONOMY_TYPE), &tax_ids)
-            .await?
-    };
+    if tax_ids.is_empty() {
+        return Ok(()); // e.g. an explicit clear (`terms: []`) — nothing to cap.
+    }
+    let tax_objs = state
+        .store
+        .get_many(&TypeName::from(TAXONOMY_TYPE), &tax_ids)
+        .await?;
     for tax in &tax_objs {
         if matches!(tax.get("multiple"), Some(Value::Bool(true))) {
             continue;
@@ -902,21 +978,35 @@ async fn plan_terms(
             )));
         }
     }
-
-    Ok(Some(TermsAction { explicit, creates }))
+    Ok(())
 }
 
-/// Execute a validated [`TermsAction`]: create-or-reuse the inline tags (under
-/// `taxonomy_lock`, through the SAME [`term_ops::create_term_core`] guards the
-/// admin endpoint uses — the two creation paths can never diverge), then
-/// set-reconcile `Post.terms` to the final desired membership.
+/// Execute a validated [`TermsAction`] under `taxonomy_lock`, in three strict
+/// stages — DECIDE, RE-VERIFY, MUTATE — so every fallible check runs before the
+/// first write:
 ///
-/// Runs AFTER the post's scalar write, so the write's `updated_at` bump has already
-/// emitted the Post Update event that drives cache handling — the (eventless)
-/// link/unlink work here needs no settling event of its own on the POST side; the
-/// created TERMS get theirs from `create_term_core`'s touch. A mid-op fault leaves
-/// a partially-applied membership; the reconcile is idempotent, so a client retry
-/// converges (and any inline tag already created is simply reused).
+///  1. DECIDE (no mutation): remake each inline tag's reuse-vs-create call against
+///     fresh under-lock rows — the plan's read was advisory (a concurrent create
+///     between plan and apply must yield a reuse, not a duplicate-slug 409).
+///  2. RE-VERIFY (no mutation): re-assert every base member id is still a live
+///     Term (term deletes hold this same lock, so this is authoritative — a
+///     just-deleted id 400s HERE instead of faulting mid-reconcile, the torn-save
+///     class), and re-run the per-taxonomy `multiple` cap over the under-lock
+///     prospective set (the ADDITIVE path's base was read outside the lock in the
+///     plan; without the re-check, two concurrent additive saves can stack two
+///     terms into a single-term taxonomy, both returning 200).
+///  3. MUTATE: create the missing tags through the SAME
+///     [`term_ops::create_term_core`] guards the admin endpoint uses (the two
+///     creation paths can never diverge; each created Term settles itself via its
+///     own touch), then set-reconcile `Post.terms` to the final membership.
+///
+/// Runs BEFORE the post's scalar write: the save's `updated_at` bump is the
+/// settling Post Update for the (eventless) link work here, and ordered after it,
+/// the regen loop can never bake a pre-reconcile membership. A mid-MUTATE store
+/// fault leaves a partially-applied membership — the caller fires a settling event
+/// (`settle_post`, or create's whole-post rollback) so it is never cache-invisible,
+/// and the reconcile is idempotent, so a client retry converges (any inline tag
+/// already created is simply reused).
 async fn apply_terms(
     state: &AppState,
     post_id: ObjectId,
@@ -924,25 +1014,66 @@ async fn apply_terms(
 ) -> Result<(), AdminError> {
     let _guard = state.taxonomy_lock.lock().await;
 
-    // Create-or-reuse the inline tags. The reuse decision is REMADE here, under the
-    // lock, against fresh rows — the plan's read was advisory (a concurrent create
-    // between plan and apply must yield a reuse, not a duplicate-slug 409).
-    let mut resolved_new: Vec<ObjectId> = Vec::new();
+    // 1. DECIDE: the reuse-vs-create call per inline tag (`None` = create).
     let mut rows_cache: HashMap<u64, HashMap<u64, term_ops::TermRow>> = HashMap::new();
-    for (tax, name, slug) in &action.creates {
+    let mut decisions: Vec<Option<ObjectId>> = Vec::with_capacity(action.creates.len());
+    for (tax, _name, slug) in &action.creates {
         if let std::collections::hash_map::Entry::Vacant(e) = rows_cache.entry(tax.id.0) {
             e.insert(term_ops::load_term_rows(state, tax.id).await?);
         }
-        let rows = rows_cache.get_mut(&tax.id.0).expect("cached above");
-        let reused = rows
+        let reused = rows_cache[&tax.id.0]
             .iter()
             .find(|(_, row)| row.parent.is_none() && row.slug == *slug)
-            .map(|(id, _)| *id);
-        match reused {
-            Some(id) => resolved_new.push(ObjectId(id)),
+            .map(|(id, _)| ObjectId(*id));
+        decisions.push(reused);
+    }
+
+    // 2. RE-VERIFY: the base membership (explicit, or — additively — the current
+    // one, re-read under the lock) and the cap over the full prospective set.
+    let base: Vec<ObjectId> = match &action.explicit {
+        Some(ids) => ids.clone(),
+        None => current_terms(state, post_id).await?,
+    };
+    let mut prospective: std::collections::HashSet<(u64, MemberKey)> =
+        std::collections::HashSet::new();
+    let mut tax_ids: Vec<ObjectId> = Vec::new();
+    for id in &base {
+        match state.store.get(&TypeName::from(TERM_TYPE), *id).await {
+            Ok(_) => {}
+            Err(CoreError::NotFound { .. }) => {
+                return Err(AdminError::BadRequest(format!(
+                    "term {} does not exist",
+                    id.0
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let tax = term_ops::single_link(state, TERM_TYPE, *id, "taxonomy")
+            .await?
+            .ok_or_else(|| AdminError::BadRequest(format!("term {} has no taxonomy", id.0)))?;
+        prospective.insert((tax.0, MemberKey::Id(id.0)));
+        tax_ids.push(tax);
+    }
+    for ((tax, _, slug), decision) in action.creates.iter().zip(&decisions) {
+        match decision {
+            Some(id) => prospective.insert((tax.id.0, MemberKey::Id(id.0))),
+            None => prospective.insert((tax.id.0, MemberKey::Slug(slug.clone()))),
+        };
+        tax_ids.push(tax.id);
+    }
+    check_multiple_cap(state, tax_ids, &prospective).await?;
+
+    // 3. MUTATE: create what DECIDE resolved to create, then reconcile.
+    let mut resolved_new: Vec<ObjectId> = Vec::new();
+    for ((tax, name, slug), decision) in action.creates.iter().zip(&decisions) {
+        match decision {
+            Some(id) => resolved_new.push(*id),
             None => {
+                let rows = rows_cache.get_mut(&tax.id.0).expect("cached in DECIDE");
                 let id = term_ops::create_term_core(state, tax, rows, name, Some(slug), "", None)
                     .await?;
+                // Keep the snapshot true for a later create in the SAME taxonomy
+                // (its sibling-uniqueness check must see this one).
                 rows.insert(
                     id.0,
                     term_ops::TermRow {
@@ -957,12 +1088,7 @@ async fn apply_terms(
         }
     }
 
-    // The final desired membership: the explicit set (or, additively, the current
-    // one) plus the inline tags.
-    let mut desired = match action.explicit {
-        Some(ids) => ids,
-        None => current_terms(state, post_id).await?,
-    };
+    let mut desired = base;
     desired.extend(resolved_new);
     desired.sort_unstable();
     desired.dedup();
@@ -1032,17 +1158,26 @@ async fn resolve_terms(state: &AppState, post_id: ObjectId) -> Result<Vec<TermRe
         .map(|o| (o.id.0, str_field(o, "key").unwrap_or_default()))
         .collect();
 
-    let mut out: Vec<TermRefDto> = objs
+    // Join by ID, never positionally: `get_many` silently SKIPS missing ids (and
+    // sorts), while `get_links_many` returns exactly one group per INPUT id — a
+    // term deleted between the two reads would shift a positional zip and label
+    // surviving terms with the wrong (or no) taxonomy in this AUTHORITATIVE
+    // response. Joining on id just drops the vanished term instead.
+    let obj_by_id: HashMap<u64, &Object> = objs.iter().map(|o| (o.id.0, o)).collect();
+    let mut out: Vec<TermRefDto> = ids
         .iter()
         .zip(&tax_links)
-        .map(|(obj, tax)| TermRefDto {
-            id: obj.id.0,
-            name: str_field(obj, "name").unwrap_or_default(),
-            slug: str_field(obj, "slug").unwrap_or_default(),
-            taxonomy: tax
-                .first()
-                .and_then(|t| tax_keys.get(&t.0).cloned())
-                .unwrap_or_default(),
+        .filter_map(|(id, tax)| {
+            let obj = obj_by_id.get(&id.0)?;
+            Some(TermRefDto {
+                id: obj.id.0,
+                name: str_field(obj, "name").unwrap_or_default(),
+                slug: str_field(obj, "slug").unwrap_or_default(),
+                taxonomy: tax
+                    .first()
+                    .and_then(|t| tax_keys.get(&t.0).cloned())
+                    .unwrap_or_default(),
+            })
         })
         .collect();
     out.sort_by(|a, b| {

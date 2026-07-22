@@ -3343,6 +3343,31 @@ async fn seed_taxonomy(
         .expect("seed taxonomy")
 }
 
+/// Seed a Page row DIRECTLY (bypassing the admin handlers and their guards) — for
+/// grandfathering/legacy-state tests that need a row the current guards would
+/// refuse to create. Mirrors the create handler's scalar fields.
+async fn seed_page(store: &Arc<dyn RhypeStore>, slug: &str, path: &str) -> ObjectId {
+    let mut f: FieldMap = HashMap::new();
+    f.insert("uuid".to_owned(), Value::String(format!("uuid-{slug}")));
+    f.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    f.insert("path".to_owned(), Value::String(path.to_owned()));
+    f.insert("title".to_owned(), Value::String(format!("Page {slug}")));
+    f.insert(
+        "status".to_owned(),
+        Value::String(Status::Draft.as_str().to_owned()),
+    );
+    f.insert("block_tree".to_owned(), Value::Json(one_paragraph("body")));
+    f.insert("plaintext".to_owned(), Value::String("body".to_owned()));
+    f.insert("menu_order".to_owned(), Value::I32(0));
+    f.insert("template".to_owned(), Value::String(String::new()));
+    f.insert("created_at".to_owned(), Value::DateTime(now_millis()));
+    f.insert("updated_at".to_owned(), Value::DateTime(now_millis()));
+    store
+        .create(&TypeName::from("Page"), f)
+        .await
+        .expect("seed page")
+}
+
 /// Log a seeded user in and return the ready-to-send `Cookie` header value.
 async fn login_cookie(state: &AppState, slug: &str) -> String {
     let (status, cookie, body) = do_login(state, slug, "hunter2hunter2").await;
@@ -3456,7 +3481,43 @@ async fn term_crud_hierarchy_per_sibling_uniqueness_and_promote_on_delete() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "cycle: {cyc}");
 
-    // Deleting the parent PROMOTES the child (SDL @on_delete(remove) on parent).
+    // Deleting the parent would re-home its child `space-opera` NEXT TO the root
+    // `space-opera` — a per-sibling collision the delete must refuse (it must not
+    // be the one mutation that can break the invariant every other mutation
+    // enforces), naming the offending child.
+    let cousin_id = cousin["id"].as_u64().unwrap();
+    let (st, refused) = do_json(
+        &state,
+        "DELETE",
+        &format!("/admin/api/terms/{fiction_id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "delete would promote a colliding child: {refused}"
+    );
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("space-opera"),
+        "the 409 names the offending child: {refused}"
+    );
+
+    // Clear the collision (drop the root cousin), then the delete goes through and
+    // the child is promoted to a root.
+    let (st, _) = do_json(
+        &state,
+        "DELETE",
+        &format!("/admin/api/terms/{cousin_id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "leaf delete is unguarded");
     let (st, _) = do_json(
         &state,
         "DELETE",
@@ -3475,12 +3536,69 @@ async fn term_crud_hierarchy_per_sibling_uniqueness_and_promote_on_delete() {
     )
     .await;
     let rows = list.as_array().unwrap();
-    assert_eq!(rows.len(), 2, "child survives its parent's deletion");
+    assert_eq!(rows.len(), 1, "child survives its parent's deletion");
     assert!(
         rows.iter()
             .all(|r| r["depth"] == 0 && r["parent"].is_null()),
-        "orphaned child is promoted to a root: {list}"
+        "a deleted ROOT's child is promoted to a root: {list}"
     );
+}
+
+#[tokio::test]
+async fn term_delete_reparents_children_to_the_grandparent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    // Alpha → Beta → Gamma.
+    let mut ids = Vec::new();
+    let mut parent: Option<u64> = None;
+    for name in ["Alpha", "Beta", "Gamma"] {
+        let mut body = serde_json::json!({"taxonomy": "category", "name": name});
+        if let Some(p) = parent {
+            body["parent"] = serde_json::json!(p);
+        }
+        let (st, t) = do_json(&state, "POST", "/admin/api/terms", &cookie, Some(body)).await;
+        assert_eq!(st, StatusCode::OK, "create {name}: {t}");
+        let id = t["id"].as_u64().unwrap();
+        ids.push(id);
+        parent = Some(id);
+    }
+    let (alpha, beta, gamma) = (ids[0], ids[1], ids[2]);
+
+    // Deleting the MIDDLE term re-homes its child to the deleted term's own parent
+    // (WP's wp_delete_term), not to the root.
+    let (st, _) = do_json(
+        &state,
+        "DELETE",
+        &format!("/admin/api/terms/{beta}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=category",
+        &cookie,
+        None,
+    )
+    .await;
+    let rows = list.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{list}");
+    let gamma_row = rows
+        .iter()
+        .find(|r| r["id"].as_u64() == Some(gamma))
+        .expect("gamma survives");
+    assert_eq!(
+        gamma_row["parent"].as_u64(),
+        Some(alpha),
+        "the orphaned grandchild is re-homed under its GRANDPARENT: {list}"
+    );
+    assert_eq!(gamma_row["depth"], 1, "{list}");
 }
 
 #[tokio::test]
@@ -3944,6 +4062,364 @@ async fn reserved_root_slugs_and_archive_path_collisions_are_rejected() {
         StatusCode::CONFLICT,
         "term archive path category/news collides with the page: {body}"
     );
+}
+
+#[tokio::test]
+async fn inline_tag_archive_collision_fails_before_any_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "tag", false, true).await;
+    let ed = login_cookie(&state, "ed").await;
+
+    // A Page occupying the would-be archive path `tag/news` (root `tag` is legal —
+    // only the full chain path is an archive; the bare base is not).
+    let (st, root) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "Tag landing", "slug": "tag", "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "root page `tag`: {root}");
+    let (st, _) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "News", "slug": "news", "parent": root["id"].as_u64().unwrap(),
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let post = seed_post(&store, "torn", Status::Draft).await;
+    let a = seed_media(&store, "media-a").await;
+    let b = seed_media(&store, "media-b").await;
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ed,
+        Some(post_save_body(
+            "torn",
+            serde_json::json!({"featured_media": a.0}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Featured B + a colliding inline tag in ONE save: the collision must 409 at
+    // PLAN time, before ANY mutation — deferred into the mutation window it would
+    // tear the save (featured B persisted, scalars not, no settling event: the
+    // baked envelope silently diverges from the store).
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ed,
+        Some(post_save_body(
+            "torn",
+            serde_json::json!({
+                "featured_media": b.0,
+                "new_terms": [{"taxonomy": "tag", "name": "News"}],
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "inline tag archive clash: {body}");
+
+    let (_, detail) = do_json(
+        &state,
+        "GET",
+        &format!("/admin/api/posts/{}", post.0),
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(
+        detail["featured_media"]["id"], a.0,
+        "the rejected save must not have persisted ANY of its mutations: {detail}"
+    );
+    assert_eq!(
+        detail["terms"].as_array().map(Vec::len),
+        Some(0),
+        "no term was assigned: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn page_cannot_land_on_a_term_archive_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    let ed = login_cookie(&state, "ed").await;
+
+    let (st, term) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "category", "name": "News"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "seed term: {term}");
+
+    // The bare taxonomy base is NOT an archive path — a root page `category` is legal.
+    let (st, root) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "Category landing", "slug": "category",
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "bare base page: {root}");
+    let root_id = root["id"].as_u64().unwrap();
+
+    // The REVERSE archive guard: a page landing on `category/news` (the term's
+    // archive path) must 409 — same collision the term side refuses in the other
+    // creation order.
+    let (st, body) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "News", "slug": "news", "parent": root_id,
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "page onto term archive: {body}");
+
+    // Same guard on the MOVE path: a root page `news` is fine, re-parenting it
+    // under `category` is not.
+    let (st, page) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "News", "slug": "news", "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "root page `news`: {page}");
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{}", page["id"].as_u64().unwrap()),
+        &ed,
+        Some(serde_json::json!({
+            "title": "News", "slug": "news", "status": "draft", "parent": root_id,
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "re-parent onto term archive: {body}"
+    );
+}
+
+#[tokio::test]
+async fn reserved_slugs_are_grandfathered_for_edit_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let ed = login_cookie(&state, "ed").await;
+
+    // A post grandfathered at the (now reserved) slug `page`: editing in place
+    // must keep working — the reservation must not brick pre-existing content.
+    let post = seed_post(&store, "page", Status::Draft).await;
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ed,
+        Some(post_save_body("page", serde_json::json!({}))),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "edit-in-place at a reserved slug: {body}"
+    );
+    // Moving INTO (another) reserved base is still refused…
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ed,
+        Some(post_save_body("feed", serde_json::json!({}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "moving INTO reserved is a 400");
+    // …and moving OUT is fine.
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ed,
+        Some(post_save_body("regular", serde_json::json!({}))),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Same for a page grandfathered at root `feed` — its own edits keep working
+    // (the root segment doesn't change)…
+    let page = seed_page(&store, "feed", "feed").await;
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{}", page.0),
+        &ed,
+        Some(serde_json::json!({
+            "title": "Edited", "slug": "feed", "status": "draft",
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "page edit-in-place at reserved root: {body}"
+    );
+    // …but NEW content under the grandfathered root stays refused (grandfathering
+    // covers existing rows only, never grows the occupied namespace).
+    let (st, _) = do_json(
+        &state,
+        "POST",
+        "/admin/api/pages",
+        &ed,
+        Some(serde_json::json!({
+            "title": "Child", "slug": "child", "parent": page.0,
+            "block_tree": one_paragraph("x"),
+        })),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "no new children under a reserved root"
+    );
+}
+
+#[tokio::test]
+async fn term_edit_survives_a_squatting_page_and_slug_case_is_normalized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "category", true, true).await;
+    seed_taxonomy(&store, "tag", false, true).await;
+    let ed = login_cookie(&state, "ed").await;
+
+    let (st, term) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "category", "name": "News"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let term_id = term["id"].as_u64().unwrap();
+
+    // A page squatting the term's archive path (seeded DIRECTLY — both live guards
+    // refuse this state now, but legacy/corrupt data can still hold it).
+    seed_page(&store, "news", "category/news").await;
+
+    // A name-only edit keeps (slug, parent) — the archive path doesn't move, so
+    // the collision guard must NOT re-check it (or the squatter would permanently
+    // brick ordinary edits of this term).
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/terms/{term_id}"),
+        &ed,
+        Some(serde_json::json!({"name": "Newsier"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "name-only edit under a squatter: {body}"
+    );
+    // Moving AWAY from the squatted path is fine; moving BACK onto it is a 409.
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/terms/{term_id}"),
+        &ed,
+        Some(serde_json::json!({"name": "Newsier", "slug": "updates"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/terms/{term_id}"),
+        &ed,
+        Some(serde_json::json!({"name": "Newsier", "slug": "news"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "moving back onto the squatted path"
+    );
+
+    // Explicit slugs are case-normalized (WP sanitize_title): `Rust` mints `rust`,
+    // and the inline tag path REUSES it instead of creating a lowercase twin.
+    let (st, rust) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Rust", "slug": "Rust"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(rust["slug"], "rust", "explicit slug lowercased: {rust}");
+    let rust_id = rust["id"].as_u64().unwrap();
+    // The reserved set can't be dodged by case either.
+    let (st, _) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Paged", "slug": "Page"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "reserved slug in mixed case");
+
+    let post = seed_post(&store, "cased", Status::Draft).await;
+    let (st, saved) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ed,
+        Some(post_save_body(
+            "cased",
+            serde_json::json!({"new_terms": [{"taxonomy": "tag", "name": "Rust"}]}),
+        )),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{saved}");
+    let terms = saved["terms"].as_array().unwrap();
+    assert_eq!(terms.len(), 1, "reused, not duplicated: {saved}");
+    assert_eq!(terms[0]["id"].as_u64(), Some(rust_id), "{saved}");
 }
 
 #[tokio::test]

@@ -36,7 +36,10 @@ use ferropress_serve::templates::page_templates;
 use super::posts::{
     FeaturedMediaDto, effective_time, ensure_media_exists, initial_status, parse_status,
 };
-use super::{AdminError, AdminJson, AuthedUser, content_ops, i32_field, json_field, str_field};
+use super::{
+    AdminError, AdminJson, AuthedUser, content_ops, i32_field, json_field, str_field,
+    terms as term_ops,
+};
 use crate::AppState;
 
 /// A runaway guard on the descendant cascade: the max number of subtree nodes a single
@@ -258,15 +261,28 @@ pub async fn save(
     // Serialize hierarchy mutations from here: the cycle check + path-uniqueness pre-flight and
     // the writes must be atomic w.r.t. another concurrent re-parent.
     let hierarchy_guard = state.hierarchy_lock.lock().await;
+    // Nested INSIDE the hierarchy lock — the ONE sanctioned nesting (see
+    // `AppState::taxonomy_lock`): the term-archive collision check below and the
+    // path writes must be atomic w.r.t. concurrent TERM writes, whose own
+    // archive-path guard runs under this same lock. Without it, each side's check
+    // can pass before the other side's row commits and a page and a term archive
+    // land on one path (which the Inc-2 archive resolver would silently shadow).
+    let taxonomy_guard = state.taxonomy_lock.lock().await;
 
     // Validate the parent (exists, is a Page, not self, no cycle) and compute the new path.
     let parent_path = resolve_parent_path(&state, Some(ObjectId(id)), body.parent).await?;
     let new_path = join_page_path(parent_path.as_deref(), &slug);
+    let old_path = str_field(&current, "path").unwrap_or_default();
     // The ROOT segment must not be a reserved URL base (`page`/`feed` — pagination/
     // feed grammar). Checked on the whole computed path, so a re-parent to top level
     // can't smuggle a reserved slug in; descendants inherit an already-checked root.
-    content_ops::ensure_unreserved_root(&new_path)?;
-    let old_path = str_field(&current, "path").unwrap_or_default();
+    // Enforced only when the root segment actually CHANGES: a page grandfathered at
+    // a reserved root (created before the reservation existed) — and every
+    // descendant under it, whose recomputed path keeps that root — must stay
+    // editable in place; only moving INTO the reserved namespace is refused.
+    if new_path.split('/').next() != old_path.split('/').next() {
+        content_ops::ensure_unreserved_root(&new_path)?;
+    }
 
     // If the path moved, recompute every descendant's new path from the (new) parent chain.
     let moved = new_path != old_path;
@@ -290,6 +306,23 @@ pub async fn save(
             return Err(AdminError::Conflict(format!(
                 "the path {dnew:?} is already in use"
             )));
+        }
+    }
+
+    // The REVERSE archive-path guard: term create/update/delete refuse a term path
+    // landing on a live page — a page path landing on a live term archive must be
+    // refused just the same, or the collision the 409s exist to prevent stays
+    // reachable by moving the page second. Only MOVED paths are checked (an
+    // unchanged path cannot newly collide, and re-checking it would brick edits of
+    // a page in a legacy-corrupt collision state).
+    if moved {
+        let term_paths = term_ops::all_term_archive_paths(&state).await?;
+        for path in std::iter::once(&new_path).chain(descendants.iter().map(|(_, _, d)| d)) {
+            if term_paths.contains(path) {
+                return Err(AdminError::Conflict(format!(
+                    "the path {path:?} is already used as a term archive"
+                )));
+            }
         }
     }
 
@@ -340,9 +373,10 @@ pub async fn save(
 
     backfill_author(&state, ObjectId(id), &who, author).await;
 
-    // Release the hierarchy lock BEFORE the auto-add hook (it takes `menu_lock` itself). Fire when
+    // Release both locks BEFORE the auto-add hook (it takes `menu_lock` itself). Fire when
     // this save leaves the page as a published TOP-LEVEL page AND it just crossed into that state —
     // either by becoming published (WordPress's transition trigger) or by re-parenting to top level.
+    drop(taxonomy_guard);
     drop(hierarchy_guard);
     let now_published_top = new_status.is_publish_state() && body.parent.is_none();
     let became_published = !current_status.is_publish_state() && new_status.is_publish_state();
@@ -413,6 +447,9 @@ pub async fn create(
     let title = body.title.clone();
 
     let hierarchy_guard = state.hierarchy_lock.lock().await;
+    // Nested INSIDE the hierarchy lock — the one sanctioned nesting (see
+    // `AppState::taxonomy_lock` and the identical block in `save`).
+    let taxonomy_guard = state.taxonomy_lock.lock().await;
 
     // Validate the parent (no self on create; a fresh page has no id yet) and compute the path.
     let parent_path = resolve_parent_path(&state, None, body.parent).await?;
@@ -422,6 +459,17 @@ pub async fn create(
     if content_ops::is_taken(&state, &path, &[]).await? {
         return Err(AdminError::Conflict(format!(
             "the path {path:?} is already in use"
+        )));
+    }
+    // The reverse archive-path guard (see `save`): a new page must not land on a
+    // live term's archive path — the same collision the term side 409s in the
+    // other creation order.
+    if term_ops::all_term_archive_paths(&state)
+        .await?
+        .contains(&path)
+    {
+        return Err(AdminError::Conflict(format!(
+            "the path {path:?} is already used as a term archive"
         )));
     }
 
@@ -480,8 +528,9 @@ pub async fn create(
     // Shadow-guard: a live page now occupies this path → drop any stale 301 FROM it.
     content_ops::retire_redirects_at(&state, &path).await?;
 
-    // Release the hierarchy lock BEFORE the auto-add hook — it takes `menu_lock` itself, never
-    // nested under `hierarchy_lock`. A newly-published top-level page joins every auto-add menu.
+    // Release both locks BEFORE the auto-add hook — it takes `menu_lock` itself, never
+    // nested under either. A newly-published top-level page joins every auto-add menu.
+    drop(taxonomy_guard);
     drop(hierarchy_guard);
     if published && is_top_level {
         super::menus::auto_add_top_level_page(&state, id.0, &title).await;

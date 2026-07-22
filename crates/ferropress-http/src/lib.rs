@@ -131,10 +131,17 @@ pub struct AppState {
     /// so two concurrent creates can't both pass the app-level uniqueness check —
     /// `Term.slug` is `@indexed`, NOT `@unique` (the same slug may exist in different
     /// taxonomies / under different parents), so the engine enforces nothing and the
-    /// pre-check + write must be atomic. SEPARATE from [`hierarchy_lock`](Self::hierarchy_lock)
-    /// and [`menu_lock`](Self::menu_lock) (unrelated surfaces must not contend), and never
-    /// nested with either — a handler takes at most ONE of the three. Term edits are rare,
-    /// so this is near-uncontended.
+    /// pre-check + write must be atomic.
+    ///
+    /// It ALSO serializes the bidirectional term-archive-vs-page-path collision guard:
+    /// the term side checks page paths and the page side checks term archive paths, so
+    /// BOTH sides' check + row commit must run under this one lock or each side's check
+    /// can pass before the other's commit. Hence the ONE sanctioned lock nesting:
+    /// the page handlers acquire [`hierarchy_lock`](Self::hierarchy_lock) THEN
+    /// `taxonomy_lock` — always in that order, never the reverse (term handlers take
+    /// only `taxonomy_lock`, so no cycle is possible). [`menu_lock`](Self::menu_lock)
+    /// is never combined with either. Term/page edits are rare, so this is
+    /// near-uncontended.
     pub taxonomy_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
