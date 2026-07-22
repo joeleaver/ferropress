@@ -177,6 +177,73 @@ impl BlobStore for LocalFsBlobStore {
             .await
             .map_err(|e| CoreError::Store(e.to_string()))
     }
+
+    async fn delete_prefix(&self, prefix: &BlobKey) -> CoreResult<()> {
+        // `resolve` drops a trailing `/` (Path::components does) and — crucially —
+        // rejects a prefix that names the ROOT itself ("", ".", "./"), so a bulk
+        // evict can never wipe the whole store by accident.
+        let path = self.resolve(prefix)?;
+        // Segment-aligned semantics fall out of the filesystem layout: the prefix
+        // is either a directory (a key subtree) or a plain file (an exact key) —
+        // `a/b` can never match `a/bc`.
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // Not a directory → fall through to the single-file case.
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {}
+            Err(e) => return Err(CoreError::Store(e.to_string())),
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Store(e.to_string())),
+        }
+    }
+
+    async fn list_prefix(&self, prefix: &BlobKey) -> CoreResult<Vec<BlobKey>> {
+        let root = self.resolve(prefix)?;
+        let base = prefix.0.trim_end_matches('/');
+
+        // The prefix names an exact blob (a leaf), not a subtree.
+        match tokio::fs::metadata(&root).await {
+            Ok(m) if m.is_file() => return Ok(vec![BlobKey(base.to_owned())]),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(CoreError::Store(e.to_string())),
+        }
+
+        // Iterative subtree walk. `dirs` pairs each pending directory with its
+        // key-space path (relative keys stay slash-delimited regardless of the
+        // platform separator).
+        let mut out = Vec::new();
+        let mut dirs: Vec<(std::path::PathBuf, String)> = vec![(root, base.to_owned())];
+        while let Some((dir, key_base)) = dirs.pop() {
+            let mut entries = tokio::fs::read_dir(&dir)
+                .await
+                .map_err(|e| CoreError::Store(e.to_string()))?;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| CoreError::Store(e.to_string()))?
+            {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let child_key = format!("{key_base}/{name}");
+                let ftype = entry
+                    .file_type()
+                    .await
+                    .map_err(|e| CoreError::Store(e.to_string()))?;
+                if ftype.is_dir() {
+                    dirs.push((entry.path(), child_key));
+                } else if !(name.starts_with('.') && name.ends_with(".tmp")) {
+                    // Skip the adapter's own in-flight temp files (see
+                    // [`tmp_sibling`]) — they are not blobs and vanish on rename.
+                    out.push(BlobKey(child_key));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
 }
 
 /// Build a temp-file path that is a sibling of `path` (same parent directory, so
@@ -295,6 +362,103 @@ mod tests {
         assert!(store.get(&key).await.is_err());
         assert!(store.delete(&key).await.is_err());
         assert!(store.exists(&key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_evicts_the_subtree_and_nothing_else() {
+        let (_dir, store) = store();
+        for k in [
+            "prerender/listing/term/category/news.html",
+            "prerender/listing/term/category/news/page/2.html",
+            "prerender/listing/term/tag/rust.html",
+            "prerender/listing/index.html",
+            "prerender/page/about.html",
+        ] {
+            store.put(&BlobKey(k.into()), b"x".to_vec()).await.unwrap();
+        }
+
+        // Trailing slash tolerated; the whole subtree goes, siblings stay.
+        store
+            .delete_prefix(&BlobKey("prerender/listing/term/".into()))
+            .await
+            .unwrap();
+        for gone in [
+            "prerender/listing/term/category/news.html",
+            "prerender/listing/term/category/news/page/2.html",
+            "prerender/listing/term/tag/rust.html",
+        ] {
+            assert!(!store.exists(&BlobKey(gone.into())).await.unwrap(), "{gone}");
+        }
+        for kept in ["prerender/listing/index.html", "prerender/page/about.html"] {
+            assert!(store.exists(&BlobKey(kept.into())).await.unwrap(), "{kept}");
+        }
+
+        // Idempotent on an already-empty prefix; also works on an EXACT leaf key.
+        store
+            .delete_prefix(&BlobKey("prerender/listing/term".into()))
+            .await
+            .unwrap();
+        store
+            .delete_prefix(&BlobKey("prerender/listing/index.html".into()))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .exists(&BlobKey("prerender/listing/index.html".into()))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_never_names_the_root() {
+        let (_dir, store) = store();
+        store
+            .put(&BlobKey("keep.bin".into()), b"x".to_vec())
+            .await
+            .unwrap();
+        // The root-wipe shapes are Validation errors, not a store nuke.
+        for raw in ["", ".", "./", "/"] {
+            assert!(
+                store.delete_prefix(&BlobKey(raw.into())).await.is_err(),
+                "prefix {raw:?} must be rejected"
+            );
+        }
+        assert!(store.exists(&BlobKey("keep.bin".into())).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_prefix_walks_sorted_and_skips_tmp_files() {
+        let (_dir, store) = store();
+        for k in ["t/b/two.html", "t/a/one.html", "t/zero.html", "other/x.html"] {
+            store.put(&BlobKey(k.into()), b"x".to_vec()).await.unwrap();
+        }
+        // A lingering in-flight temp file (crashed put) must not be listed.
+        tokio::fs::write(store.root().join("t/.orphan.html.1.2.tmp"), b"x")
+            .await
+            .unwrap();
+
+        let keys = store.list_prefix(&BlobKey("t/".into())).await.unwrap();
+        assert_eq!(
+            keys.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(),
+            vec!["t/a/one.html", "t/b/two.html", "t/zero.html"],
+        );
+
+        // A leaf key lists itself; an empty prefix subtree lists nothing.
+        assert_eq!(
+            store
+                .list_prefix(&BlobKey("t/zero.html".into()))
+                .await
+                .unwrap(),
+            vec![BlobKey("t/zero.html".into())]
+        );
+        assert!(
+            store
+                .list_prefix(&BlobKey("nowhere/".into()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -70,6 +70,25 @@ pub trait BlobStore: Send + Sync + 'static {
 
     /// Whether a blob exists (cheap existence check for the serve cache).
     async fn exists(&self, key: &BlobKey) -> Result<bool>;
+
+    /// Bulk-delete the whole SUBTREE under `prefix` — the cache's bulk-eviction
+    /// primitive (e.g. "evict every term-archive page"). Idempotent: a prefix
+    /// with nothing under it is Ok.
+    ///
+    /// `prefix` is SEGMENT-ALIGNED, not a raw string prefix: it names a subtree
+    /// of the slash-delimited key space (an optional trailing `/` is tolerated
+    /// and means the same thing). `a/b` matches the key `a/b` and every
+    /// `a/b/…` — never `a/bc`. Key-space note: a key that is a segment-aligned
+    /// proper prefix of another key (`a/b` AND `a/b/c`) is not supported by the
+    /// port (the localfs adapter cannot represent it); writers must keep leaf
+    /// keys and subtree namespaces disjoint, as the serve cache layout does.
+    async fn delete_prefix(&self, prefix: &BlobKey) -> Result<()>;
+
+    /// Every key currently stored in the subtree under `prefix` (same
+    /// segment-aligned matching as [`delete_prefix`](Self::delete_prefix)),
+    /// sorted for determinism. An empty subtree is `Ok(vec![])`, not an error.
+    /// Intended for diagnostics and targeted re-walks, not the hot path.
+    async fn list_prefix(&self, prefix: &BlobKey) -> Result<Vec<BlobKey>>;
 }
 
 // ---------------------------------------------------------------------------
