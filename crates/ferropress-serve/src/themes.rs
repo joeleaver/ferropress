@@ -305,7 +305,16 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
     // live category/tag page. This shape's `total` (3) fits on one page, so `pager` is
     // deliberately left unset here — the PAGINATED archive shape below is what exercises
     // `pager: Some`.
-    let mut home_archive = sample_context(true, one_post.clone());
+    // F10 (review finding C13): `compose_archive` NEVER produces `is_home: true` — an archive
+    // is never the front page (see `HomeCtx`'s own doc comment) — so every archive probe shape
+    // below is built with `is_home = false` from the start (not `sample_context(true, ..)`
+    // patched afterward), so it propagates correctly into the sample nav's OWN `aria_current`
+    // too, not just the top-level field. Before this fix, all three archive shapes carried a
+    // (archive: Some, is_home: true) combination production can never emit, while the converse
+    // (archive: Some, is_home: false) it ALWAYS emits was never probed at all — any
+    // render-time-only fault gated on `is_home` being false inside the archive branch was
+    // invisible to this "registered ⇒ renderable" smoke test.
+    let mut home_archive = sample_context(false, one_post.clone());
     if let Some(obj) = home_archive.as_object_mut() {
         obj.insert(
             "page_title".to_owned(),
@@ -326,7 +335,7 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
     // both home and an archive) was never exercised at theme load; a theme with a broken pager
     // block would pass registration and only blow up on a live paginated request. Page 1 shape:
     // an "older" link, no "newer" (mirrors `build_pager`'s real output for page 1 of N>1).
-    let mut home_archive_paged = sample_context(true, one_post);
+    let mut home_archive_paged = sample_context(false, one_post); // F10, see home_archive above
     if let Some(obj) = home_archive_paged.as_object_mut() {
         obj.insert(
             "page_title".to_owned(),
@@ -355,7 +364,7 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
     // twin of `home_empty`'s site-wide empty state), which is a DIFFERENT branch than the
     // plain `is_home` empty shape above (`{% if archive %}...{% else %}...{% endif %}` inside
     // the empty-state paragraph itself).
-    let mut archive_empty = sample_context(true, empty);
+    let mut archive_empty = sample_context(false, empty); // F10, see home_archive above
     if let Some(obj) = archive_empty.as_object_mut() {
         obj.insert(
             "page_title".to_owned(),
@@ -379,11 +388,34 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
         (HOME_TEMPLATE, &home_archive_paged),
         (HOME_TEMPLATE, &archive_empty),
     ] {
+        // F10 (review finding C13): every probe context here must match a shape production can
+        // actually emit — `archive: Some` and `is_home: true` never coexist (`compose_archive`
+        // always sets `is_home: false`; see `HomeCtx`'s own doc comment). A `debug_assert` keeps
+        // this self-checking against a future probe shape that forgets it, rather than relying
+        // on a human re-reading this list every time it grows.
+        debug_assert!(
+            archive_and_is_home_pairing_is_valid(ctx),
+            "a boot-probe context must never pair archive: Some with is_home: true — production \
+             can never emit that combination"
+        );
         engine
             .render(template, ctx)
             .map_err(|e| format!("rendering {template}: {e}"))?;
     }
     Ok((id, sources))
+}
+
+/// Whether `ctx` pairs `archive`/`is_home` a way production can actually emit (F10 / review
+/// finding C13): `compose_archive` always sets `is_home: false` — an archive is never the
+/// front page — so `archive: Some` alongside `is_home: true` is a combination no real render
+/// ever produces. `false` for that ONE illegal pairing; `true` for every other combination
+/// (including a context with no `archive` key at all, treated as `None`). A free function (not
+/// inlined into the probe loop) so it is independently unit-testable — see
+/// [`tests::archive_and_is_home_pairing_rejects_only_the_impossible_combination`].
+fn archive_and_is_home_pairing_is_valid(ctx: &serde_json::Value) -> bool {
+    let has_archive = ctx.get("archive").is_some_and(|a| !a.is_null());
+    let is_home = ctx.get("is_home") == Some(&serde_json::json!(true));
+    !(has_archive && is_home)
 }
 
 /// A representative render context covering the full shared contract (see `content.rs`), used to
@@ -598,6 +630,35 @@ mod tests {
             "{% extends \"base.html\" %}{% block main %}<article>{{ body | safe }}</article>{% endblock %}",
         )
         .unwrap();
+    }
+
+    /// F10 (review finding C13): `archive_and_is_home_pairing_is_valid` rejects ONLY the one
+    /// combination production can never emit (`archive: Some` + `is_home: true`) — proving the
+    /// `debug_assert` in `load_theme`'s probe loop actually has teeth, independent of whatever
+    /// the current probe shapes happen to construct.
+    #[test]
+    fn archive_and_is_home_pairing_rejects_only_the_impossible_combination() {
+        let archive_some = serde_json::json!({"name": "Fiction", "description": null, "total": 0});
+
+        // The one illegal pairing.
+        assert!(!archive_and_is_home_pairing_is_valid(&serde_json::json!({
+            "archive": archive_some, "is_home": true
+        })));
+
+        // Every other combination is valid.
+        assert!(archive_and_is_home_pairing_is_valid(&serde_json::json!({
+            "archive": archive_some, "is_home": false
+        })));
+        assert!(archive_and_is_home_pairing_is_valid(
+            &serde_json::json!({"archive": null, "is_home": true})
+        ));
+        assert!(archive_and_is_home_pairing_is_valid(
+            &serde_json::json!({"archive": null, "is_home": false})
+        ));
+        // No "archive" key at all (the single/page-wide probe shapes) — treated as `None`.
+        assert!(archive_and_is_home_pairing_is_valid(
+            &serde_json::json!({"is_home": true})
+        ));
     }
 
     #[test]

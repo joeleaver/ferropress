@@ -16,6 +16,12 @@
 //!     the server serves at `/_fp/islands`).
 //!   * `build-admin` — the same, for the excluded `ferropress-admin` admin-SPA
 //!     `cdylib` → `crates/ferropress-admin/dist/` (served at `/_fp/admin`).
+//!   * `parity` — run the fellstone-site theme's parity fixtures (`cargo test -p
+//!     ferropress-serve --lib fellstone`) against the REAL sibling theme repo. These do
+//!     NOT run in CI (fellstone-site is a separate, local-only project with no pushed
+//!     remote CI could check out — see [`run_fellstone_parity`]'s doc comment), so this
+//!     is the one place that verifies the two themes haven't drifted. Anyone changing a
+//!     theme file, in EITHER repo, must run this before pushing.
 //!
 //! Run from anywhere:
 //!
@@ -23,6 +29,7 @@
 //! cargo run --manifest-path xtask/Cargo.toml -- dep-graph
 //! cargo run --manifest-path xtask/Cargo.toml -- build-islands
 //! cargo run --manifest-path xtask/Cargo.toml -- build-admin
+//! cargo run --manifest-path xtask/Cargo.toml -- parity
 //! ```
 //!
 //! The lint uses `cargo metadata --no-deps` so it is fast and offline — it reads
@@ -62,8 +69,9 @@ fn main() -> Result<()> {
         Some("build-islands") => build_islands(),
         Some("build-admin") => build_admin(),
         Some("build-plugins") => build_plugins(),
+        Some("parity") => run_fellstone_parity(),
         Some(other) => bail!(
-            "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, `build-admin`, or `build-plugins`)"
+            "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, `build-admin`, `build-plugins`, or `parity`)"
         ),
     }
 }
@@ -356,4 +364,68 @@ fn dep_graph_lint() -> Result<()> {
         }
         bail!("dep-graph lint failed with {} violation(s)", violations.len());
     }
+}
+
+/// Run the fellstone-site theme's parity fixtures against the REAL sibling repo (F11 /
+/// review finding C14).
+///
+/// `fellstone-site` is a separate, standalone project (its own git history, no `path =`
+/// dependency, consumed only via `FERROPRESS_THEMES_DIR` at deploy time — see
+/// `CLAUDE.local.md`), and — as of this writing — has no pushed remote: `git remote -v` in
+/// that repo is empty. Ferropress's own CI therefore has NOTHING to check it out from, so
+/// wiring a CI step for it would either silently no-op (defeating the point) or fail every
+/// run (blocking on a repo CI can't reach). Rather than fake either, the four fellstone
+/// parity tests in `ferropress-serve` skip cleanly (never fail) when
+/// `FERROPRESS_FELLSTONE_DIR` is unset — see `crates/ferropress-serve/src/tests.rs`'s
+/// `fellstone_engine()` — and THIS target is the one place that actually runs them, on
+/// purpose, against the real files. It must be run locally (by a human, or a future CI once
+/// the repo has a reachable remote) before pushing ANY change to a theme file in either
+/// repo. Documented in both repos' README/CLAUDE.md; not automatic.
+///
+/// Resolves the theme dir from `FERROPRESS_FELLSTONE_DIR` if set (passed through to the
+/// `cargo test` subprocess unchanged); otherwise tries the conventional sibling checkout
+/// location (`../fellstone-site/theme`, next to this repo's own root, which is where this
+/// project's own machine keeps it) and errors with a clear message if neither exists —
+/// never silently skips (unlike the Rust tests themselves): a human explicitly running
+/// `parity` wants a real answer, not a quiet no-op.
+fn run_fellstone_parity() -> Result<()> {
+    let root = repo_root()?;
+    let dir = match std::env::var_os("FERROPRESS_FELLSTONE_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let sibling = root.parent().map(|p| p.join("fellstone-site/theme"));
+            match sibling.filter(|p| p.is_dir()) {
+                Some(dir) => dir,
+                None => bail!(
+                    "fellstone-site's theme/ dir was not found. Set FERROPRESS_FELLSTONE_DIR to \
+                     its path (e.g. `FERROPRESS_FELLSTONE_DIR=/path/to/fellstone-site/theme \
+                     cargo run --manifest-path xtask/Cargo.toml -- parity`), or check the repo \
+                     out as a sibling of this one (`../fellstone-site`)."
+                ),
+            }
+        }
+    };
+    if !dir.is_dir() {
+        bail!(
+            "FERROPRESS_FELLSTONE_DIR ({}) is not a directory",
+            dir.display()
+        );
+    }
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let status = Command::new(&cargo)
+        .args(["test", "-p", "ferropress-serve", "--lib", "fellstone"])
+        .env("FERROPRESS_FELLSTONE_DIR", &dir)
+        .current_dir(&root)
+        .status()
+        .context("failed to run `cargo test` for the fellstone parity fixtures")?;
+    if !status.success() {
+        bail!(
+            "fellstone parity fixtures FAILED against {} — a theme has drifted; see output above",
+            dir.display()
+        );
+    }
+
+    println!("parity: OK -> ran against {}", dir.display());
+    Ok(())
 }

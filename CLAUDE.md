@@ -36,3 +36,20 @@ to rinch. This keeps design iteration fast and decoupled from the framework port
 Whenever writing or editing rinch code (`rsx!`, `Signal`, `#[component]`, rinch components), invoke
 the **`rinch:rinch`** skill. Don't hand-write rinch from memory — let the skill guide correct use of
 the macro, reactive signals, props, and state management.
+
+## 4. Changing a shared theme mechanism (built-in + fellstone-site)? Run the parity check
+
+Some markup/script is deliberately **byte-identical** between the built-in theme
+(`crates/ferropress-serve/src/templates.rs`) and the `fellstone-site` sibling project's own theme
+(the endless-scroll script is the current example). `crates/ferropress-serve/src/tests.rs` carries
+parity fixtures that load fellstone-site's REAL theme files and assert they still match — but they
+do **not** run in CI (`fellstone-site` has no pushed remote as of this writing, so CI has nothing to
+check it out from; see the fixtures' own doc comments and `xtask/src/main.rs`'s `run_fellstone_parity`
+for the full reasoning). Run them yourself before pushing any change to a shared theme mechanism:
+
+```sh
+cargo run --manifest-path xtask/Cargo.toml -- parity
+```
+
+This auto-discovers `fellstone-site` at the conventional sibling location (`../fellstone-site`) or
+via `FERROPRESS_FELLSTONE_DIR` if it lives elsewhere.
