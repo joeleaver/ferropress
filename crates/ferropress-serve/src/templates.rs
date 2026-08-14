@@ -345,31 +345,36 @@ main { padding: 2.4rem 0 3rem; }
 /* Endless-scroll enhancement (progressive enhancement over the structural /page/{n} pager
    above — that pager is BOTH the no-JS/crawler fallback and this script's fetch source; no
    separate endpoint). Works identically on the home galley and a term archive, since both
-   share this template and its data-fp-* hooks. An IntersectionObserver sentinel placed just
-   above the pager fetches the OLDER page's HTML (same-origin, plain GET), lifts its
-   [data-fp-rows] children into THIS page's own list, and advances to THAT fetched page's own
-   [data-fp-next] href — so scrolling can walk arbitrarily many pages, one fetch at a time.
-   The pager hides once enhancement takes over (nothing left to click) and reappears only if a
-   fetch fails (graceful degrade back to manual pagination); it stays hidden once the listing
-   is legitimately exhausted (the fetched page carried no further [data-fp-next]). Never steals
-   focus — appended rows are inert, static content, exactly like the ones already on the page. */
+   share this template and its data-fp-* hooks. Byte-identical to the sibling copy in the
+   fellstone theme's base.html — keep them in sync; it is deliberately theme-agnostic (only
+   data-fp-* selectors, no theme classes), so there is nothing here to diverge.
+
+   An IntersectionObserver sentinel placed just above the pager fetches the OLDER page's HTML
+   (same-origin, plain GET), lifts its [data-fp-rows] children into THIS page's own list, and
+   advances the pager's OWN [data-fp-next] href to that fetched page's — so scrolling can walk
+   arbitrarily many pages, one fetch at a time, and the pager (if later un-hidden) always
+   points at the CORRECT next page, never a stale/already-shown one. The pager stays visible
+   and usable through every fetch attempt; it hides ONLY once a fetch actually SUCCEEDS
+   (enhancement confirmed working), and reappears if a LATER fetch fails (graceful degrade
+   back to manual pagination — no retry loop). It stays hidden once the listing is legitimately
+   exhausted (a fetched page carried no further [data-fp-next]). Never steals focus — appended
+   rows are inert, static content, exactly like the ones already on the page. */
 (function () {
   var rows = document.querySelector('[data-fp-rows]');
   var pagerNav = document.querySelector('[data-fp-pager]');
   var nextEl = document.querySelector('[data-fp-next]');
   if (!rows || !pagerNav || !nextEl || typeof IntersectionObserver === 'undefined') return;
-  var nextHref = nextEl.getAttribute('href');
 
   var sentinel = document.createElement('div');
   pagerNav.insertAdjacentElement('beforebegin', sentinel);
-  pagerNav.hidden = true;
 
   var busy = false;
 
   function loadNext() {
-    if (busy || !nextHref) return;
+    if (busy || !nextEl) return;
+    var href = nextEl.getAttribute('href');
     busy = true;
-    fetch(nextHref, { headers: { 'Accept': 'text/html' } })
+    fetch(href, { headers: { 'Accept': 'text/html' } })
       .then(function (res) {
         if (!res.ok) throw new Error('fp-scroll: ' + res.status);
         return res.text();
@@ -382,17 +387,23 @@ main { padding: 2.4rem 0 3rem; }
             rows.appendChild(document.adoptNode(li));
           });
         }
-        history.replaceState(null, '', nextHref);
+        history.replaceState(null, '', href);
+        pagerNav.hidden = true; // this fetch succeeded — enhancement is confirmed working
         var fetchedNext = doc.querySelector('[data-fp-next]');
-        nextHref = fetchedNext ? fetchedNext.getAttribute('href') : null;
+        if (fetchedNext) {
+          // Keep the (now-hidden) pager's own link truthful, so a LATER failure can
+          // un-hide it pointing at the page that actually failed, not a stale one.
+          nextEl.setAttribute('href', fetchedNext.getAttribute('href'));
+        } else {
+          nextEl = null; // exhausted — nothing further to fetch
+          observer.disconnect();
+        }
         busy = false;
-        if (!nextHref) observer.disconnect();
       })
       .catch(function () {
-        // A network/server fault — fall back to the visible, manual pager rather than
-        // silently stalling with no way forward.
+        // A network/server fault — fall back to the visible, manual pager (pointing at
+        // whichever page actually failed) rather than silently stalling with no way forward.
         pagerNav.hidden = false;
-        nextHref = null;
         busy = false;
         observer.disconnect();
       });

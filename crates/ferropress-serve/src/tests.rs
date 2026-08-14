@@ -5629,3 +5629,52 @@ async fn endless_scroll_script_present_in_fellstone_theme() {
         );
     }
 }
+
+/// The endless-scroll script lives in the SHARED base chrome (present on every page, matching
+/// where the APG disclosure-nav controller already lives), so a single-post permalink page —
+/// which has no pager at all — still ships the script text, but the DOM hooks it depends on
+/// (`data-fp-rows`/`data-fp-pager`/`data-fp-next`) are structurally ABSENT there. That absence
+/// is exactly what the script's own early-return guard (`if (!rows || !pagerNav || !nextEl...)
+/// return;`) turns into a silent no-op at runtime — a Rust test can prove the absence (the
+/// precondition), not the runtime branch itself (covered by the real-browser verification).
+#[tokio::test]
+async fn endless_scroll_script_is_a_structural_noop_on_a_single_post_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await;
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        &format!("/{SLUG}"),
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    assert!(
+        html.contains("IntersectionObserver"),
+        "the shared chrome still ships the script on a single-post page; was:\n{html}"
+    );
+    // The script's OWN source references these same hook names as bracketed CSS-selector
+    // strings ('[data-fp-rows]', …), so a bare `contains(hook)` would be vacuous (the same
+    // class of bug the D2/D3 pager tests already hit). A real markup ATTRIBUTE always ends
+    // the hook name with `>` (a bare boolean attribute immediately closing its tag); the
+    // script's references never do — they end with `]'`. Check that distinguishing form.
+    for hook in ["data-fp-rows>", "data-fp-pager>", "data-fp-next>"] {
+        assert!(
+            !html.contains(hook),
+            "a single-post page has no listing, so it must carry no {hook:?} markup attribute \
+             — the script's early-return guard relies on this absence; was:\n{html}"
+        );
+    }
+}
