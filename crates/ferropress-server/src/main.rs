@@ -40,8 +40,9 @@ use ferropress_sched_tokiocron::TokioCronScheduler;
 use ferropress_secrets_env::EnvSecretStore;
 use ferropress_serve::{
     AuthorsHandle, ContentIndexHandle, HookBridge, MenuHandle, RedirectHandle, ServeEngine,
-    SettingsHandle, ThemeHandle, ThemeRegistry, backfill_page_paths, load_author_directory,
-    load_content_index, load_menus, load_redirects, load_site_settings,
+    SettingsHandle, TaxonomyHandle, ThemeHandle, ThemeRegistry, backfill_page_paths,
+    load_author_directory, load_content_index, load_menus, load_redirects, load_site_settings,
+    load_taxonomies,
 };
 use ferropress_store_embedded::EmbeddedStore;
 
@@ -155,6 +156,18 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
             .context("loading content index")?,
     );
 
+    // Seed the live taxonomy set from the store ONCE at boot. The SAME handle is shared with
+    // the HTTP read path (`AppState`, which resolves term archives/chips/nav targets) and the
+    // regen loop (`ServeEngine`), which full-reloads it on a `Taxonomy`/`Term` change — so a
+    // re-parent, rename, or new term is reflected on the public site with NO page regeneration
+    // (the term's own archive page is evicted separately; this handle only backs live
+    // resolution).
+    let taxonomies = TaxonomyHandle::new(
+        load_taxonomies(&store)
+            .await
+            .context("loading taxonomies")?,
+    );
+
     // 2. Build the owned subsystems over the ports.
     // Discover the installed public themes from the themes dir (on top of the always-present
     // built-in default) and build the page-chrome theme named by the live `appearance.theme`
@@ -202,7 +215,8 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
         .with_redirects(redirects.clone())
         .with_theme(theme.clone())
         .with_menus(menus.clone())
-        .with_content_index(content_index.clone());
+        .with_content_index(content_index.clone())
+        .with_taxonomies(taxonomies.clone());
     // Serve the built wasm island bundle at `/_fp/islands` (the page chrome emits
     // the matching mount points + boot script). Built by `cargo xtask build-islands`.
     // The same plugin host is the custom-block renderer AND the hook dispatcher
@@ -214,6 +228,7 @@ async fn run_server(cfg: ServerConfig) -> Result<()> {
         .with_redirects(redirects.clone())
         .with_menus(menus.clone())
         .with_content_index(content_index.clone())
+        .with_taxonomies(taxonomies.clone())
         .with_islands_dir(cfg.islands_dir.clone())
         .with_custom_renderer(plugins.clone())
         .with_hook_dispatcher(plugins.clone())

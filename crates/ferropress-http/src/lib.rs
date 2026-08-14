@@ -33,7 +33,7 @@ use ferropress_render::{CustomBlockRenderer, NoCustomBlocks};
 use ferropress_render_form::{NoPlugins, PluginCatalog};
 use ferropress_serve::{
     AuthorsHandle, ContentIndexHandle, MenuHandle, RedirectHandle, Resolved, SettingsHandle,
-    ThemeHandle,
+    TaxonomyHandle, ThemeHandle,
 };
 
 pub mod admin;
@@ -93,6 +93,14 @@ pub struct AppState {
     /// targeting it with no menu edit. Defaults to an empty index (targets resolve to nothing)
     /// until seeded via [`with_content_index`](Self::with_content_index).
     pub content_index: ContentIndexHandle,
+    /// The live taxonomy set the read path resolves term archives, post chips, and nav
+    /// `Term` targets from. The SAME handle is given to the `ServeEngine` regen loop, which
+    /// full-reloads it on a `Taxonomy`/`Term` change — so a re-parent, rename, or new term is
+    /// reflected on the public site with no page regeneration (the archive page itself is
+    /// evicted separately; this handle only backs live resolution). Defaults to an empty set
+    /// (no term resolves) until the composition root seeds it via
+    /// [`with_taxonomies`](Self::with_taxonomies).
+    pub taxonomies: TaxonomyHandle,
     /// Directory holding the built wasm island bundle (the `wasm-bindgen` output
     /// of `ferropress-islands`). When set, it is served at `/_fp/islands`; `None`
     /// (e.g. in tests) simply omits that route.
@@ -159,6 +167,7 @@ impl AppState {
             redirects: RedirectHandle::default(),
             menus: MenuHandle::default(),
             content_index: ContentIndexHandle::default(),
+            taxonomies: TaxonomyHandle::default(),
             islands_dir: None,
             custom: Arc::new(NoCustomBlocks),
             hooks: Arc::new(NoHooks),
@@ -212,6 +221,15 @@ impl AppState {
     /// the loop is immediately visible here.
     pub fn with_content_index(mut self, content_index: ContentIndexHandle) -> Self {
         self.content_index = content_index;
+        self
+    }
+
+    /// Share the live [`TaxonomyHandle`] the public read path resolves term archives, chips,
+    /// and nav targets from. The composition root creates ONE handle (seeded from the store)
+    /// and gives the same handle to both this state and the `ServeEngine` regen loop, so a
+    /// term/taxonomy change reloaded by the loop is immediately visible here.
+    pub fn with_taxonomies(mut self, taxonomies: TaxonomyHandle) -> Self {
+        self.taxonomies = taxonomies;
         self
     }
 
