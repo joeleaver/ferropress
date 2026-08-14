@@ -4965,6 +4965,82 @@ async fn archive_write_through_uses_the_term_archive_cache_key() {
     assert_eq!(envelope.page, 1);
 }
 
+/// F5 (review finding C6, MAJOR): a cache HIT whose envelope's BAKED `term_id` disagrees with
+/// the PATH-resolved term id must never be trusted — the blob key is path-derived but the
+/// envelope's identity is baked, and the blunt subtree evict that's supposed to keep them in
+/// sync is best-effort and racy (a rename/delete+recreate landing between an in-flight
+/// request's read and its write-through, or a second instance on a stale snapshot). Hand-write
+/// a blob at `/category/fiction`'s cache key whose `term_id` belongs to an entirely different
+/// (unrelated) term, and confirm the response renders the PATH's own term's real content — and
+/// that the blob is corrected (self-healed) in place, exactly like a format-drifted entry.
+#[tokio::test]
+async fn archive_hit_with_a_foreign_baked_term_id_is_treated_as_a_miss_and_self_heals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let post_id =
+        seed_titled_post(&store, "the-real-post", "The Real Post", Status::Published).await;
+    link_term(&store, post_id, fiction_id).await;
+    // An entirely unrelated term (different taxonomy key, so its own path never collides with
+    // `/category/fiction`) — this id is what the stale/foreign blob will claim.
+    let foreign_id = seed_term(&store, "tag", "unrelated", "Unrelated").await;
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+
+    let key = crate::archive_cache_key("category/fiction", 1);
+    let foreign_envelope = crate::content::CachedTermArchive {
+        term_id: foreign_id.0,
+        rows: vec![],
+        total: 0,
+        page: 1,
+    };
+    blobs
+        .put(&key, serde_json::to_vec(&foreign_envelope).unwrap())
+        .await
+        .expect("hand-write the foreign-identity blob");
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html.contains("Fiction"),
+        "the response must render the PATH's own term, not the foreign blob's; was:\n{html}"
+    );
+    assert!(
+        !html.contains("Unrelated"),
+        "the foreign term's identity must never leak into the response; was:\n{html}"
+    );
+    assert!(
+        html.contains("The Real Post"),
+        "the archive's REAL rollup must render, not the foreign blob's (empty) rows; was:\n{html}"
+    );
+
+    let healed: crate::content::CachedTermArchive =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+    assert_eq!(
+        healed.term_id, fiction_id.0,
+        "the blob must be corrected in place to the path's own term"
+    );
+    assert_eq!(
+        healed.rows.len(),
+        1,
+        "the corrected blob carries the real rollup"
+    );
+}
+
 /// A bare taxonomy key with no chain (`/category`, no term slug) is nobody's canonical
 /// archive path — it falls through to the ordinary 404 flow (nothing else claims it either).
 #[tokio::test]
@@ -5180,6 +5256,134 @@ async fn archive_out_of_range_page_is_404_with_no_write_through() {
     assert!(!blobs.exists(&key).await.unwrap());
 }
 
+/// F4 (review finding C5): on a COLD cache (page 1 not yet cached either), an out-of-range
+/// `/page/{n}` request still costs its full (unavoidable, first-time) scan — but it ARMS the
+/// out-of-range gate by building + write-through-caching page 1's OWN envelope at its OWN
+/// key, even though the out-of-range page itself is (correctly) never cached. A store-call
+/// counter isn't available on the real `EmbeddedStore` this test drives, so the gate is
+/// verified the way its own contract is externally observable: page 1's blob exists
+/// afterward, and a SECOND (even wildly different) out-of-range probe gets the identical
+/// NotFound outcome — now servable from that one cached blob alone.
+#[tokio::test]
+async fn out_of_range_home_page_arms_the_range_gate_on_a_cold_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await; // 1 post; default posts_per_page = 10
+
+    let page1_key = cache_key("/");
+    assert!(
+        !blobs.exists(&page1_key).await.unwrap(),
+        "page 1 must not be cached yet — a genuinely cold cache"
+    );
+
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/page/2",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+    assert!(
+        !blobs.exists(&crate::home_page_cache_key(2)).await.unwrap(),
+        "the out-of-range page's own key must still never be write-through-cached"
+    );
+    assert!(
+        blobs.exists(&page1_key).await.unwrap(),
+        "page 1 must now be cached — the gate is armed by the first out-of-range miss"
+    );
+
+    // A second, even more wildly out-of-range probe: identical outcome, now resolvable from
+    // the gate alone (no full scan needed to reach it).
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/page/999999",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+/// The archive twin of [`out_of_range_home_page_arms_the_range_gate_on_a_cold_cache`].
+#[tokio::test]
+async fn out_of_range_archive_page_arms_the_range_gate_on_a_cold_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let post = seed_post(&store, SLUG, Status::Published).await;
+    link_term(&store, post, fiction_id).await;
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+
+    let page1_key = crate::archive_cache_key("category/fiction", 1);
+    assert!(!blobs.exists(&page1_key).await.unwrap());
+
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction/page/2",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+    assert!(
+        !blobs
+            .exists(&crate::archive_cache_key("category/fiction", 2))
+            .await
+            .unwrap(),
+        "the out-of-range page's own key must still never be write-through-cached"
+    );
+    assert!(
+        blobs.exists(&page1_key).await.unwrap(),
+        "page 1 must now be cached — the gate is armed by the first out-of-range miss"
+    );
+
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction/page/999999",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
 /// A REAL Page whose own materialized path happens to end in two segments that PARSE as a
 /// pagination suffix (`docs/page/3`, with actual pages slugged "page" and "3" nested under
 /// "docs") still serves as itself — claim-only-on-resolve: "docs" is not a taxonomy key, so
@@ -5220,6 +5424,50 @@ async fn nested_page_shaped_like_a_pager_suffix_falls_through() {
         html.contains("Docs entry three."),
         "the real page at this exact path must serve, never 404 or be mistaken for a pager suffix; was:\n{html}"
     );
+}
+
+/// F2 (review finding C2): `strip_page_suffix` must accept ONLY the canonical decimal
+/// spelling of a page number — a leading `+`, leading zeros, or any other non-canonical
+/// spelling must be rejected entirely (falls through to the ordinary permalink lookup, which
+/// 404s), never silently normalized to a 200 duplicate of the canonical URL.
+#[test]
+fn strip_page_suffix_rejects_non_canonical_spellings() {
+    // Canonical spellings resolve normally.
+    assert_eq!(content::strip_page_suffix("page/2"), Some(("", 2)));
+    assert_eq!(
+        content::strip_page_suffix("category/fiction/page/2"),
+        Some(("category/fiction", 2))
+    );
+    assert_eq!(
+        content::strip_page_suffix("page/18446744073709551615"),
+        Some(("", usize::MAX)),
+        "a huge but canonically-spelled page number must still parse"
+    );
+
+    // Non-canonical spellings of a real page number (n >= 2) must NOT match — a duplicate
+    // spelling of a real page is not a pagination suffix at all here, it falls through.
+    for path in [
+        "page/02",
+        "page/+2",
+        "page/0000002",
+        "category/fiction/page/+2",
+    ] {
+        assert_eq!(
+            content::strip_page_suffix(path),
+            None,
+            "{path:?} is a non-canonical spelling and must not parse as a pagination suffix"
+        );
+    }
+
+    // `n == 1` (canonical or not) is never a suffix here regardless — that's the HTTP layer's
+    // dedicated `/page/1` -> bare 301 rule, not this syntactic parse.
+    for path in ["page/1", "page/01", "page/+1"] {
+        assert_eq!(content::strip_page_suffix(path), None);
+    }
+
+    // Not a pagination shape at all.
+    assert_eq!(content::strip_page_suffix("about"), None);
+    assert_eq!(content::strip_page_suffix("page/not-a-number"), None);
 }
 
 /// A static front page NEVER paginates — `/page/{n>=2}` is a 404 (nothing to paginate), not a

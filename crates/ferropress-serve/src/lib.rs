@@ -49,7 +49,7 @@ pub mod themes;
 pub use authors::{AuthorDirectory, AuthorsHandle, load_author_directory};
 pub use content::{
     Resolved, default_theme, default_theme_handle, render_preview, resolve_path,
-    resolve_published_entity, serve_path, slug_from_path,
+    resolve_published_entity, serve_path, slug_from_path, strip_page_suffix,
 };
 pub use content_index::{ContentEntry, ContentIndex, ContentIndexHandle, load_content_index};
 pub use feed::{FeedFormat, serve_feed};

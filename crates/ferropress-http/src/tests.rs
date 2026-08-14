@@ -27,7 +27,7 @@ use ferropress_blob_localfs::LocalFsBlobStore;
 use ferropress_serve::{AuthorDirectory, AuthorsHandle, load_author_directory};
 use ferropress_store_embedded::EmbeddedStore;
 
-use crate::{AppState, router};
+use crate::{AppState, path_is_front_or_archive_owned, router, strip_bare_page_one_suffix};
 
 const PARAGRAPH_TEXT: &str = "Hello from the Ferropress end-to-end test.";
 const PUBLISHED_SLUG: &str = "hello-world";
@@ -52,8 +52,9 @@ fn paragraph_block_tree_json() -> serde_json::Value {
 }
 
 /// Insert one Post with the given slug + status + a single-paragraph body. Only
-/// the fields the serve path reads are populated.
-async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) {
+/// the fields the serve path reads are populated. Returns the post's id (most callers
+/// discard it; a few need it to link a term).
+async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) -> ObjectId {
     let mut fields: HashMap<String, Value> = HashMap::new();
     fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
     fields.insert(
@@ -70,7 +71,21 @@ async fn seed_post(store: &Arc<dyn RhypeStore>, slug: &str, status: Status) {
     store
         .create(&TypeName::from(POST_TYPE), fields)
         .await
-        .expect("seeding a post must succeed");
+        .expect("seeding a post must succeed")
+}
+
+/// Link a Post to a Term (the M:N `terms` edge) — the http-crate twin of
+/// `ferropress-serve`'s own `link_term` test helper.
+async fn link_term(store: &Arc<dyn RhypeStore>, post_id: ObjectId, term_id: ObjectId) {
+    let edge = Edge {
+        type_name: TypeName::from(POST_TYPE),
+        id: post_id,
+        field: "terms".to_owned(),
+    };
+    store
+        .link(&edge, term_id, HashMap::new())
+        .await
+        .expect("linking the post term must succeed");
 }
 
 /// Boot a real embedded store + the SAME theme the composition root uses, into an
@@ -965,6 +980,65 @@ async fn an_archive_owned_path_wins_over_a_stale_redirect() {
     assert_eq!(location.as_deref(), Some("/company"));
 }
 
+/// F1 (review findings C1/C4/C7): the redirect shadow-guard must recognize an archive's OWN
+/// paginated pages as archive-owned too, not just its bare page-1 path — a stale redirect
+/// recorded at `{archive}/page/2` (e.g. from a Page that once lived there, before it was
+/// deleted/moved and a term later took the bare path) must never shadow the archive's own
+/// second page.
+#[tokio::test]
+async fn an_archive_owned_page_2_wins_over_a_stale_redirect_at_the_same_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    // 15 published posts, default posts_per_page = 10 -> a real, live page 2.
+    for i in 0..15 {
+        let post_id = seed_post(&store, &format!("post-{i}"), Status::Published).await;
+        link_term(&store, post_id, fiction_id).await;
+    }
+    let taxonomies = ferropress_serve::TaxonomyHandle::new(
+        ferropress_serve::load_taxonomies(&store)
+            .await
+            .expect("load taxonomies"),
+    );
+    let state = state.with_taxonomies(taxonomies);
+
+    // A stale redirect recorded FROM the archive's own page-2 path.
+    seed_redirect(&store, "/category/fiction/page/2", "/somewhere-else").await;
+    let redirects = ferropress_serve::RedirectHandle::new(
+        ferropress_serve::load_redirects(&store)
+            .await
+            .expect("load redirects"),
+    );
+    let state = state.with_redirects(redirects);
+
+    let (status, location) = get_redirect(&state, "/category/fiction/page/2").await;
+    assert_ne!(
+        status,
+        StatusCode::MOVED_PERMANENTLY,
+        "a live archive's own page 2 must win over a stale redirect at the same path"
+    );
+    assert_eq!(location, None, "no redirect must fire");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the archive's page 2 itself must serve"
+    );
+
+    // A path the archive does NOT own (a different, unrelated page-shaped path) still
+    // redirects normally — the widened guard must stay narrow, not swallow every /page/N.
+    seed_redirect(&store, "/about/page/2", "/company").await;
+    let redirects2 = ferropress_serve::RedirectHandle::new(
+        ferropress_serve::load_redirects(&store)
+            .await
+            .expect("load redirects"),
+    );
+    let state = state.with_redirects(redirects2);
+    let (status, location) = get_redirect(&state, "/about/page/2").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(location.as_deref(), Some("/company"));
+}
+
 /// A bare structural `/page/1` suffix 301s to the home base (`/`) — page 1's canonical URL
 /// has no suffix at all.
 #[tokio::test]
@@ -994,6 +1068,42 @@ async fn archive_page_1_suffix_redirects_to_the_archive_base() {
     assert_eq!(location.as_deref(), Some("/category/fiction"));
 }
 
+/// F3 (review finding C3): the synthetic `/page/1` 301 is pure canonical-URL normalization of
+/// the SAME resource (never a recorded redirect to a DIFFERENT destination), so a query string
+/// on the request must be carried across to the Location header — exactly as WordPress's own
+/// canonical redirect does. Dropping it would silently lose UTM/campaign tracking params on
+/// every page-1 pagination link. Covers both the home base and an archive base.
+#[tokio::test]
+async fn page_1_suffix_301_carries_the_query_string() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await;
+    let taxonomies = ferropress_serve::TaxonomyHandle::new(
+        ferropress_serve::load_taxonomies(&store)
+            .await
+            .expect("load taxonomies"),
+    );
+    let state = state.with_taxonomies(taxonomies);
+
+    let (status, location) =
+        get_redirect(&state, "/page/1?utm_source=newsletter&utm_campaign=spring").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        location.as_deref(),
+        Some("/?utm_source=newsletter&utm_campaign=spring"),
+        "the query string must survive the canonical-URL 301"
+    );
+
+    let (status, location) = get_redirect(&state, "/category/fiction/page/1?utm_source=x").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(location.as_deref(), Some("/category/fiction?utm_source=x"));
+
+    // No query string at all: unchanged from before (no stray trailing `?`).
+    let (status, location) = get_redirect(&state, "/page/1").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(location.as_deref(), Some("/"));
+}
+
 /// Claim-only-on-resolve extends to the `/page/1` 301 rule too: a path shaped like a
 /// page-1 suffix whose stripped base resolves as NEITHER the front nor a live archive must
 /// never redirect (it would 301 to a dead page) — it falls through to the ordinary 404 flow.
@@ -1013,4 +1123,82 @@ async fn page_1_suffix_does_not_redirect_when_the_base_does_not_resolve() {
         StatusCode::NOT_FOUND,
         "falls through to the ordinary 404 flow"
     );
+}
+
+/// F2 (review finding C2), the http-layer half: `strip_bare_page_one_suffix` is an EXACT
+/// literal match on `"page/1"` — it already correctly rejects non-canonical spellings
+/// (`"page/01"`, `"page/+1"`), unlike `ferropress_serve::strip_page_suffix` before its own F2
+/// fix. Direct unit coverage for both functions, so a future edit to either can't silently
+/// reopen the asymmetry the review caught.
+#[test]
+fn strip_bare_page_one_suffix_rejects_non_canonical_spellings() {
+    assert_eq!(strip_bare_page_one_suffix("page/1"), Some(""));
+    assert_eq!(
+        strip_bare_page_one_suffix("category/fiction/page/1"),
+        Some("category/fiction")
+    );
+    for path in ["page/01", "page/+1", "page/0000001"] {
+        assert_eq!(
+            strip_bare_page_one_suffix(path),
+            None,
+            "{path:?} is a non-canonical spelling of page 1 and must not match"
+        );
+    }
+    // A different (real) page number is never this suffix.
+    assert_eq!(strip_bare_page_one_suffix("page/2"), None);
+    assert_eq!(
+        strip_bare_page_one_suffix("page/18446744073709551615"),
+        None
+    );
+    assert_eq!(strip_bare_page_one_suffix("about"), None);
+}
+
+/// F1 (review findings C1/C4/C7), the pure-function half: `path_is_front_or_archive_owned`
+/// against a synthetic taxonomy — no store, no HTTP round-trip — isolating exactly the
+/// stripped-base ownership contract the shadow-guard fix relies on, independent of the
+/// end-to-end redirect test above.
+#[test]
+fn path_is_front_or_archive_owned_strips_the_pagination_suffix() {
+    let taxonomies = ferropress_serve::TaxonomySet::build(
+        [ferropress_serve::TaxonomyInfo {
+            id: 1,
+            key: "category".to_owned(),
+            label: "Category".to_owned(),
+            hierarchical: true,
+        }],
+        [(
+            1,
+            ferropress_serve::TermEntry {
+                taxonomy_key: "category".to_owned(),
+                slug: "fiction".to_owned(),
+                name: "Fiction".to_owned(),
+                description: String::new(),
+                parent: None,
+            },
+        )],
+    );
+    let handle = ferropress_serve::TaxonomyHandle::new(taxonomies);
+
+    // The front page: owned, with or without a paginated suffix.
+    assert!(path_is_front_or_archive_owned(&handle, "/"));
+    assert!(path_is_front_or_archive_owned(&handle, "/page/2"));
+
+    // The archive: owned at its bare path AND at any of its paginated pages.
+    assert!(path_is_front_or_archive_owned(&handle, "/category/fiction"));
+    assert!(path_is_front_or_archive_owned(
+        &handle,
+        "/category/fiction/page/2"
+    ));
+
+    // A non-canonical page-number spelling doesn't parse as a suffix at all (F2), so it falls
+    // back to checking the RAW path — which the archive does not own as a literal chain.
+    assert!(!path_is_front_or_archive_owned(
+        &handle,
+        "/category/fiction/page/02"
+    ));
+
+    // An unrelated, unowned path stays unowned, with or without a paginated suffix — the
+    // widened guard must not swallow every `/page/N` shape.
+    assert!(!path_is_front_or_archive_owned(&handle, "/about"));
+    assert!(!path_is_front_or_archive_owned(&handle, "/about/page/2"));
 }

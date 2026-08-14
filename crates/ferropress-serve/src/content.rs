@@ -272,6 +272,13 @@ pub fn slug_from_path(path: &str) -> &str {
 /// (non-numeric or zero) and `n == 1` both return `None`, so `/page/1` is never claimed here
 /// (its 301-to-bare is a SEPARATE, HTTP-layer rule; claiming it here would 200 it instead).
 ///
+/// `n_str` must be the CANONICAL decimal spelling of `n` (`n_str == n.to_string()`) — a
+/// non-canonical spelling (`"02"`, `"+2"`, `"0000002"`) is rejected entirely (returns `None`,
+/// falling through to the ordinary permalink lookup, which then 404s) rather than silently
+/// normalized to `n` and served as a 200 duplicate of the canonical URL. Every page has
+/// exactly ONE canonical spelling; this is the enforcement point for `n >= 2` (the `/page/1`
+/// HTTP-layer rule enforces it separately for `n == 1` via an exact literal match).
+///
 /// This is a SYNTACTIC parse only — claim-only-on-resolve is the CALLER's job. `base` (the
 /// part before `/page/{n}`) may be empty (`"page/3"` → home page 3) or non-empty
 /// (`"category/fiction/page/3"` → `base = "category/fiction"`), and the caller must still
@@ -281,9 +288,12 @@ pub fn slug_from_path(path: &str) -> &str {
 /// exact materialized path) would be wrongly shadowed. When `base` doesn't resolve, the caller
 /// falls through with the ORIGINAL, un-stripped path — this function has no side effect on
 /// that decision.
-fn strip_page_suffix(term_path: &str) -> Option<(&str, usize)> {
+pub fn strip_page_suffix(term_path: &str) -> Option<(&str, usize)> {
     let (rest, n_str) = term_path.rsplit_once('/')?;
     let n: usize = n_str.parse().ok()?;
+    if n_str != n.to_string() {
+        return None;
+    }
     if n < 2 {
         return None;
     }
@@ -620,6 +630,18 @@ async fn serve_front(
         }
     }
 
+    // Out-of-range CHEAP GATE (F4 / review finding C5): before paying for the FULL published-
+    // post scan `build_front`/`build_galley` runs, check whether page 1's OWN cached envelope
+    // already proves `page` is out of range — one blob read instead of a full store scan. Only
+    // a real, currently-cached page 1 can arm this (see `home_range_gate`); when it can't
+    // (never cached, or stale/corrupt), fall through and pay for the query exactly as before.
+    if page > 1
+        && let Some(pages) = home_range_gate(blobs, settings).await
+        && page > pages
+    {
+        return Resolved::NotFound;
+    }
+
     match build_front(store, custom, settings, page).await {
         Ok(Some(front)) => {
             match serde_json::to_vec(&front) {
@@ -638,9 +660,66 @@ async fn serve_front(
             }
         }
         // Out of range (or page >= 2 on a static front, which never paginates): a 404 that is
-        // NEVER write-through-cached — there is nothing to cache for a page that doesn't exist.
-        Ok(None) => Resolved::NotFound,
+        // NEVER write-through-cached — there is nothing to cache for a page that doesn't exist
+        // (`page`'s own key stays empty). But ARM the gate above for next time: build +
+        // write-through page 1's OWN envelope at its OWN key (real content at its real key,
+        // never an orphan) — the gate check above short-circuits the SAME (or any other
+        // out-of-range) probe on every subsequent request, so repeat abuse costs one blob read,
+        // not a repeated full scan. Best-effort: a failure here changes nothing about THIS
+        // response.
+        Ok(None) => {
+            arm_home_range_gate(store, blobs, custom, settings).await;
+            Resolved::NotFound
+        }
         Err(e) => Resolved::Error(e),
+    }
+}
+
+/// The out-of-range CHEAP GATE for [`serve_front`]'s paginated miss path (F4 / review finding
+/// C5): read page 1's OWN cached envelope (never the store) and, if present and current-shape,
+/// return its total page count — `None` when page 1 has never been cached, or its entry is
+/// stale/corrupt, in which case the caller falls through to the ordinary (expensive) query
+/// exactly as before this gate existed. A [`CachedFront::Static`] front never paginates, so it
+/// always reports exactly 1 page; a [`CachedFront::Galley`]'s count is derived from its baked
+/// `total` + the LIVE `posts_per_page` (the same arithmetic [`build_pager`] uses, via
+/// [`total_pages`], so the two can never disagree on what "in range" means).
+async fn home_range_gate(blobs: &Arc<dyn BlobStore>, settings: &SiteSettings) -> Option<usize> {
+    let bytes = blobs.get(&cache_key("/")).await.ok()?;
+    let front: CachedFront = serde_json::from_slice(&bytes).ok()?;
+    Some(match front {
+        CachedFront::Static(_) => 1,
+        CachedFront::Galley { total, .. } => total_pages(total, settings.posts_per_page),
+    })
+}
+
+/// ARM [`home_range_gate`] after an out-of-range home-pagination miss (F4): build + write-
+/// through page 1's OWN envelope at its OWN key, so a later request — abusive or legitimate —
+/// hits the cheap gate instead of repeating the full scan. Best-effort, exactly like every
+/// other write-through in this module: any failure here is logged and swallowed, never
+/// surfaced to the caller (it only means the gate stays unarmed).
+async fn arm_home_range_gate(
+    store: &Arc<dyn RhypeStore>,
+    blobs: &Arc<dyn BlobStore>,
+    custom: &dyn CustomBlockRenderer,
+    settings: &SiteSettings,
+) {
+    match build_front(store, custom, settings, 1).await {
+        Ok(Some(front)) => match serde_json::to_vec(&front) {
+            Ok(bytes) => {
+                if let Err(e) = blobs.put(&cache_key("/"), bytes).await {
+                    tracing::warn!(error = %e, "arming the home out-of-range gate: write-through failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "arming the home out-of-range gate: could not serialize page 1");
+            }
+        },
+        // Page 1 itself came back out of range — cannot happen in practice (page 1 always
+        // builds; see `build_front`'s own doc), but if it ever did there is nothing to arm.
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "arming the home out-of-range gate: page 1 build failed");
+        }
     }
 }
 
@@ -675,13 +754,27 @@ async fn serve_archive(
 
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedTermArchive>(&bytes) {
-            Ok(archive) => {
+            // The blob's KEY is path-derived but its IDENTITY is baked (`term_id`) — nothing
+            // ties them together except the blunt subtree evict, which is best-effort and
+            // racy against an in-flight write-through (F5 / review finding C6: a rename+evict
+            // can land WHILE an old request is still building, so its stale envelope re-lands
+            // under the NEW owner's path after the evict already ran). Verify they still agree
+            // before trusting the hit; a mismatch is treated as a MISS below, which rebuilds +
+            // overwrites the blob with the path's actual current owner — self-healing exactly
+            // like a format-drifted entry does.
+            Ok(archive) if archive.term_id == term_id => {
                 return match compose_archive(
                     theme, settings, authors, menus, index, taxonomies, &archive,
                 ) {
                     Ok(html) => Resolved::Found(html),
                     Err(e) => Resolved::Error(e),
                 };
+            }
+            Ok(archive) => {
+                tracing::warn!(
+                    %term_path, page, cached_term_id = archive.term_id, resolved_term_id = term_id,
+                    "term-archive cache entry's baked term_id disagrees with this path's current owner; rebuilding"
+                );
             }
             Err(e) => {
                 // Not the current `CachedTermArchive` shape: re-render live and write-through
@@ -696,6 +789,17 @@ async fn serve_archive(
         Err(e) => {
             tracing::warn!(%term_path, page, error = %e, "term-archive prerender cache read failed; falling back to render");
         }
+    }
+
+    // Out-of-range CHEAP GATE (F4 / review finding C5): the archive twin of `home_range_gate`
+    // — before paying for the full rollup (`build_archive`'s `get_links_many` + `get_many` over
+    // every member post), check whether page 1's OWN cached envelope already proves `page` is
+    // out of range.
+    if page > 1
+        && let Some(pages) = archive_range_gate(blobs, settings, term_path).await
+        && page > pages
+    {
+        return Resolved::NotFound;
     }
 
     match build_archive(store, taxonomies, settings, term_id, page).await {
@@ -715,9 +819,60 @@ async fn serve_archive(
                 Err(e) => Resolved::Error(e),
             }
         }
-        // Out-of-range page: a 404 that is NEVER write-through-cached.
-        Ok(None) => Resolved::NotFound,
+        // Out-of-range page: a 404 that is NEVER write-through-cached (`page`'s own key stays
+        // empty). ARM the gate above for next time — same rationale as `arm_home_range_gate`.
+        Ok(None) => {
+            arm_archive_range_gate(store, blobs, taxonomies, settings, term_id, term_path).await;
+            Resolved::NotFound
+        }
         Err(e) => Resolved::Error(e),
+    }
+}
+
+/// The archive twin of [`home_range_gate`] (F4 / review finding C5): page 1's OWN cached
+/// envelope at [`archive_cache_key`]`(term_path, 1)`, if present and current-shape, gives the
+/// total page count for free (one blob read); `None` when it can't (never cached, or
+/// stale/corrupt) — the caller falls through to the full rollup exactly as before this gate
+/// existed.
+async fn archive_range_gate(
+    blobs: &Arc<dyn BlobStore>,
+    settings: &SiteSettings,
+    term_path: &str,
+) -> Option<usize> {
+    let bytes = blobs.get(&archive_cache_key(term_path, 1)).await.ok()?;
+    let archive: CachedTermArchive = serde_json::from_slice(&bytes).ok()?;
+    Some(total_pages(archive.total, settings.posts_per_page))
+}
+
+/// ARM [`archive_range_gate`] after an out-of-range archive-pagination miss (F4): build +
+/// write-through page 1's OWN envelope at its OWN key, the archive twin of
+/// [`arm_home_range_gate`]. Best-effort: any failure is logged and swallowed.
+#[allow(clippy::too_many_arguments)]
+async fn arm_archive_range_gate(
+    store: &Arc<dyn RhypeStore>,
+    blobs: &Arc<dyn BlobStore>,
+    taxonomies: &TaxonomySet,
+    settings: &SiteSettings,
+    term_id: u64,
+    term_path: &str,
+) {
+    match build_archive(store, taxonomies, settings, term_id, 1).await {
+        Ok(Some(archive)) => match serde_json::to_vec(&archive) {
+            Ok(bytes) => {
+                if let Err(e) = blobs.put(&archive_cache_key(term_path, 1), bytes).await {
+                    tracing::warn!(%term_path, error = %e, "arming the archive out-of-range gate: write-through failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%term_path, error = %e, "arming the archive out-of-range gate: could not serialize page 1");
+            }
+        },
+        // Page 1 itself came back out of range — cannot happen in practice (page 1 always
+        // builds; see `build_archive`'s own doc), but if it ever did there is nothing to arm.
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(%term_path, error = %e, "arming the archive out-of-range gate: page 1 build failed");
+        }
     }
 }
 
@@ -1278,6 +1433,16 @@ struct PagerCtx {
     total_pages: usize,
 }
 
+/// The page count a listing's baked `total` + the LIVE `posts_per_page` arithmetic yields —
+/// shared by [`build_pager`] (the composed pager's `total_pages`) and the out-of-range CHEAP
+/// GATE ([`home_range_gate`]/[`archive_range_gate`], F4) so the two can never independently
+/// drift on what "in range" means. Always at least 1 (an empty listing is still a valid single
+/// page, never zero pages).
+fn total_pages(total: usize, posts_per_page: u32) -> usize {
+    let per_page = (posts_per_page as usize).max(1);
+    total.div_ceil(per_page).max(1)
+}
+
 /// Build [`PagerCtx`] for one listing page. `base_href` is page 1's own href (`"/"` for home,
 /// the archive's own [`TaxonomySet::archive_href`] for a term); `paged_href(n)` builds page
 /// `n`'s href for `n >= 2`.
@@ -1288,8 +1453,7 @@ fn build_pager(
     base_href: &str,
     paged_href: impl Fn(usize) -> String,
 ) -> Option<PagerCtx> {
-    let per_page = (posts_per_page as usize).max(1);
-    let total_pages = total.div_ceil(per_page).max(1);
+    let total_pages = total_pages(total, posts_per_page);
     if total_pages <= 1 {
         return None;
     }

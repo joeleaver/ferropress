@@ -405,6 +405,15 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
         } else {
             format!("/{base}")
         };
+        // Pure canonical-URL normalization of the SAME resource (never a recorded redirect),
+        // so unlike the Redirect-table 301s below — which forward to an author-authored
+        // DIFFERENT destination, where dropping the query is defensible — the query string
+        // must be carried across, exactly as WordPress's own canonical redirect does. Query
+        // params (UTM tags, etc.) on `/page/1?utm=...` must survive the hop to `/?utm=...`.
+        let location = match req.uri().query() {
+            Some(q) if !q.is_empty() => format!("{location}?{q}"),
+            _ => location,
+        };
         return (
             StatusCode::MOVED_PERMANENTLY,
             [(axum::http::header::LOCATION, location)],
@@ -419,8 +428,11 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
     // ARCHIVE is the same kind of shadow-guard win: it always wins over a stale 301 recorded
     // before the archive existed (or before a term reused a once-redirected path), so the
     // redirect table is consulted only when no archive currently claims this path — `serve_path`
-    // below resolves the archive branch itself on the fall-through.
-    if !state.taxonomies.term_path_owns(&path)
+    // below resolves the archive branch itself on the fall-through. Ownership is checked on the
+    // STRIPPED pagination base (see `path_is_front_or_archive_owned`), not just the raw path —
+    // otherwise only an archive's bare page-1 path counted as "owned" and a stale 301 recorded
+    // at `{archive}/page/{n}` would shadow the archive's own later pages.
+    if !path_is_front_or_archive_owned(&state.taxonomies, &path)
         && let Some(target) = state.redirects.lookup(&path)
     {
         let status = StatusCode::from_u16(target.status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
@@ -464,6 +476,34 @@ fn strip_bare_page_one_suffix(path: &str) -> Option<&str> {
         Some("")
     } else {
         trimmed.strip_suffix("/page/1")
+    }
+}
+
+/// Whether `path` is currently claimed by the front page or a live term archive —
+/// INCLUDING a paginated `/page/{n}` suffix. Strips the SAME structural suffix
+/// [`ferropress_serve::strip_page_suffix`] does before checking ownership of the STRIPPED
+/// base, so `/category/fiction/page/2` is recognized as archive-owned exactly like its own
+/// page-1 path `/category/fiction` is — closing the asymmetry where only an archive's BARE
+/// path counted as "owned" for shadow-guard purposes, letting a stale 301 recorded at
+/// `{archive}/page/{n}` mask the archive's own later pages. Falls back to checking the raw
+/// path when there is no suffix (the ordinary, unpaginated case) — a non-canonical page-number
+/// spelling (rejected by `strip_page_suffix`) is simply treated as an ordinary path here too.
+///
+/// Shared by both shadow-guard call sites: [`serve_page`]'s redirect-table lookup (serve-time
+/// — a live archive/front page always wins over a stale 301) and
+/// `admin::content_ops::upsert_redirect` (write-time — never RECORD a redirect FROM a path a
+/// live archive/front page currently owns).
+pub(crate) fn path_is_front_or_archive_owned(taxonomies: &TaxonomyHandle, path: &str) -> bool {
+    let term_path = ferropress_serve::slug_from_path(path);
+    // The bare front page itself — never reachable through `strip_page_suffix` (that only ever
+    // matches a `/page/{n}` SUFFIX), and never a real `Redirect::from_path` either (the empty
+    // string is not a valid Page path), but always front-owned by definition.
+    if term_path.is_empty() {
+        return true;
+    }
+    match ferropress_serve::strip_page_suffix(term_path) {
+        Some((base, _n)) => base.is_empty() || taxonomies.term_path_owns(base),
+        None => taxonomies.term_path_owns(path),
     }
 }
 
