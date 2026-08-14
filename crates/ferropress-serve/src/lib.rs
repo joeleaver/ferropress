@@ -122,14 +122,40 @@ pub fn cache_key(path: &str) -> BlobKey {
     BlobKey(format!("{CACHE_PREFIX}/permalink/{rel}.html"))
 }
 
-/// The prerender-cache key for page 1 of a term archive (D2 adds a `/page/{n}` shape beyond
-/// page 1 — see [`TERM_ARCHIVE_CACHE_PREFIX`]'s doc for both). `term_path` is the archive's own
+/// The prerender-cache key for one page of a term archive. `term_path` is the archive's own
 /// resolved chain (e.g. `"category/fiction"`, no leading/trailing slash — exactly the trimmed
 /// string [`TaxonomySet::resolve_archive_path`](crate::TaxonomySet::resolve_archive_path)
 /// consumed to find it), so the read path's claim-only-on-resolve routing and this key
-/// derivation can never disagree — both key off the SAME trimmed chain.
-pub(crate) fn archive_cache_key(term_path: &str) -> BlobKey {
-    BlobKey(format!("{TERM_ARCHIVE_CACHE_PREFIX}/{term_path}.html"))
+/// derivation can never disagree — both key off the SAME trimmed chain. Page 1 is
+/// suffix-free (`{prefix}/{term_path}.html`, the D1 shape — unchanged, so no D1 blob needs
+/// migrating); page ≥2 gets the structural `/page/{n}` suffix ([`TERM_ARCHIVE_CACHE_PREFIX`]'s
+/// doc anticipated both shapes). A term slugged `page` is unrepresentable (reserved at
+/// create), so the two shapes can never collide with each other or with a real term chain.
+pub(crate) fn archive_cache_key(term_path: &str, page: usize) -> BlobKey {
+    if page <= 1 {
+        BlobKey(format!("{TERM_ARCHIVE_CACHE_PREFIX}/{term_path}.html"))
+    } else {
+        BlobKey(format!(
+            "{TERM_ARCHIVE_CACHE_PREFIX}/{term_path}/page/{page}.html"
+        ))
+    }
+}
+
+/// The LISTING subtree every home-pagination page BEYOND page 1 is cached under. Page 1 stays
+/// at [`cache_key`]`("/")` (`prerender/listing/index.html`, unchanged since before pagination
+/// existed — no blob migration for the common case); page ≥2 lives here instead, in its OWN
+/// reserved subtree, so widening/narrowing `posts_per_page` (or any change that reshapes the
+/// front page) can blunt-evict every later home page in one `delete_prefix` without touching
+/// page 1's key, the feed, or any permalink/term-archive blob. `page` (the reserved top-level
+/// slug — see `RESERVED_TOP_LEVEL_SLUGS` in `ferropress-http`) can never be a real Post/Page
+/// slug, so this subtree can never collide with permalink space either.
+pub(crate) const HOME_PAGINATION_CACHE_PREFIX: &str = "prerender/listing/page";
+
+/// The prerender-cache key for home-listing page `page` (≥2 — page 1 uses [`cache_key`]`("/")`
+/// instead; callers must not call this for page 1).
+pub(crate) fn home_page_cache_key(page: usize) -> BlobKey {
+    debug_assert!(page >= 2, "home page 1 uses cache_key(\"/\"), not this key");
+    BlobKey(format!("{HOME_PAGINATION_CACHE_PREFIX}/{page}.html"))
 }
 
 /// The prerender-cache key for an [`OutputPage`]. Thin wrapper over [`cache_key`]
@@ -425,6 +451,16 @@ impl ServeEngine {
             // change apply.
             if setting_reshapes_front(change) {
                 self.evict_front().await;
+                self.evict_home_pagination().await;
+            }
+            // `reading.posts_per_page` ALSO moves every OTHER paginated listing's page
+            // boundaries — the home pagination evict above only covers page 1's sibling home
+            // pages; every term archive slices on this same live value (`build_archive`'s
+            // `limit`), so widening/narrowing it re-slices those boundaries too. Distinct from
+            // `setting_reshapes_front` above: `show_on_front`/`page_on_front` reshape WHICH
+            // page 1 shows but never move a page boundary, so they must NOT bust archives.
+            if setting_reshapes_pagination(change) {
+                self.evict_term_archives().await;
             }
             // `reading.feed_items` is the ONE `Setting` that reshapes the cached FEED's content
             // (how many entries it lists — the feed analogue of `reading.posts_per_page`
@@ -654,8 +690,10 @@ impl ServeEngine {
         }
     }
 
-    /// Evict the home page (`/`) prerender cache entry when a POST/PAGE change can reshape
-    /// what it shows. I/O-free (reads only the in-memory settings snapshot, when present).
+    /// Evict the home page (`/`) prerender cache entry — AND every paginated home page beyond
+    /// it — when a POST/PAGE change can reshape what the listing shows. A post joining/leaving
+    /// the galley re-slices EVERY page boundary, not just page 1's, so both evictions fire
+    /// together. I/O-free (reads only the in-memory settings snapshot, when present).
     ///
     /// Home *eviction* is deliberately NOT gated on the engine holding a [`SettingsHandle`]:
     /// the read path caches `/` unconditionally (it carries its own settings), so eviction
@@ -685,6 +723,7 @@ impl ServeEngine {
         };
         if affects_front {
             self.evict_front().await;
+            self.evict_home_pagination().await;
         }
     }
 
@@ -695,6 +734,18 @@ impl ServeEngine {
     async fn evict_front(&self) {
         if let Err(e) = self.blobs.delete(&cache_key("/")).await {
             tracing::warn!(error = %e, "evicting the home prerender cache failed");
+        }
+    }
+
+    /// Blunt-evict every cached home LISTING page BEYOND page 1
+    /// ([`HOME_PAGINATION_CACHE_PREFIX`]) — one recursive `delete_prefix`. Page 1 itself is
+    /// [`evict_front`](Self::evict_front)'s job (a separate key, outside this prefix); the two
+    /// together cover the whole paginated home listing. **Best-effort**, idempotent — mirrors
+    /// [`evict_term_archives`](Self::evict_term_archives).
+    async fn evict_home_pagination(&self) {
+        let prefix = BlobKey(HOME_PAGINATION_CACHE_PREFIX.to_owned());
+        if let Err(e) = self.blobs.delete_prefix(&prefix).await {
+            tracing::warn!(error = %e, "evicting the home-pagination prerender cache subtree failed");
         }
     }
 
@@ -876,6 +927,24 @@ fn setting_reshapes_front(change: &Change) -> bool {
             key,
             "reading.posts_per_page" | "reading.show_on_front" | "reading.page_on_front"
         ),
+        None => true,
+    }
+}
+
+/// Whether a `Setting` change altered `reading.posts_per_page` specifically — the ONE key
+/// that moves EVERY paginated listing's page boundaries (home page ≥2 AND every term
+/// archive's own pages, both sliced from this same live value at build time), not just
+/// what page 1 shows. Fails OPEN on an absent key (parity with [`setting_reshapes_front`]) —
+/// under-eviction is the dangerous direction, and a needless archive rebuild is idempotent
+/// and cheap.
+fn setting_reshapes_pagination(change: &Change) -> bool {
+    match change
+        .fields
+        .as_ref()
+        .and_then(|f| f.get("key"))
+        .and_then(|v| v.as_str())
+    {
+        Some(key) => key == "reading.posts_per_page",
         None => true,
     }
 }

@@ -2195,7 +2195,7 @@ async fn serve_front_galley_read_through_populates_cache() {
     )
     .expect("the home cache holds a CachedFront envelope, not composed HTML");
     match front {
-        crate::content::CachedFront::Galley(rows) => {
+        crate::content::CachedFront::Galley { rows, page, .. } => {
             assert_eq!(
                 rows.len(),
                 2,
@@ -2205,6 +2205,7 @@ async fn serve_front_galley_read_through_populates_cache() {
                 rows.iter().all(|r| r.title == "Hello World"),
                 "rows carry content-stable titles"
             );
+            assert_eq!(page, 1);
         }
         other => panic!("expected a Galley envelope, got {other:?}"),
     }
@@ -2223,14 +2224,18 @@ async fn serve_front_cache_hit_composes_from_stored_galley() {
 
     let home_key = cache_key("/");
     const SENTINEL: &str = "SENTINEL GALLEY ROW STRAIGHT FROM THE ENVELOPE";
-    let front = crate::content::CachedFront::Galley(vec![crate::content::CachedHomePost {
-        title: SENTINEL.to_owned(),
-        url: "/sentinel".to_owned(),
-        excerpt: String::new(),
-        published_at: None,
-        author_id: None,
-        term_ids: Vec::new(),
-    }]);
+    let front = crate::content::CachedFront::Galley {
+        rows: vec![crate::content::CachedHomePost {
+            title: SENTINEL.to_owned(),
+            url: "/sentinel".to_owned(),
+            excerpt: String::new(),
+            published_at: None,
+            author_id: None,
+            term_ids: Vec::new(),
+        }],
+        total: 1,
+        page: 1,
+    };
     blobs
         .put(&home_key, serde_json::to_vec(&front).unwrap())
         .await
@@ -2579,7 +2584,7 @@ async fn home_galley_byline_stays_live_on_cached_front_without_regen() {
     let envelope_bytes = blobs.get(&home_key).await.unwrap();
     let front: crate::content::CachedFront = serde_json::from_slice(&envelope_bytes).unwrap();
     match &front {
-        crate::content::CachedFront::Galley(rows) => assert_eq!(
+        crate::content::CachedFront::Galley { rows, .. } => assert_eq!(
             rows[0].author_id,
             Some(user_id.0),
             "the envelope caches the author id, not the name"
@@ -2835,7 +2840,7 @@ async fn home_rebuild_honors_new_posts_per_page_after_eviction() {
     let front0: crate::content::CachedFront =
         serde_json::from_slice(&blobs.get(&home_key).await.unwrap()).unwrap();
     match front0 {
-        crate::content::CachedFront::Galley(rows) => assert_eq!(rows.len(), 3),
+        crate::content::CachedFront::Galley { rows, .. } => assert_eq!(rows.len(), 3),
         other => panic!("expected Galley, got {other:?}"),
     }
 
@@ -2872,7 +2877,7 @@ async fn home_rebuild_honors_new_posts_per_page_after_eviction() {
     let front1: crate::content::CachedFront =
         serde_json::from_slice(&blobs.get(&home_key).await.unwrap()).unwrap();
     match front1 {
-        crate::content::CachedFront::Galley(rows) => assert_eq!(
+        crate::content::CachedFront::Galley { rows, .. } => assert_eq!(
             rows.len(),
             2,
             "the rebuilt galley must honor the new posts_per_page cap"
@@ -4534,7 +4539,7 @@ async fn root_archive_lists_own_and_descendant_posts_deduped() {
         );
     }
 
-    let key = crate::archive_cache_key("category/fiction");
+    let key = crate::archive_cache_key("category/fiction", 1);
     let envelope: crate::content::CachedTermArchive =
         serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
     assert_eq!(
@@ -4620,7 +4625,7 @@ async fn a_draft_post_is_excluded_from_the_archive() {
     assert!(html.contains("Published Post"), "was:\n{html}");
     assert!(!html.contains("Draft Post"), "was:\n{html}");
 
-    let key = crate::archive_cache_key("category/fiction");
+    let key = crate::archive_cache_key("category/fiction", 1);
     let envelope: crate::content::CachedTermArchive =
         serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
     assert_eq!(envelope.total, 1, "the draft must not count toward total");
@@ -4843,7 +4848,7 @@ async fn archive_write_through_uses_the_term_archive_cache_key() {
     seed_term(&store, "category", "fiction", "Fiction").await;
     let taxonomies = crate::load_taxonomies(&store).await.unwrap();
 
-    let key = crate::archive_cache_key("category/fiction");
+    let key = crate::archive_cache_key("category/fiction", 1);
     assert!(
         !blobs.exists(&key).await.unwrap(),
         "cache must be empty before the first serve"
@@ -4902,4 +4907,625 @@ async fn a_bare_taxonomy_key_falls_through_to_404() {
         crate::Resolved::NotFound => {}
         other => panic!("a bare taxonomy key must fall through to 404, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// D2 pagination: /page/{n}, the shared pager, and posts_per_page widen-evict
+// ---------------------------------------------------------------------------
+
+/// Home page 2 serves the NEXT slice (not page 1's rows again), with a self-URL canonical
+/// and a " — Page N" title suffix, write-through under the DEDICATED pagination key (never
+/// `cache_key("/")`).
+#[tokio::test]
+async fn home_page_2_serves_the_next_slice_with_self_canonical_and_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    for (slug, title) in [("p1", "Post One"), ("p2", "Post Two"), ("p3", "Post Three")] {
+        seed_titled_post(&store, slug, title, Status::Published).await;
+    }
+    let mut settings = SiteSettings::defaults();
+    settings.posts_per_page = 2;
+    settings.url = "https://example.com".to_owned();
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/page/2",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    // Newest-first with an id-DESC tiebreak (none of these posts set published_at): p3, p2
+    // land on page 1; p1 alone lands on page 2.
+    assert!(
+        html.contains("Post One"),
+        "page 2 must show the 3rd-newest post; was:\n{html}"
+    );
+    assert!(
+        !html.contains("Post Two") && !html.contains("Post Three"),
+        "page 2 must not repeat page 1's rows; was:\n{html}"
+    );
+    assert!(
+        html.contains("— Page 2"),
+        "page_title must suffix Page N on n>=2; was:\n{html}"
+    );
+    assert!(
+        html.contains("href=\"https:&#x2f;&#x2f;example.com&#x2f;page&#x2f;2\""),
+        "canonical must be page 2's OWN self-URL, never page 1's; was:\n{html}"
+    );
+
+    let key = crate::home_page_cache_key(2);
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "page 2 must write-through under its OWN dedicated key"
+    );
+    assert!(
+        !blobs.exists(&cache_key("/")).await.unwrap(),
+        "page 2's miss must never populate page 1's key"
+    );
+}
+
+/// The archive twin of [`home_page_2_serves_the_next_slice_with_self_canonical_and_title`].
+#[tokio::test]
+async fn archive_page_2_serves_the_next_slice_with_self_canonical_and_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    for (slug, title) in [("p1", "Post One"), ("p2", "Post Two"), ("p3", "Post Three")] {
+        let id = seed_titled_post(&store, slug, title, Status::Published).await;
+        link_term(&store, id, fiction_id).await;
+    }
+    let mut settings = SiteSettings::defaults();
+    settings.posts_per_page = 2;
+    settings.url = "https://example.com".to_owned();
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction/page/2",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    assert!(html.contains("Post One"), "was:\n{html}");
+    assert!(
+        !html.contains("Post Two") && !html.contains("Post Three"),
+        "was:\n{html}"
+    );
+    assert!(html.contains("— Page 2"), "was:\n{html}");
+    assert!(
+        html.contains(
+            "href=\"https:&#x2f;&#x2f;example.com&#x2f;category&#x2f;fiction&#x2f;page&#x2f;2\""
+        ),
+        "canonical must be page 2's OWN self-URL, never page 1's; was:\n{html}"
+    );
+
+    let key = crate::archive_cache_key("category/fiction", 2);
+    assert!(blobs.exists(&key).await.unwrap());
+    assert!(
+        !blobs
+            .exists(&crate::archive_cache_key("category/fiction", 1))
+            .await
+            .unwrap(),
+        "page 2's miss must never populate page 1's key"
+    );
+}
+
+/// An out-of-range home page (past the last real page) is a 404 that is NEVER
+/// write-through-cached — there is nothing to cache for a page that doesn't exist.
+#[tokio::test]
+async fn home_out_of_range_page_is_404_with_no_write_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await; // 1 post; default posts_per_page = 10
+    let settings = SiteSettings::defaults();
+
+    let key = crate::home_page_cache_key(2);
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/page/2",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "an out-of-range page must never be write-through-cached"
+    );
+}
+
+/// The archive twin of [`home_out_of_range_page_is_404_with_no_write_through`].
+#[tokio::test]
+async fn archive_out_of_range_page_is_404_with_no_write_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let post = seed_post(&store, SLUG, Status::Published).await;
+    link_term(&store, post, fiction_id).await;
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+
+    let key = crate::archive_cache_key("category/fiction", 2);
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction/page/2",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+    assert!(!blobs.exists(&key).await.unwrap());
+}
+
+/// A REAL Page whose own materialized path happens to end in two segments that PARSE as a
+/// pagination suffix (`docs/page/3`, with actual pages slugged "page" and "3" nested under
+/// "docs") still serves as itself — claim-only-on-resolve: "docs" is not a taxonomy key, so
+/// the syntactic parse is never consumed, and the FULL original path resolves as the page it
+/// really is.
+#[tokio::test]
+async fn nested_page_shaped_like_a_pager_suffix_falls_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    let docs = seed_page(&store, "docs", Status::Published, "Docs root.").await;
+    let page_seg = seed_page(&store, "page", Status::Published, "The 'page' page.").await;
+    link_parent(&store, page_seg, docs).await;
+    let three = seed_page(&store, "3", Status::Published, "Docs entry three.").await;
+    link_parent(&store, three, page_seg).await;
+    crate::backfill_page_paths(&store)
+        .await
+        .expect("backfill page paths");
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/docs/page/3",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (the real page), got {other:?}"),
+    };
+    assert!(
+        html.contains("Docs entry three."),
+        "the real page at this exact path must serve, never 404 or be mistaken for a pager suffix; was:\n{html}"
+    );
+}
+
+/// A static front page NEVER paginates — `/page/{n>=2}` is a 404 (nothing to paginate), not a
+/// slice of the static page's own content.
+#[tokio::test]
+async fn static_front_page_2_is_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    let page_id = seed_page(&store, "about", Status::Published, "About the Press body.").await;
+    let mut settings = SiteSettings::defaults();
+    settings.front_page_id = Some(page_id.0);
+
+    let key = crate::home_page_cache_key(2);
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/page/2",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("a static front must never paginate; expected NotFound, got {other:?}"),
+    }
+    assert!(!blobs.exists(&key).await.unwrap());
+}
+
+/// `reading.posts_per_page` moves EVERY paginated listing's boundaries — home pages beyond 1
+/// AND every term archive (both slice on this same live value) — so its change must evict
+/// both subtrees, not just page 1's own key.
+#[tokio::test]
+async fn posts_per_page_change_evicts_home_pagination_and_term_archives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, _theme) = boot(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await;
+
+    let front_key = cache_key("/");
+    let home_p2_key = crate::home_page_cache_key(2);
+    let archive_p1_key = crate::archive_cache_key("category/fiction", 1);
+    let archive_p2_key = crate::archive_cache_key("category/fiction", 2);
+    for key in [&front_key, &home_p2_key, &archive_p1_key, &archive_p2_key] {
+        blobs.put(key, b"cached".to_vec()).await.unwrap();
+    }
+
+    let settings = SiteSettings::defaults();
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings));
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "reading.posts_per_page",
+        ))
+        .await
+        .expect("apply posts_per_page change");
+
+    for key in [&front_key, &home_p2_key, &archive_p1_key, &archive_p2_key] {
+        assert!(
+            !blobs.exists(key).await.unwrap(),
+            "reading.posts_per_page must evict {key:?} (every boundary moves)"
+        );
+    }
+}
+
+/// A `show_on_front`/`page_on_front` change reshapes ONLY what page 1 shows — it must evict
+/// home pagination (any previously-cached later page could now be meaningless) but must NOT
+/// touch term archives, which don't depend on the front's configuration at all.
+#[tokio::test]
+async fn show_on_front_change_evicts_home_pagination_but_not_archives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, _theme) = boot(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await;
+
+    let home_p2_key = crate::home_page_cache_key(2);
+    let archive_p1_key = crate::archive_cache_key("category/fiction", 1);
+    for key in [&home_p2_key, &archive_p1_key] {
+        blobs.put(key, b"cached".to_vec()).await.unwrap();
+    }
+
+    let settings = SiteSettings::defaults();
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    )
+    .with_settings(SettingsHandle::new(settings));
+    engine
+        .apply_change(&setting_change_with_key(
+            ChangeKind::Update,
+            "reading.show_on_front",
+        ))
+        .await
+        .expect("apply show_on_front change");
+
+    assert!(
+        !blobs.exists(&home_p2_key).await.unwrap(),
+        "show_on_front must evict home pagination"
+    );
+    assert!(
+        blobs.exists(&archive_p1_key).await.unwrap(),
+        "show_on_front must NOT touch term archives — they don't depend on the front's config"
+    );
+}
+
+/// A published-Post change re-slices EVERY home page boundary (a post joining/leaving the
+/// galley shifts what every later page shows), so it must evict home pagination ALONGSIDE the
+/// existing front-key + term-archive evictions.
+#[tokio::test]
+async fn a_post_change_evicts_home_pagination_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, _theme) = boot(tmp.path());
+    let id = seed_post(&store, SLUG, Status::Published).await;
+
+    let home_p2_key = crate::home_page_cache_key(2);
+    blobs.put(&home_p2_key, b"cached".to_vec()).await.unwrap();
+
+    let engine = ServeEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&blobs),
+        Arc::new(NoCustomBlocks),
+    );
+    engine
+        .apply_change(&change(ChangeKind::Update, id))
+        .await
+        .expect("post change applies");
+
+    assert!(
+        !blobs.exists(&home_p2_key).await.unwrap(),
+        "a post change must evict home pagination — it re-slices every boundary"
+    );
+}
+
+/// A pre-D2 `CachedFront::Galley` blob (the OLD tuple-variant shape, serialized as a bare
+/// JSON array rather than `{rows, total, page}`) fails the new shape under
+/// `deny_unknown_fields`/the struct-variant tag and self-heals via the SAME
+/// re-render-on-first-access path every other envelope format change uses — never a 500, never
+/// stale/wrong content.
+#[tokio::test]
+async fn old_tuple_variant_galley_blob_self_heals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await;
+
+    let home_key = cache_key("/");
+    // The OLD (pre-D2) shape: `CachedFront::Galley` as a bare array of rows, no total/page.
+    let legacy = serde_json::json!({ "Galley": [] });
+    blobs
+        .put(&home_key, serde_json::to_vec(&legacy).unwrap())
+        .await
+        .unwrap();
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("a legacy-shape blob must self-heal to a fresh render, got {other:?}"),
+    };
+    assert!(
+        html.contains("Hello World"),
+        "the self-healed render must show the real (live) post, not the stale empty legacy blob; was:\n{html}"
+    );
+
+    // The cache now holds the CURRENT shape.
+    let healed: crate::content::CachedFront =
+        serde_json::from_slice(&blobs.get(&home_key).await.unwrap())
+            .expect("the self-heal write-through must be the CURRENT CachedFront shape");
+    match healed {
+        crate::content::CachedFront::Galley { rows, page, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(page, 1);
+        }
+        other => panic!("expected Galley, got {other:?}"),
+    }
+}
+
+/// The built-in theme's pager markup carries the D3 endless-scroll loader's stable hooks:
+/// `data-fp-rows` on the post-list container, `data-fp-pager` on the pager `<nav>`, and
+/// `data-fp-next` on the OLDER link specifically (the loader's fetch target).
+#[tokio::test]
+async fn pager_hooks_present_in_built_in_theme_markup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    for slug in ["p1", "p2", "p3"] {
+        seed_post(&store, slug, Status::Published).await;
+    }
+    let mut settings = SiteSettings::defaults();
+    settings.posts_per_page = 2;
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    assert!(
+        html.contains("data-fp-rows"),
+        "the post-list container must carry the D3 rows hook; was:\n{html}"
+    );
+    assert!(
+        html.contains("data-fp-pager"),
+        "the pager nav must carry the D3 pager hook; was:\n{html}"
+    );
+    assert!(
+        html.contains("data-fp-next"),
+        "the older/next link must carry the D3 fetch-target hook; was:\n{html}"
+    );
+}
+
+/// The fellstone-site theme's OWN pager markup carries the same three D3 hooks — a real
+/// smoke-render against its actual template files (not just the built-in theme), the same
+/// "registered ⇒ renderable" discipline `ThemeRegistry::load_dir` enforces at boot. Both a
+/// page with an OLDER link (page 1) and one with a NEWER link (page 2) are checked, so the
+/// `{% else %}` (spent) branches on both sides are exercised at least once too.
+#[tokio::test]
+async fn pager_hooks_present_in_fellstone_theme_markup() {
+    let registry = crate::themes::ThemeRegistry::load_dir(std::path::Path::new(
+        "/home/joe/dev/fellstone-site/theme",
+    ));
+    let engine = registry
+        .build("fellstone")
+        .expect("the fellstone theme must build");
+    let base_ctx = serde_json::json!({
+        "page_title": "Sample", "page_description": null, "canonical": null,
+        "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
+        "is_home": true, "preview_status": null, "nav": {},
+        "archive": null,
+        "posts": [{"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}],
+    });
+
+    let mut page1 = base_ctx.clone();
+    page1["pager"] =
+        serde_json::json!({"older": "/page/2", "newer": null, "page": 1, "total_pages": 2});
+    let html1 = engine
+        .render(crate::templates::HOME_TEMPLATE, &page1)
+        .expect("fellstone home.html must render page 1 with a pager");
+    assert!(html1.contains("data-fp-rows"), "page 1: {html1}");
+    assert!(html1.contains("data-fp-pager"), "page 1: {html1}");
+    assert!(html1.contains("data-fp-next"), "page 1: {html1}");
+
+    let mut page2 = base_ctx;
+    page2["pager"] = serde_json::json!({"older": null, "newer": "/", "page": 2, "total_pages": 2});
+    let html2 = engine
+        .render(crate::templates::HOME_TEMPLATE, &page2)
+        .expect("fellstone home.html must render the last page too");
+    assert!(html2.contains("data-fp-pager"), "page 2: {html2}");
+    assert!(
+        !html2.contains("data-fp-next"),
+        "the LAST page has no older link, so no data-fp-next; page 2: {html2}"
+    );
+}
+
+/// `aria_current` is EXACT-match: on home page 2+, a nav item pointing at the bare `/` is
+/// NOT current (page 2's own path is `/page/2`, not `/`) — the same discipline the archive
+/// nav Term arm and every other target kind already carry.
+#[tokio::test]
+async fn home_page_2_nav_home_item_is_not_current() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    for slug in ["p1", "p2", "p3"] {
+        seed_post(&store, slug, Status::Published).await;
+    }
+    let mut settings = SiteSettings::defaults();
+    settings.posts_per_page = 2;
+
+    let menus = crate::MenuSet::from_locations([(
+        "primary".to_owned(),
+        vec![crate::MenuNode {
+            label: "Home".to_owned(),
+            target: ferropress_core::LinkTarget::Custom {
+                url: "/".to_owned(),
+            },
+            new_tab: false,
+            children: vec![],
+        }],
+    )]);
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &menus,
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/page/2",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    // The base chrome's OWN CSS literally contains the substring "aria-current" (a selector,
+    // `.mastnav a[aria-current="page"]`), so a whole-document `contains` check would be
+    // vacuous — isolate the actual rendered `<a>...Home</a>` link and check THAT.
+    let start = html
+        .find("<a href=\"&#x2f;\"")
+        .expect("the Home nav link must render");
+    let end = html[start..].find("</a>").map(|i| start + i + 4).unwrap();
+    let home_link = &html[start..end];
+    assert!(
+        !home_link.contains("aria-current"),
+        "the Home nav item must NOT be current on page 2 (EXACT-match against /page/2, not /); link was: {home_link}"
+    );
+}
+
+/// The archive twin of [`home_page_2_nav_home_item_is_not_current`]: on an archive's page 2+,
+/// a nav item pointing at the archive's OWN base href is not current either.
+#[tokio::test]
+async fn archive_page_2_nav_item_is_not_current() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    for slug in ["p1", "p2", "p3"] {
+        let id = seed_post(&store, slug, Status::Published).await;
+        link_term(&store, id, fiction_id).await;
+    }
+    let mut settings = SiteSettings::defaults();
+    settings.posts_per_page = 2;
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+
+    let menus = crate::MenuSet::from_locations([(
+        "primary".to_owned(),
+        vec![crate::MenuNode {
+            label: "Fiction".to_owned(),
+            target: ferropress_core::LinkTarget::Term { id: fiction_id.0 },
+            new_tab: false,
+            children: vec![],
+        }],
+    )]);
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &menus,
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction/page/2",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    // Isolate the rendered link (the chrome's own CSS literally contains "aria-current" in a
+    // selector, so a whole-document check would be vacuous — see the home twin above).
+    let start = html
+        .find("<a href=\"&#x2f;category&#x2f;fiction\"")
+        .expect("the Fiction nav link must render");
+    let end = html[start..].find("</a>").map(|i| start + i + 4).unwrap();
+    let fiction_link = &html[start..end];
+    assert!(
+        !fiction_link.contains("aria-current"),
+        "the Fiction nav item must NOT be current on page 2 (EXACT-match against .../page/2, not the base); link was: {fiction_link}"
+    );
 }

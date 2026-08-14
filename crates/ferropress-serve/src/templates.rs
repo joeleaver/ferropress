@@ -386,7 +386,7 @@ pub const HOME_SRC: &str = r##"{% extends "base.html" %}
     <p class="eyebrow">Latest from the galley</p>
     {% endif %}
     {% if posts %}
-    <ol class="galley">
+    <ol class="galley" data-fp-rows>
       {% for post in posts %}
       <li class="proof">
         <span class="slugline">{% if post.dateline %}<b>{{ post.dateline }}</b>{% endif %}{% if post.dateline and post.author %}<span class="dot"></span>{% endif %}{% if post.author %}{{ post.author }}{% endif %}</span>
@@ -399,6 +399,12 @@ pub const HOME_SRC: &str = r##"{% extends "base.html" %}
     </ol>
     {% else %}
     {% if archive %}<p class="empty">No proofs filed under {{ archive.name }} yet.</p>{% else %}<p class="empty">Nothing set in type yet.</p>{% endif %}
+    {% endif %}
+    {% if pager %}
+    <nav class="leaf" aria-label="Pagination" data-fp-pager>
+      {% if pager.newer %}<a href="{{ pager.newer }}">&larr; Newer type</a>{% else %}<span class="spent">Front of the galley</span>{% endif %}
+      {% if pager.older %}<a href="{{ pager.older }}" data-fp-next>Older type &rarr;</a>{% else %}<span class="spent">End of the galley</span>{% endif %}
+    </nav>
     {% endif %}
 {% endblock %}
 "##;

@@ -162,10 +162,11 @@ pub(crate) async fn build_feed(
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
 ) -> Result<CachedFeed, CoreError> {
-    // The feed does not (yet) surface term chips — `recent_published_posts` also batches term
-    // links for the galley/single-page chip resolution, ignored here.
-    let (objects, author_links, _term_links) =
-        content::recent_published_posts(store, settings.feed_items as usize).await?;
+    // The feed is not paginated (offset 0, always the newest `feed_items`) and does not (yet)
+    // surface term chips — `recent_published_posts` also batches term links (for the
+    // galley/single-page chip resolution) and a `total` (for the pager), both ignored here.
+    let (objects, author_links, _term_links, _total) =
+        content::recent_published_posts(store, 0, settings.feed_items as usize).await?;
 
     let mut items = Vec::with_capacity(objects.len());
     for (obj, author_ids) in objects.iter().zip(author_links.iter()) {

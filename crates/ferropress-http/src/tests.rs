@@ -964,3 +964,53 @@ async fn an_archive_owned_path_wins_over_a_stale_redirect() {
     assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
     assert_eq!(location.as_deref(), Some("/company"));
 }
+
+/// A bare structural `/page/1` suffix 301s to the home base (`/`) — page 1's canonical URL
+/// has no suffix at all.
+#[tokio::test]
+async fn bare_page_1_suffix_redirects_to_the_home_base() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_store, state) = boot_state(tmp.path());
+    let (status, location) = get_redirect(&state, "/page/1").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(location.as_deref(), Some("/"));
+}
+
+/// The archive twin: `/{taxonomy_key}/{chain}/page/1` 301s to the archive's own bare base.
+#[tokio::test]
+async fn archive_page_1_suffix_redirects_to_the_archive_base() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await;
+    let taxonomies = ferropress_serve::TaxonomyHandle::new(
+        ferropress_serve::load_taxonomies(&store)
+            .await
+            .expect("load taxonomies"),
+    );
+    let state = state.with_taxonomies(taxonomies);
+
+    let (status, location) = get_redirect(&state, "/category/fiction/page/1").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(location.as_deref(), Some("/category/fiction"));
+}
+
+/// Claim-only-on-resolve extends to the `/page/1` 301 rule too: a path shaped like a
+/// page-1 suffix whose stripped base resolves as NEITHER the front nor a live archive must
+/// never redirect (it would 301 to a dead page) — it falls through to the ordinary 404 flow.
+#[tokio::test]
+async fn page_1_suffix_does_not_redirect_when_the_base_does_not_resolve() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_store, state) = boot_state(tmp.path());
+    let (status, location) = get_redirect(&state, "/no-such-archive/page/1").await;
+    assert_ne!(
+        status,
+        StatusCode::MOVED_PERMANENTLY,
+        "an unresolvable base must never 301"
+    );
+    assert_eq!(location, None);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "falls through to the ordinary 404 flow"
+    );
+}

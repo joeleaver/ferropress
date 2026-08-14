@@ -387,6 +387,31 @@ async fn healthz() -> impl IntoResponse {
 async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_owned();
 
+    // A structural `/page/1` suffix is redundant — page 1's canonical URL is the bare base
+    // (no suffix; `ferropress_serve`'s own routing never even treats "n == 1" as a pagination
+    // suffix — see `strip_page_suffix` — so `/page/1` would otherwise just 404 or fall through
+    // to nothing). 301 it to the bare base BEFORE the redirect-table lookup below (this is
+    // canonical-URL normalization, not a recorded redirect: nothing is written to the
+    // `Redirect` table for it). Claim-only-on-resolve extends here too: fire ONLY when the
+    // stripped base actually resolves as the front page or a live archive — the reserved
+    // `page` top-level slug guarantees no legitimate PERMALINK content can occupy this exact
+    // shape, but a base that resolves to NEITHER must still fall through to the ordinary 404
+    // flow rather than 301 to a dead page.
+    if let Some(base) = strip_bare_page_one_suffix(&path)
+        && (base.is_empty() || state.taxonomies.term_path_owns(base))
+    {
+        let location = if base.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{base}")
+        };
+        return (
+            StatusCode::MOVED_PERMANENTLY,
+            [(axum::http::header::LOCATION, location)],
+        )
+            .into_response();
+    }
+
     // A moved URL 301s to its new home BEFORE the cache is consulted, so a renamed/re-parented
     // page's old path forwards instead of serving a stale blob or 404ing. The shadow-guard (the
     // admin handler deletes a redirect when a live page later takes that path) keeps a redirect
@@ -423,6 +448,22 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
             tracing::error!(%path, error = %err, "page render failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
         }
+    }
+}
+
+/// Strip a trailing structural `/page/1` suffix — the exact literal `"page/1"` as the
+/// path's last two segments — returning the base beneath it (`""` for the bare
+/// `/page/1`). `None` for any other shape, INCLUDING a different page number: `/page/2`
+/// must never redirect (n != 1 is a real page), and `/page/1extra` or a non-numeric
+/// segment isn't this suffix at all. This is the ONE dedicated "n == 1" case;
+/// `ferropress_serve`'s own `strip_page_suffix` deliberately never treats n == 1 as a
+/// pagination suffix (this 301 rule is what handles it, one layer up).
+fn strip_bare_page_one_suffix(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+    if trimmed == "page/1" {
+        Some("")
+    } else {
+        trimmed.strip_suffix("/page/1")
     }
 }
 

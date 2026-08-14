@@ -52,7 +52,7 @@ use crate::datefmt;
 use crate::menus::{MenuItemCtx, MenuSet};
 use crate::taxonomies::TaxonomySet;
 use crate::templates::{HOME_TEMPLATE, template_name_for};
-use crate::{archive_cache_key, cache_key};
+use crate::{archive_cache_key, cache_key, home_page_cache_key};
 
 /// Build a [`ThemeEngine`] for the **default** theme (the built-in letterpress "Composing
 /// Room" — `appearance.theme`'s default) from a builtin-only registry. The integration tests
@@ -170,21 +170,34 @@ pub(crate) struct CachedPage {
 /// are composed **live** in [`compose_front`], so a settings edit or an author rename is
 /// reflected with no `/` regeneration.
 ///
-/// The regen loop never *builds* this — it only **evicts** `/` when a change can reshape it
-/// (see [`ServeEngine::apply_change`](crate::ServeEngine)); the read path ([`serve_front`])
-/// is the sole populator, rebuilding on the next request. An externally-tagged enum rejects
-/// an unknown variant tag on deserialize, and the inner structs are `deny_unknown_fields`,
-/// so any format drift fails to deserialize and self-heals on first access (the same
-/// discipline as [`CachedPage`]).
+/// The regen loop never *builds* this — it only **evicts** `/` (and, for the galley, every
+/// paginated home page beyond it) when a change can reshape it (see
+/// [`ServeEngine::apply_change`](crate::ServeEngine)); the read path ([`serve_front`]) is the
+/// sole populator, rebuilding on the next request. An externally-tagged enum rejects an
+/// unknown variant tag on deserialize, and the inner structs are `deny_unknown_fields`, so any
+/// format drift fails to deserialize and self-heals on first access (the same discipline as
+/// [`CachedPage`]). D2's `Galley` shape change (tuple → struct, to bake `total`/`page` — the
+/// pager on a cache HIT must never touch the store) is one such drift: a pre-D2 `Galley([…])`
+/// blob fails this shape and self-heals via the SAME re-render-on-first-access path, a one-time
+/// cost.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum CachedFront {
     /// The configured static front page (a published `Page`): the SAME per-object envelope
     /// its own permalink caches, composed with `is_home = true`. Boxed so the (much larger)
     /// static variant does not bloat every galley envelope; the `Box` is transparent to serde
-    /// (the on-disk JSON is identical to an unboxed `CachedPage`).
+    /// (the on-disk JSON is identical to an unboxed `CachedPage`). Never paginates — D2's
+    /// `/page/{n≥2}` on a static front is a 404 (nothing to paginate).
     Static(Box<CachedPage>),
-    /// The latest-posts galley (newest first, capped at `posts_per_page`).
-    Galley(Vec<CachedHomePost>),
+    /// The latest-posts galley, one page's worth (newest first, capped at `posts_per_page`).
+    Galley {
+        rows: Vec<CachedHomePost>,
+        /// The FULL published-post count (before slicing to one page) — the pager's
+        /// `total_pages` arithmetic on a cache HIT must derive from this baked value, never a
+        /// store re-scan (the store-free-hit invariant).
+        total: usize,
+        /// The 1-based page number this envelope holds.
+        page: usize,
+    },
 }
 
 /// One content-stable galley row. The dateline is formatted and the byline name is resolved
@@ -254,6 +267,60 @@ pub fn slug_from_path(path: &str) -> &str {
     path.trim_start_matches('/').trim_end_matches('/')
 }
 
+/// Parse a trimmed path key's trailing STRUCTURAL `/page/{n}` pagination suffix, if any:
+/// `("category/fiction/page/3", 3)` on a match. Only `n >= 2` counts as a suffix — `n == 0`
+/// (non-numeric or zero) and `n == 1` both return `None`, so `/page/1` is never claimed here
+/// (its 301-to-bare is a SEPARATE, HTTP-layer rule; claiming it here would 200 it instead).
+///
+/// This is a SYNTACTIC parse only — claim-only-on-resolve is the CALLER's job. `base` (the
+/// part before `/page/{n}`) may be empty (`"page/3"` → home page 3) or non-empty
+/// (`"category/fiction/page/3"` → `base = "category/fiction"`), and the caller must still
+/// check whether `base` actually resolves (empty ⇒ home; else [`TaxonomySet::resolve_archive_path`])
+/// before treating this as a paginated hit — otherwise a real nested Page whose OWN path
+/// happens to end in two segments that parse this way (`docs/page/3`, an actual Page at that
+/// exact materialized path) would be wrongly shadowed. When `base` doesn't resolve, the caller
+/// falls through with the ORIGINAL, un-stripped path — this function has no side effect on
+/// that decision.
+fn strip_page_suffix(term_path: &str) -> Option<(&str, usize)> {
+    let (rest, n_str) = term_path.rsplit_once('/')?;
+    let n: usize = n_str.parse().ok()?;
+    if n < 2 {
+        return None;
+    }
+    if rest == "page" {
+        Some(("", n))
+    } else {
+        rest.strip_suffix("/page").map(|base| (base, n))
+    }
+}
+
+/// Resolve one term-archive PAGE **uncached** — the [`resolve_path`] twin of [`serve_archive`].
+/// `Ok(None)` from [`build_archive`] (an out-of-range page) maps to [`Resolved::NotFound`],
+/// exactly like an unresolvable permalink.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_archive_page(
+    store: &Arc<dyn RhypeStore>,
+    theme: &ThemeEngine,
+    settings: &SiteSettings,
+    authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
+    taxonomies: &TaxonomySet,
+    term_id: u64,
+    page: usize,
+) -> Resolved {
+    match build_archive(store, taxonomies, settings, term_id, page).await {
+        Ok(Some(archive)) => {
+            match compose_archive(theme, settings, authors, menus, index, taxonomies, &archive) {
+                Ok(html) => Resolved::Found(html),
+                Err(e) => Resolved::Error(e),
+            }
+        }
+        Ok(None) => Resolved::NotFound,
+        Err(e) => Resolved::Error(e),
+    }
+}
+
 /// Resolve a request path to a rendered HTML document (v1 SSR-on-demand, uncached).
 ///
 /// The site root renders the front-page galley; any other path resolves the
@@ -275,9 +342,28 @@ pub async fn resolve_path(
     let term_path = slug_from_path(path);
     if term_path.is_empty() {
         return front_page(
-            store, theme, custom, settings, authors, menus, index, taxonomies,
+            store, theme, custom, settings, authors, menus, index, taxonomies, 1,
         )
         .await;
+    }
+
+    // A structural `/page/{n}` suffix, claim-only-on-resolve: only consumed when the stripped
+    // base actually resolves (empty -> home, else an archive chain) — otherwise fall through
+    // with the FULL original path/term_path below (covers a real nested Page whose own path
+    // happens to end `.../page/{n}`, e.g. `docs/page/3`).
+    if let Some((base, page)) = strip_page_suffix(term_path) {
+        if base.is_empty() {
+            return front_page(
+                store, theme, custom, settings, authors, menus, index, taxonomies, page,
+            )
+            .await;
+        }
+        if let Some(term_id) = taxonomies.resolve_archive_path(base) {
+            return resolve_archive_page(
+                store, theme, settings, authors, menus, index, taxonomies, term_id, page,
+            )
+            .await;
+        }
     }
 
     // Claim-only-on-resolve, mirroring `serve_path`'s archive branch (kept in parity here too,
@@ -286,16 +372,10 @@ pub async fn resolve_path(
     // diverge on what "this path exists" means). A bare taxonomy key (`/category`, no chain)
     // does not resolve, so it falls through untouched to the ordinary permalink flow below.
     if let Some(term_id) = taxonomies.resolve_archive_path(term_path) {
-        return match build_archive(store, taxonomies, settings, term_id).await {
-            Ok(archive) => {
-                match compose_archive(theme, settings, authors, menus, index, taxonomies, &archive)
-                {
-                    Ok(html) => Resolved::Found(html),
-                    Err(e) => Resolved::Error(e),
-                }
-            }
-            Err(e) => Resolved::Error(e),
-        };
+        return resolve_archive_page(
+            store, theme, settings, authors, menus, index, taxonomies, term_id, 1,
+        )
+        .await;
     }
 
     match build_page(store, custom, path).await {
@@ -357,9 +437,29 @@ pub async fn serve_path(
         // (build + write-through on a miss); the change-driven regen loop EVICTS `/` when a
         // content/settings change can reshape it, and this read path is the sole populator.
         return serve_front(
-            store, blobs, theme, custom, settings, authors, menus, index, taxonomies,
+            store, blobs, theme, custom, settings, authors, menus, index, taxonomies, 1,
         )
         .await;
+    }
+
+    // A structural `/page/{n}` suffix, claim-only-on-resolve — mirrors `resolve_path`'s: only
+    // consumed when the stripped base actually resolves (empty -> home, else an archive
+    // chain), otherwise fall through with the FULL original path/term_path below (a real
+    // nested Page whose own path happens to end `.../page/{n}` still resolves as itself).
+    if let Some((base, page)) = strip_page_suffix(term_path) {
+        if base.is_empty() {
+            return serve_front(
+                store, blobs, theme, custom, settings, authors, menus, index, taxonomies, page,
+            )
+            .await;
+        }
+        if let Some(term_id) = taxonomies.resolve_archive_path(base) {
+            return serve_archive(
+                store, blobs, theme, settings, authors, menus, index, taxonomies, term_id, base,
+                page,
+            )
+            .await;
+        }
     }
 
     // Claim-only-on-resolve: intercept BEFORE the permalink cache key/read below, so a live
@@ -370,7 +470,7 @@ pub async fn serve_path(
     // is nothing to cache for a path nobody claims.
     if let Some(term_id) = taxonomies.resolve_archive_path(term_path) {
         return serve_archive(
-            store, blobs, theme, settings, authors, menus, index, taxonomies, term_id, term_path,
+            store, blobs, theme, settings, authors, menus, index, taxonomies, term_id, term_path, 1,
         )
         .await;
     }
@@ -454,23 +554,28 @@ pub async fn serve_path(
     }
 }
 
-/// Cache-first resolution of the site root (`/`): the static-first hot path for the front
-/// page, mirroring [`serve_path`] for permalinks.
+/// Cache-first resolution of the site root (`/`) or one of its paginated `/page/{n}` pages,
+/// mirroring [`serve_path`] for permalinks.
 ///
-/// 1. Try the prerender cache (`blobs.get(cache_key("/"))`). On a hit, deserialize the
-///    [`CachedFront`] envelope and compose it live (chrome + datelines + bylines from the
-///    current settings + author directory) — **no store scan, no block re-render**. A
-///    corrupt/legacy entry that fails to deserialize is treated as a miss (self-heal).
-/// 2. On a miss, [`build_front`] the envelope (a static Page or the galley scan), write it
-///    *through* to the cache, and compose.
+/// 1. Try the prerender cache (`page == 1` -> `cache_key("/")`; `page >= 2` ->
+///    [`home_page_cache_key`], its OWN reserved subtree). On a hit, deserialize the
+///    [`CachedFront`] envelope and compose it live (chrome + datelines + bylines + the pager —
+///    from the current settings + author directory + the envelope's baked `total`, **no store
+///    scan, no block re-render**). A corrupt/legacy entry that fails to deserialize is treated
+///    as a miss (self-heal).
+/// 2. On a miss, [`build_front`] the envelope (a static Page or a galley page-slice), write it
+///    *through* to the cache, and compose. `Ok(None)` (an out-of-range page, or `page >= 2` on
+///    a static front — it never paginates) is [`Resolved::NotFound`] with NO write-through:
+///    there is nothing to cache for a page that does not exist.
 ///
 /// The cache is **best-effort** (a blob fault degrades to a live render, never a 500). The
-/// regen loop keeps `/` fresh by **evicting** it on a reshaping change; this read path is the
-/// sole *populator*, so there is no eager-regen writer to race a PUT against. A narrow
-/// residual window remains — a write-through that builds from state S then lands just after a
-/// concurrent evict can re-cache pre-change content — the same best-effort read-vs-invalidate
-/// class the permalink path ([`serve_path`]) already carries; it self-clears on the next
-/// reshaping change (and a post/page/setting change is a broad trigger set).
+/// regen loop keeps `/` (and every paginated home page) fresh by **evicting** on a reshaping
+/// change; this read path is the sole *populator*, so there is no eager-regen writer to race a
+/// PUT against. A narrow residual window remains — a write-through that builds from state S
+/// then lands just after a concurrent evict can re-cache pre-change content — the same
+/// best-effort read-vs-invalidate class the permalink path ([`serve_path`]) already carries;
+/// it self-clears on the next reshaping change (and a post/page/setting change is a broad
+/// trigger set).
 #[allow(clippy::too_many_arguments)]
 async fn serve_front(
     store: &Arc<dyn RhypeStore>,
@@ -482,8 +587,13 @@ async fn serve_front(
     menus: &MenuSet,
     index: &ContentIndex,
     taxonomies: &TaxonomySet,
+    page: usize,
 ) -> Resolved {
-    let key = cache_key("/");
+    let key = if page <= 1 {
+        cache_key("/")
+    } else {
+        home_page_cache_key(page)
+    };
 
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedFront>(&bytes) {
@@ -499,27 +609,27 @@ async fn serve_front(
                 // Not the current `CachedFront` shape (corrupt, or a legacy/format-drifted
                 // entry rejected by the enum tag / `deny_unknown_fields`): re-render live and
                 // write-through the current format — the cache self-heals on first access.
-                tracing::warn!(error = %e, "home prerender cache entry not in the current format; re-rendering");
+                tracing::warn!(page, error = %e, "home prerender cache entry not in the current format; re-rendering");
             }
         },
         Err(CoreError::NotFound { .. }) => {
             // Ordinary cache miss — fall through to render-on-demand.
         }
         Err(e) => {
-            tracing::warn!(error = %e, "home prerender cache read failed; falling back to render");
+            tracing::warn!(page, error = %e, "home prerender cache read failed; falling back to render");
         }
     }
 
-    match build_front(store, custom, settings).await {
-        Ok(front) => {
+    match build_front(store, custom, settings, page).await {
+        Ok(Some(front)) => {
             match serde_json::to_vec(&front) {
                 Ok(bytes) => {
                     if let Err(e) = blobs.put(&key, bytes).await {
-                        tracing::warn!(error = %e, "home prerender cache write-through failed; serving uncached render");
+                        tracing::warn!(page, error = %e, "home prerender cache write-through failed; serving uncached render");
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "could not serialize the home envelope for the cache; serving uncached render");
+                    tracing::warn!(page, error = %e, "could not serialize the home envelope for the cache; serving uncached render");
                 }
             }
             match compose_front(theme, settings, authors, menus, index, taxonomies, &front) {
@@ -527,20 +637,26 @@ async fn serve_front(
                 Err(e) => Resolved::Error(e),
             }
         }
+        // Out of range (or page >= 2 on a static front, which never paginates): a 404 that is
+        // NEVER write-through-cached — there is nothing to cache for a page that doesn't exist.
+        Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
     }
 }
 
-/// Cache-first resolution of one term archive (`/{taxonomy_key}/{chain}`), mirroring
-/// [`serve_front`] for the site root: try the archive-namespaced cache
-/// ([`archive_cache_key`]) and compose live on a hit; on a miss, [`build_archive`] (the
-/// rollup), write-through, and compose. `term_path` is the ALREADY-RESOLVED, trimmed chain
-/// (the caller's `taxonomies.resolve_archive_path` succeeded on it) — the exact string both
-/// the cache key and the archive's own canonical href are built from, so they can never drift.
+/// Cache-first resolution of one PAGE of a term archive (`/{taxonomy_key}/{chain}` or
+/// `/{taxonomy_key}/{chain}/page/{n}`), mirroring [`serve_front`] for the site root: try the
+/// archive-namespaced cache ([`archive_cache_key`]) and compose live (pager included, from the
+/// baked `total`) on a hit; on a miss, [`build_archive`] (the rollup), write-through, and
+/// compose. `term_path` is the ALREADY-RESOLVED, trimmed chain (the caller's
+/// `taxonomies.resolve_archive_path` succeeded on it) — the exact string both the cache key
+/// and the archive's own canonical href are built from, so they can never drift.
 ///
-/// An archive whose rollup is empty is a VALID page (the empty-galley shape), never a 404 —
-/// only a path nobody's `resolve_archive_path` claims 404s, and that never reaches this
-/// function at all (the caller's job). The cache is best-effort, exactly like [`serve_front`].
+/// An archive whose rollup is empty is a VALID page 1 (the empty-galley shape), never a 404;
+/// `page >= 2` past the last real page IS a 404, with NO write-through (nothing to cache for a
+/// page that doesn't exist). Only a path nobody's `resolve_archive_path` claims 404s outside
+/// this function entirely (the caller's job). The cache is best-effort, exactly like
+/// [`serve_front`].
 #[allow(clippy::too_many_arguments)]
 async fn serve_archive(
     store: &Arc<dyn RhypeStore>,
@@ -553,8 +669,9 @@ async fn serve_archive(
     taxonomies: &TaxonomySet,
     term_id: u64,
     term_path: &str,
+    page: usize,
 ) -> Resolved {
-    let key = archive_cache_key(term_path);
+    let key = archive_cache_key(term_path, page);
 
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedTermArchive>(&bytes) {
@@ -570,27 +687,27 @@ async fn serve_archive(
                 // Not the current `CachedTermArchive` shape: re-render live and write-through
                 // the current format — the cache self-heals on first access, same discipline
                 // as every other envelope here.
-                tracing::warn!(%term_path, error = %e, "term-archive prerender cache entry not in the current format; re-rendering");
+                tracing::warn!(%term_path, page, error = %e, "term-archive prerender cache entry not in the current format; re-rendering");
             }
         },
         Err(CoreError::NotFound { .. }) => {
             // Ordinary cache miss — fall through to render-on-demand.
         }
         Err(e) => {
-            tracing::warn!(%term_path, error = %e, "term-archive prerender cache read failed; falling back to render");
+            tracing::warn!(%term_path, page, error = %e, "term-archive prerender cache read failed; falling back to render");
         }
     }
 
-    match build_archive(store, taxonomies, settings, term_id).await {
-        Ok(archive) => {
+    match build_archive(store, taxonomies, settings, term_id, page).await {
+        Ok(Some(archive)) => {
             match serde_json::to_vec(&archive) {
                 Ok(bytes) => {
                     if let Err(e) = blobs.put(&key, bytes).await {
-                        tracing::warn!(%term_path, error = %e, "term-archive prerender cache write-through failed; serving uncached render");
+                        tracing::warn!(%term_path, page, error = %e, "term-archive prerender cache write-through failed; serving uncached render");
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(%term_path, error = %e, "could not serialize the term-archive envelope for the cache; serving uncached render");
+                    tracing::warn!(%term_path, page, error = %e, "could not serialize the term-archive envelope for the cache; serving uncached render");
                 }
             }
             match compose_archive(theme, settings, authors, menus, index, taxonomies, &archive) {
@@ -598,6 +715,8 @@ async fn serve_archive(
                 Err(e) => Resolved::Error(e),
             }
         }
+        // Out-of-range page: a 404 that is NEVER write-through-cached.
+        Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
     }
 }
@@ -621,19 +740,26 @@ pub(crate) async fn build_page(
     ))
 }
 
-/// Build the [`CachedTermArchive`] envelope for `term_id`'s rolled-up listing (page 1 — D1 has
-/// no pagination yet, but the envelope already carries `page` so D2 adds no new shape).
-/// `pub(crate)` so the regen loop could cache it directly in a future increment; today only
-/// the read path ([`serve_archive`], and `resolve_path`'s archive branch) builds it, on a miss.
+/// Build the [`CachedTermArchive`] envelope for `term_id`'s rolled-up listing, one `page`
+/// (1-based). `Ok(None)` means `page` is OUT OF RANGE — `page >= 2` whose offset lands at or
+/// past `total` (page 1 ALWAYS builds, even an empty rollup: the empty-galley shape is valid,
+/// never "out of range"). `pub(crate)` so the regen loop could cache it directly in a future
+/// increment; today only the read path ([`serve_archive`], and `resolve_path`'s archive
+/// branch) builds it, on a miss.
 pub(crate) async fn build_archive(
     store: &Arc<dyn RhypeStore>,
     taxonomies: &TaxonomySet,
     settings: &SiteSettings,
     term_id: u64,
-) -> Result<CachedTermArchive, CoreError> {
+    page: usize,
+) -> Result<Option<CachedTermArchive>, CoreError> {
     let limit = settings.posts_per_page as usize;
+    let offset = limit.saturating_mul(page.saturating_sub(1));
     let (published, author_links, term_links, total) =
-        rollup_published_posts(store, taxonomies, term_id, limit).await?;
+        rollup_published_posts(store, taxonomies, term_id, offset, limit).await?;
+    if page > 1 && offset >= total {
+        return Ok(None);
+    }
 
     let rows = published
         .iter()
@@ -642,12 +768,12 @@ pub(crate) async fn build_archive(
         .map(|((obj, author_ids), row_term_ids)| to_cached_home_post(obj, author_ids, row_term_ids))
         .collect();
 
-    Ok(CachedTermArchive {
+    Ok(Some(CachedTermArchive {
         term_id,
         rows,
         total,
-        page: 1,
-    })
+        page,
+    }))
 }
 
 /// Render a specific (possibly **unpublished**) object through the real public theme,
@@ -863,10 +989,12 @@ fn compose_single(
         .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
 }
 
-/// Resolve the site root **uncached** (the SSR-on-demand form used by [`resolve_path`] +
-/// tests): [`build_front`] the envelope, then [`compose_front`] it live. The cache-first
-/// hot path is [`serve_front`]; both share `build_front`/`compose_front`, so the cached and
-/// uncached front pages are byte-for-byte identical.
+/// Resolve the site root, or one of its paginated `/page/{n}` pages, **uncached** (the
+/// SSR-on-demand form used by [`resolve_path`] + tests): [`build_front`] the envelope, then
+/// [`compose_front`] it live. The cache-first hot path is [`serve_front`]; both share
+/// `build_front`/`compose_front`, so the cached and uncached front pages are byte-for-byte
+/// identical. `Ok(None)` from `build_front` (an out-of-range page, or `page >= 2` on a static
+/// front) is [`Resolved::NotFound`].
 #[allow(clippy::too_many_arguments)]
 async fn front_page(
     store: &Arc<dyn RhypeStore>,
@@ -877,45 +1005,54 @@ async fn front_page(
     menus: &MenuSet,
     index: &ContentIndex,
     taxonomies: &TaxonomySet,
+    page: usize,
 ) -> Resolved {
-    match build_front(store, custom, settings).await {
-        Ok(front) => {
+    match build_front(store, custom, settings, page).await {
+        Ok(Some(front)) => {
             match compose_front(theme, settings, authors, menus, index, taxonomies, &front) {
                 Ok(html) => Resolved::Found(html),
                 Err(e) => Resolved::Error(e),
             }
         }
+        Ok(None) => Resolved::NotFound,
         Err(e) => Resolved::Error(e),
     }
 }
 
-/// Build the [`CachedFront`] envelope for the site root, or resolve which shape it takes.
+/// Build the [`CachedFront`] envelope for home listing page `page` (1-based), or resolve which
+/// shape it takes.
 ///
 /// A configured static front page ([`settings.front_page_id`](SiteSettings)) wins when it
 /// exists AND is published, producing a [`CachedFront::Static`] carrying the SAME per-object
-/// envelope its own permalink caches (composed later with `is_home = true`). A missing /
-/// unpublished / trashed target FALLS BACK to the [`CachedFront::Galley`] rather than 404ing
-/// or leaking an unpublished page — the front page is never a dead end. The by-id lookup
-/// bypasses the slug publish gate (the id came from a trusted setting, not a public slug),
-/// so this re-checks [`is_published`] itself.
+/// envelope its own permalink caches (composed later with `is_home = true`) — but ONLY for
+/// `page == 1`: a static front never paginates (there is nothing to paginate), so `page >= 2`
+/// here is `Ok(None)` (a 404) without even reading the page object. A missing / unpublished /
+/// trashed target FALLS BACK to the [`CachedFront::Galley`] rather than 404ing or leaking an
+/// unpublished page — the front page is never a dead end. The by-id lookup bypasses the slug
+/// publish gate (the id came from a trusted setting, not a public slug), so this re-checks
+/// [`is_published`] itself.
 ///
 /// `pub(crate)` so the read path ([`serve_front`], [`front_page`]) builds it on a miss. The
-/// regen loop never calls this — it only *evicts* `/`.
+/// regen loop never calls this — it only *evicts* `/` and its paginated siblings.
 pub(crate) async fn build_front(
     store: &Arc<dyn RhypeStore>,
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
-) -> Result<CachedFront, CoreError> {
+    page: usize,
+) -> Result<Option<CachedFront>, CoreError> {
     if let Some(page_id) = settings.front_page_id {
         match store
             .get(&TypeName::from(PAGE_TYPE), ObjectId(page_id))
             .await
         {
             Ok(obj) if is_published(&obj) => {
-                let page =
+                if page > 1 {
+                    return Ok(None); // a static front never paginates
+                }
+                let cached =
                     cached_page_from_object(store, custom, RenderMode::Publish, PAGE_TYPE, &obj)
                         .await?;
-                return Ok(CachedFront::Static(Box::new(page)));
+                return Ok(Some(CachedFront::Static(Box::new(cached))));
             }
             // Unpublished target -> galley fallback (must never surface publicly).
             Ok(_) => {}
@@ -924,7 +1061,10 @@ pub(crate) async fn build_front(
             Err(e) => return Err(e),
         }
     }
-    Ok(CachedFront::Galley(build_galley(store, settings).await?))
+    match build_galley(store, settings, page).await? {
+        Some((rows, total)) => Ok(Some(CachedFront::Galley { rows, total, page })),
+        None => Ok(None),
+    }
 }
 
 /// Compose the final front-page HTML from a cached [`CachedFront`], live. The static case
@@ -941,9 +1081,9 @@ fn compose_front(
     taxonomies: &TaxonomySet,
     front: &CachedFront,
 ) -> Result<String, CoreError> {
-    // The front page's own path is the site root, so nav items pointing at `/` are current.
-    let current_path = Some("/");
     match front {
+        // A static front never paginates (page is always 1), so its own path (the site root)
+        // is always current.
         CachedFront::Static(page) => compose_single(
             theme,
             settings,
@@ -954,9 +1094,9 @@ fn compose_front(
             page,
             true,
             None,
-            current_path,
+            Some("/"),
         ),
-        CachedFront::Galley(rows) => {
+        CachedFront::Galley { rows, total, page } => {
             let posts: Vec<PostSummary> = rows
                 .iter()
                 .map(|p| PostSummary {
@@ -974,19 +1114,42 @@ fn compose_front(
                 })
                 .collect();
 
+            // This page's own path (EXACT-match aria_current: page 2+ is NOT current at "/").
+            let current_path = if *page > 1 {
+                format!("/page/{page}")
+            } else {
+                "/".to_owned()
+            };
+            let page_title = if *page > 1 {
+                format!("{} — Page {page}", settings.title_or_default())
+            } else {
+                settings.title_or_default().to_owned()
+            };
+            // Self-URL canonical on page 2+ (never point at page 1); page 1 keeps the plain
+            // galley's existing "no canonical of its own" behavior.
+            let canonical = (*page > 1)
+                .then(|| format!("{}{current_path}", settings.url.trim_end_matches('/')));
+            let pager = build_pager(*page, *total, settings.posts_per_page, "/", |n| {
+                format!("/page/{n}")
+            });
+
             let ctx = HomeCtx {
-                page_title: settings.title_or_default().to_owned(),
+                page_title,
                 page_description: if settings.tagline.is_empty() {
                     None
                 } else {
                     Some(settings.tagline.clone())
                 },
-                canonical: None,
+                canonical,
                 site: SiteCtx::from(settings),
-                is_home: true,
+                // Only the ACTUAL site root counts as home for the theme's own fallback
+                // "Front page" link (which points at "/") — matches the EXACT-match discipline
+                // aria_current already uses everywhere else.
+                is_home: *page == 1,
                 preview_status: None,
-                nav: menus.compose(index, taxonomies, current_path),
+                nav: menus.compose(index, taxonomies, Some(&current_path)),
                 archive: None,
+                pager,
                 posts,
             };
 
@@ -1027,11 +1190,37 @@ fn compose_archive(
             Some(e.description.clone())
         }
     });
-    let href = taxonomies.archive_href(archive.term_id);
-    let current_path = href.as_deref();
-    let canonical = href
+    // The archive's own (page-1) href — the base every page's own path + the pager's hrefs
+    // are built from. `None` only in the narrow degrade window (see the doc comment above);
+    // every page then falls back to no current-path match and no canonical, still a safe
+    // (if unideal) render rather than a panic or an error.
+    let base_href = taxonomies.archive_href(archive.term_id);
+
+    // This page's own path (EXACT-match aria_current: page 2+ is not current at the base href).
+    let current_path = base_href.as_ref().map(|h| {
+        if archive.page > 1 {
+            format!("{h}/page/{}", archive.page)
+        } else {
+            h.clone()
+        }
+    });
+    let mut page_title = page_title(&name, settings);
+    if archive.page > 1 {
+        page_title = format!("{page_title} — Page {}", archive.page);
+    }
+    // Self-URL canonical (never point at page 1) once there IS a current path to point at.
+    let canonical = current_path
         .as_deref()
-        .map(|h| format!("{}{h}", settings.url.trim_end_matches('/')));
+        .map(|p| format!("{}{p}", settings.url.trim_end_matches('/')));
+    let pager = base_href.as_deref().and_then(|base| {
+        build_pager(
+            archive.page,
+            archive.total,
+            settings.posts_per_page,
+            base,
+            |n| format!("{base}/page/{n}"),
+        )
+    });
 
     let posts: Vec<PostSummary> = archive
         .rows
@@ -1052,18 +1241,19 @@ fn compose_archive(
         .collect();
 
     let ctx = HomeCtx {
-        page_title: page_title(&name, settings),
+        page_title,
         page_description: description.clone(),
         canonical,
         site: SiteCtx::from(settings),
         is_home: false,
         preview_status: None,
-        nav: menus.compose(index, taxonomies, current_path),
+        nav: menus.compose(index, taxonomies, current_path.as_deref()),
         archive: Some(ArchiveCtx {
             name,
             description,
             total: archive.total,
         }),
+        pager,
         posts,
     };
 
@@ -1072,11 +1262,61 @@ fn compose_archive(
         .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
 }
 
-/// The most-recent published posts for the galley, newest first, capped at
-/// `settings.posts_per_page`, as content-stable [`CachedHomePost`] rows (raw `published_at`
+/// One resolved pagination control for a listing (home or archive): hrefs for the adjacent
+/// pages + the current page / total pages, derived LIVE from a BAKED `total` + the LIVE
+/// `posts_per_page` — pure arithmetic, no store touch, so a cache HIT renders the pager with
+/// zero I/O. `None` when the whole listing fits on one page (no pager needed at all).
+#[derive(Serialize)]
+struct PagerCtx {
+    /// Href of the next-OLDER page (`page + 1`), or `None` on the last page. The D3
+    /// endless-scroll loader's fetch target (`data-fp-next` in the theme markup).
+    older: Option<String>,
+    /// Href of the next-NEWER page (`page - 1`); page 2's "newer" is the bare base href
+    /// (never a `/page/1` URL — page 1 has no suffix). `None` on page 1.
+    newer: Option<String>,
+    page: usize,
+    total_pages: usize,
+}
+
+/// Build [`PagerCtx`] for one listing page. `base_href` is page 1's own href (`"/"` for home,
+/// the archive's own [`TaxonomySet::archive_href`] for a term); `paged_href(n)` builds page
+/// `n`'s href for `n >= 2`.
+fn build_pager(
+    page: usize,
+    total: usize,
+    posts_per_page: u32,
+    base_href: &str,
+    paged_href: impl Fn(usize) -> String,
+) -> Option<PagerCtx> {
+    let per_page = (posts_per_page as usize).max(1);
+    let total_pages = total.div_ceil(per_page).max(1);
+    if total_pages <= 1 {
+        return None;
+    }
+    let newer = (page > 1).then(|| {
+        if page == 2 {
+            base_href.to_owned()
+        } else {
+            paged_href(page - 1)
+        }
+    });
+    let older = (page < total_pages).then(|| paged_href(page + 1));
+    Some(PagerCtx {
+        older,
+        newer,
+        page,
+        total_pages,
+    })
+}
+
+/// One `page` (1-based) of the most-recent published posts for the galley, `settings.
+/// posts_per_page` per page, as content-stable [`CachedHomePost`] rows (raw `published_at`
 /// millis + the author *id* + the `terms` membership ids — the dateline is formatted and the
 /// byline name + term chips resolved live in [`compose_front`], so a settings edit, an author
-/// rename, or a term rename needs no `/` regeneration).
+/// rename, or a term rename needs no `/` regeneration). `Ok(None)` means `page` is OUT OF
+/// RANGE (`page >= 2` whose offset lands at or past the total — page 1 always builds, even an
+/// empty result: the empty-galley shape is valid, never "out of range"). Returns `(rows,
+/// total)`: `total` is the FULL published count, the pager's arithmetic.
 ///
 /// Scans posts and filters/sorts in Rust: v1 has no compound "status == published ORDER BY
 /// published_at DESC LIMIT n" query primitive, and the post table is small. Posts with no
@@ -1085,16 +1325,23 @@ fn compose_archive(
 async fn build_galley(
     store: &Arc<dyn RhypeStore>,
     settings: &SiteSettings,
-) -> Result<Vec<CachedHomePost>, CoreError> {
-    let (published, author_links, term_links) =
-        recent_published_posts(store, settings.posts_per_page as usize).await?;
+    page: usize,
+) -> Result<Option<(Vec<CachedHomePost>, usize)>, CoreError> {
+    let limit = settings.posts_per_page as usize;
+    let offset = limit.saturating_mul(page.saturating_sub(1));
+    let (published, author_links, term_links, total) =
+        recent_published_posts(store, offset, limit).await?;
+    if page > 1 && offset >= total {
+        return Ok(None);
+    }
 
-    Ok(published
+    let rows = published
         .iter()
         .zip(author_links.iter())
         .zip(term_links.iter())
         .map(|((obj, author_ids), term_ids)| to_cached_home_post(obj, author_ids, term_ids))
-        .collect())
+        .collect();
+    Ok(Some((rows, total)))
 }
 
 /// Project one published post + its batched author/term links into a [`CachedHomePost`] row —
@@ -1115,22 +1362,24 @@ fn to_cached_home_post(
     }
 }
 
-/// The most-recent PUBLISHED posts (newest first, capped at `limit`) with each row's author
-/// target ids AND `terms` membership ids each in ONE batched link read — the
-/// scan/filter/sort/truncate + no-N+1 author query shared by BOTH the front-page galley
-/// ([`build_galley`]) and the syndication feed ([`crate::feed::build_feed`]), so the two
-/// listings can never drift on which posts they include or on the batched-link discipline.
-/// The feed does not (yet) surface term chips, so it simply ignores the third element.
+/// One `offset..offset+limit` PAGE of the most-recent PUBLISHED posts (newest first) with each
+/// row's author target ids AND `terms` membership ids each in ONE batched link read — the
+/// scan/filter/sort/slice + no-N+1 author query shared by BOTH the front-page galley
+/// ([`build_galley`]) and the syndication feed ([`crate::feed::build_feed`], which always
+/// passes `offset = 0` — it is not paginated), so the two listings can never drift on which
+/// posts they include or on the batched-link discipline. The feed does not (yet) surface term
+/// chips, so it simply ignores the third element (and the fourth, `total`).
 ///
 /// Scans posts and filters/sorts in Rust: v1 has no compound "status == published ORDER BY
-/// published_at DESC LIMIT n" primitive, and the post table is small. Posts with no
-/// `published_at` sort last (keyed `i64::MIN`). Returns the truncated objects and, positionally
-/// aligned by index, each object's `author` target ids and `terms` target ids (empty vec when
-/// unlinked).
+/// published_at DESC LIMIT n OFFSET m" primitive, and the post table is small. Posts with no
+/// `published_at` sort last (keyed `i64::MIN`). Returns the sliced objects, positionally
+/// aligned `author`/`terms` target ids (empty vec when unlinked), and `total` — the FULL
+/// published count *before* slicing, the pager's arithmetic.
 pub(crate) async fn recent_published_posts(
     store: &Arc<dyn RhypeStore>,
+    offset: usize,
     limit: usize,
-) -> Result<(Vec<Object>, Vec<Vec<ObjectId>>, Vec<Vec<ObjectId>>), CoreError> {
+) -> Result<(Vec<Object>, Vec<Vec<ObjectId>>, Vec<Vec<ObjectId>>, usize), CoreError> {
     let mut published: Vec<Object> = store
         .scan(&TypeName::from(POST_TYPE))
         .await?
@@ -1139,10 +1388,11 @@ pub(crate) async fn recent_published_posts(
         .collect();
 
     sort_newest_first(&mut published);
-    published.truncate(limit);
+    let total = published.len();
+    let page_slice: Vec<Object> = published.into_iter().skip(offset).take(limit).collect();
 
-    let (author_links, term_links) = batch_author_and_term_links(store, &published).await?;
-    Ok((published, author_links, term_links))
+    let (author_links, term_links) = batch_author_and_term_links(store, &page_slice).await?;
+    Ok((page_slice, author_links, term_links, total))
 }
 
 /// THE shared listing order: newest-first by publish instant (missing sorts last), with an id
@@ -1183,13 +1433,13 @@ async fn batch_author_and_term_links(
     Ok((author_links, term_links))
 }
 
-/// The rolled-up, published-only posts for a term ARCHIVE (`/{taxonomy_key}/{chain}`): the
-/// term's own DIRECT `Post.terms` membership `∪` every DESCENDANT term's (the WP "a parent
-/// category also lists its children's posts" convention), deduped, then [`sort_newest_first`]
-/// — the SAME order [`recent_published_posts`] uses, so the home page and every archive can
-/// never drift on tie-breaking. Returns `(rows, author_links, term_links, total)`: `total` is
-/// the FULL deduped count *before* slicing to one page — the archive heading's count and (from
-/// D2) the page-count arithmetic. `limit` slices from the start (page 1); D2 adds an offset.
+/// One `offset..offset+limit` PAGE of the rolled-up, published-only posts for a term ARCHIVE
+/// (`/{taxonomy_key}/{chain}`): the term's own DIRECT `Post.terms` membership `∪` every
+/// DESCENDANT term's (the WP "a parent category also lists its children's posts" convention),
+/// deduped, then [`sort_newest_first`] — the SAME order [`recent_published_posts`] uses, so
+/// the home page and every archive can never drift on tie-breaking. Returns `(rows,
+/// author_links, term_links, total)`: `total` is the FULL deduped count *before* slicing —
+/// the archive heading's count and the pager's page-count arithmetic.
 ///
 /// Post membership is read off `Term.objects`, the `Post.terms` INVERSE relation ([`TERM_TYPE`]
 /// docs) — one batched [`RhypeStore::get_links_many`] over `term_id ∪ descendants` resolves
@@ -1198,6 +1448,7 @@ async fn rollup_published_posts(
     store: &Arc<dyn RhypeStore>,
     taxonomies: &TaxonomySet,
     term_id: u64,
+    offset: usize,
     limit: usize,
 ) -> Result<(Vec<Object>, Vec<Vec<ObjectId>>, Vec<Vec<ObjectId>>, usize), CoreError> {
     let mut rollup_term_ids = taxonomies.descendants(term_id);
@@ -1233,10 +1484,10 @@ async fn rollup_published_posts(
         .collect();
     sort_newest_first(&mut published);
     let total = published.len();
-    published.truncate(limit);
+    let page_slice: Vec<Object> = published.into_iter().skip(offset).take(limit).collect();
 
-    let (author_links, term_links) = batch_author_and_term_links(store, &published).await?;
-    Ok((published, author_links, term_links, total))
+    let (author_links, term_links) = batch_author_and_term_links(store, &page_slice).await?;
+    Ok((page_slice, author_links, term_links, total))
 }
 
 /// Resolve a request path key to the PUBLISHED entity behind it, returning its store
@@ -1492,9 +1743,13 @@ struct HomeCtx<'a> {
     /// is a `String` resolved live from the [`TaxonomySet`] snapshot inside `compose_archive`'s
     /// own stack frame, not borrowed from a longer-lived caller argument.
     page_description: Option<String>,
-    /// The archive's own canonical URL (`settings.url` + its archive href), `None` for the
-    /// plain galley (which has no canonical target of its own today). Built the same way
-    /// [`SingleCtx::canonical`] is — a `<link rel="canonical">` the base chrome emits when set.
+    /// This page's own self-URL (`settings.url` + its own href). `None` on home page 1 (which
+    /// has no canonical target of its own today); an archive sets it from page 1 on (D1), home
+    /// only from page 2 on. Never points at a DIFFERENT page — a paginated page is canonical
+    /// to itself, not to page 1. (An archive whose term id the live `TaxonomySet` can no
+    /// longer resolve — the narrow `compose_archive` degrade window — also gets `None` here;
+    /// see its doc comment.) Built the same way [`SingleCtx::canonical`] is — a
+    /// `<link rel="canonical">` the base chrome emits when set.
     canonical: Option<String>,
     site: SiteCtx<'a>,
     is_home: bool,
@@ -1509,6 +1764,9 @@ struct HomeCtx<'a> {
     /// `Some` only when this is a term-archive listing — the theme conditionalizes its eyebrow
     /// on this field (`{% if archive %}` the heading, `{% else %}` the site-wide "Latest …").
     archive: Option<ArchiveCtx>,
+    /// The pagination control, `None` when the whole listing fits on one page — the theme
+    /// conditionalizes its `<nav>` pager on this field.
+    pager: Option<PagerCtx>,
     posts: Vec<PostSummary>,
 }
 
