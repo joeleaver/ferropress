@@ -390,8 +390,14 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
     // A moved URL 301s to its new home BEFORE the cache is consulted, so a renamed/re-parented
     // page's old path forwards instead of serving a stale blob or 404ing. The shadow-guard (the
     // admin handler deletes a redirect when a live page later takes that path) keeps a redirect
-    // from masking a real page; the table itself never redirects the site root.
-    if let Some(target) = state.redirects.lookup(&path) {
+    // from masking a real page; the table itself never redirects the site root. A live TERM
+    // ARCHIVE is the same kind of shadow-guard win: it always wins over a stale 301 recorded
+    // before the archive existed (or before a term reused a once-redirected path), so the
+    // redirect table is consulted only when no archive currently claims this path — `serve_path`
+    // below resolves the archive branch itself on the fall-through.
+    if !state.taxonomies.term_path_owns(&path)
+        && let Some(target) = state.redirects.lookup(&path)
+    {
         let status = StatusCode::from_u16(target.status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
         return (status, [(axum::http::header::LOCATION, target.to)]).into_response();
     }

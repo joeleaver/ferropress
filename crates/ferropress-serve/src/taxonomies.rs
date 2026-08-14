@@ -357,6 +357,15 @@ impl TaxonomyHandle {
     pub fn set(&self, next: TaxonomySet) {
         *self.0.write() = Arc::new(next);
     }
+
+    /// Whether a live term archive currently owns `path` — the redirect shadow-guard's "does
+    /// an archive claim this URL" predicate ([`TaxonomySet::resolve_archive_path`], wrapped so
+    /// callers that only need the yes/no answer don't have to hold a snapshot themselves). A
+    /// live archive always wins over a stale 301: the serve path skips a redirect-table hit
+    /// here, and the admin write path refuses to RECORD a redirect from an owned path.
+    pub fn term_path_owns(&self, path: &str) -> bool {
+        self.current().resolve_archive_path(path).is_some()
+    }
 }
 
 impl Default for TaxonomyHandle {

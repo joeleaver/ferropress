@@ -4470,3 +4470,89 @@ async fn term_list_counts_are_published_only_and_direct() {
         "count is published-only (the draft doesn't leak): {list}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Taxonomies: the redirect shadow-guard's WRITE-time touch point (Slice D1)
+// ---------------------------------------------------------------------------
+
+/// A page MOVE (a slug rename) never records a redirect FROM a path a live term archive
+/// OWNS — the write-time half of the shadow-guard ([`an_archive_owned_path_wins_over_a_stale_redirect`]
+/// in the public `tests` module covers the serve-time half). Without the guard this move would
+/// normally record `/category/fiction -> /fiction-moved`.
+///
+/// The page/archive path collision this proves the guard against is one the CREATE-time
+/// collision guard (Inc 1) already refuses through the normal admin flow (a real create at an
+/// archive-owned path 409s) — so the precondition is seeded DIRECTLY via the store (this
+/// file's own [`seed_page`], built exactly for "a row the current guards would refuse to
+/// create"), mirroring how such a state could only ever arise from data that predates the
+/// term (or an edge the create-time guard doesn't cover). The guard under test here is
+/// [`upsert_redirect`](crate::admin::content_ops)'s, not the create-time one.
+#[tokio::test]
+async fn a_page_move_does_not_record_a_redirect_from_an_archive_owned_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let cookie = admin_cookie(&state, &store).await;
+
+    // The live term archive at /category/fiction — seeded directly (bypassing the admin
+    // term-create endpoint too, so neither guard can interfere with this precondition setup).
+    let tax_id = seed_taxonomy(&store, "category", true, true).await;
+    let mut f: FieldMap = HashMap::new();
+    f.insert("slug".to_owned(), Value::String("fiction".to_owned()));
+    f.insert("name".to_owned(), Value::String("Fiction".to_owned()));
+    f.insert("description".to_owned(), Value::String(String::new()));
+    f.insert("plaintext".to_owned(), Value::String("Fiction".to_owned()));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let term_id = store
+        .create(&TypeName::from("Term"), f)
+        .await
+        .expect("seed term");
+    store
+        .link(
+            &Edge {
+                type_name: TypeName::from("Term"),
+                id: term_id,
+                field: "taxonomy".to_owned(),
+            },
+            tax_id,
+            HashMap::new(),
+        )
+        .await
+        .expect("link term to taxonomy");
+
+    let taxonomies = ferropress_serve::TaxonomyHandle::new(
+        ferropress_serve::load_taxonomies(&store)
+            .await
+            .expect("load taxonomies"),
+    );
+    let state = state.with_taxonomies(taxonomies);
+
+    // A page row DIRECTLY seeded at the colliding path (see the doc comment above).
+    let page = seed_page(&store, "fiction", "category/fiction").await;
+
+    // Move it (a slug rename) — record_move would ordinarily write a redirect FROM the old
+    // (archive-owned) path.
+    let (code, body) = req(
+        &state,
+        "PUT",
+        &format!("/admin/api/pages/{}", page.0),
+        &cookie,
+        Some(serde_json::json!({
+            "title": "Page fiction",
+            "slug": "fiction-moved",
+            "status": "published",
+            "block_tree": one_paragraph("body"),
+            "parent": null,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "move save: {body}");
+    assert_eq!(page_path(&store, page.0).await, "fiction-moved");
+
+    let redirects = all_redirects(&store).await;
+    assert!(
+        !redirects
+            .iter()
+            .any(|(from, _)| from == "/category/fiction"),
+        "a redirect must NOT be recorded from a path a live term archive owns; redirects: {redirects:?}"
+    );
+}

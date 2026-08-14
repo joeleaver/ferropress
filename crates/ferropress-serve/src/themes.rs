@@ -284,13 +284,33 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
         "terms": [{"name": "Fiction", "href": "/category/fiction"}, {"name": "Space Opera", "href": "/tag/space-opera"}]
     }]);
     let single_ctx = sample_context(false, empty.clone());
-    let home_full = sample_context(true, one_post);
+    let home_full = sample_context(true, one_post.clone());
     let home_empty = sample_context(true, empty);
+    // A term-archive listing (`archive: Some`) is a DISTINCT branch of the same HOME_TEMPLATE
+    // (the eyebrow swaps for the heading) — exercised here so a theme whose archive markup is
+    // structurally broken (bad `{% if %}`/`{% endif %}` nesting) is caught at load, not on a
+    // live category/tag page.
+    let mut home_archive = sample_context(true, one_post);
+    if let Some(obj) = home_archive.as_object_mut() {
+        obj.insert(
+            "page_title".to_owned(),
+            serde_json::json!("Fiction — Sample Site"),
+        );
+        obj.insert(
+            "archive".to_owned(),
+            serde_json::json!({
+                "name": "Fiction",
+                "description": "Stories that could have happened, but didn't.",
+                "total": 3
+            }),
+        );
+    }
     for (template, ctx) in [
         (SINGLE_TEMPLATE, &single_ctx),
         (PAGE_WIDE_TEMPLATE, &single_ctx),
         (HOME_TEMPLATE, &home_full),
         (HOME_TEMPLATE, &home_empty),
+        (HOME_TEMPLATE, &home_archive),
     ] {
         engine
             .render(template, ctx)

@@ -29,7 +29,7 @@
 //! and only block dispatch lives in `ferropress-render` (the one-shared-renderer
 //! invariant). Here we only orchestrate store lookup -> `render` -> theme.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use ferropress_core::error::CoreError;
@@ -39,7 +39,7 @@ use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
     BlockTree, Compare, FilterSpec, MEDIA_TYPE, Object, PAGE_TYPE, POST_TYPE, Seo, Status,
-    is_media_token, media_url,
+    TERM_TYPE, is_media_token, media_url,
 };
 use ferropress_render::{CustomBlockRenderer, RenderMode, render_with};
 use ferropress_render_form::SiteSettings;
@@ -47,12 +47,12 @@ use ferropress_theme::{ThemeEngine, ThemeError};
 use serde::{Deserialize, Serialize};
 
 use crate::authors::AuthorDirectory;
-use crate::cache_key;
 use crate::content_index::ContentIndex;
 use crate::datefmt;
 use crate::menus::{MenuItemCtx, MenuSet};
 use crate::taxonomies::TaxonomySet;
 use crate::templates::{HOME_TEMPLATE, template_name_for};
+use crate::{archive_cache_key, cache_key};
 
 /// Build a [`ThemeEngine`] for the **default** theme (the built-in letterpress "Composing
 /// Room" — `appearance.theme`'s default) from a builtin-only registry. The integration tests
@@ -212,6 +212,37 @@ pub(crate) struct CachedHomePost {
     pub term_ids: Vec<u64>,
 }
 
+/// The cached, content-stable render of a term archive listing (`/{taxonomy_key}/{chain}`):
+/// the rolled-up post rows (own term + every descendant, deduped, newest first) for ONE page.
+/// Like [`CachedFront::Galley`], the heading — the term's NAME and description — is NOT baked
+/// here: it is resolved LIVE from the current [`TaxonomySet`] at compose time, so a term rename
+/// needs no archive regeneration (a rename doesn't even reach here — the taxonomy slice's
+/// pinned strategy blunt-EVICTS every archive on any `Taxonomy`/`Term` change instead of
+/// precisely invalidating, so this envelope's `rows` are always rebuilt fresh on the next
+/// request after one anyway; the live-heading discipline is what keeps a *hit* correct too, in
+/// the window before that evict lands).
+///
+/// `page` exists from D1 on (always `1` here) so D2's `/page/{n}` pagination adds no new
+/// envelope shape — no blob migration when it lands, just a wider range of valid `page` values
+/// and `total`-derived page count. `deny_unknown_fields` for the same fail-closed-then-re-render
+/// self-heal every other envelope uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CachedTermArchive {
+    /// The term this archive lists (its own posts ∪ every descendant's, deduped). Resolved
+    /// live at compose time for the heading name/description/href — never baked, so a rename
+    /// or re-parent needs no regeneration (though the blunt evict above rebuilds it anyway).
+    pub term_id: u64,
+    /// This page's rows, reusing [`CachedHomePost`] so a row's dateline/byline/chips resolve
+    /// identically to the front-page galley.
+    pub rows: Vec<CachedHomePost>,
+    /// The FULL deduped, published-only post count across the whole rollup (before slicing to
+    /// one page) — the archive heading's count and D2's page-count arithmetic.
+    pub total: usize,
+    /// The 1-based page number this envelope holds. Always `1` in D1.
+    pub page: usize,
+}
+
 /// Derive the lookup **path key** from a request path.
 ///
 /// Strips a single leading `'/'` and any trailing `'/'`; the remainder is the key.
@@ -241,12 +272,32 @@ pub async fn resolve_path(
     taxonomies: &TaxonomySet,
     path: &str,
 ) -> Resolved {
-    if slug_from_path(path).is_empty() {
+    let term_path = slug_from_path(path);
+    if term_path.is_empty() {
         return front_page(
             store, theme, custom, settings, authors, menus, index, taxonomies,
         )
         .await;
     }
+
+    // Claim-only-on-resolve, mirroring `serve_path`'s archive branch (kept in parity here too,
+    // even though `resolve_path` has no production caller today — the uncached form must
+    // resolve the SAME set of paths the cache-first hot path does, or the two would silently
+    // diverge on what "this path exists" means). A bare taxonomy key (`/category`, no chain)
+    // does not resolve, so it falls through untouched to the ordinary permalink flow below.
+    if let Some(term_id) = taxonomies.resolve_archive_path(term_path) {
+        return match build_archive(store, taxonomies, settings, term_id).await {
+            Ok(archive) => {
+                match compose_archive(theme, settings, authors, menus, index, taxonomies, &archive)
+                {
+                    Ok(html) => Resolved::Found(html),
+                    Err(e) => Resolved::Error(e),
+                }
+            }
+            Err(e) => Resolved::Error(e),
+        };
+    }
+
     match build_page(store, custom, path).await {
         Ok(Some(page)) => {
             match compose_single(
@@ -299,13 +350,27 @@ pub async fn serve_path(
     taxonomies: &TaxonomySet,
     path: &str,
 ) -> Resolved {
-    if slug_from_path(path).is_empty() {
+    let term_path = slug_from_path(path);
+    if term_path.is_empty() {
         // The front page is blob-cached too (a `CachedFront` envelope at `/`), composed
         // live from the current settings + author directory. `serve_front` is cache-first
         // (build + write-through on a miss); the change-driven regen loop EVICTS `/` when a
         // content/settings change can reshape it, and this read path is the sole populator.
         return serve_front(
             store, blobs, theme, custom, settings, authors, menus, index, taxonomies,
+        )
+        .await;
+    }
+
+    // Claim-only-on-resolve: intercept BEFORE the permalink cache key/read below, so a live
+    // term archive always wins at its own path. `resolve_archive_path` requires a FULL chain
+    // under a live taxonomy key — a bare `/category` (the key alone) does not resolve, so it
+    // falls through untouched to the ordinary permalink flow (and, from there, to the normal
+    // 404 if nothing else claims it either). `None` here is never write-through-cached — there
+    // is nothing to cache for a path nobody claims.
+    if let Some(term_id) = taxonomies.resolve_archive_path(term_path) {
+        return serve_archive(
+            store, blobs, theme, settings, authors, menus, index, taxonomies, term_id, term_path,
         )
         .await;
     }
@@ -466,6 +531,77 @@ async fn serve_front(
     }
 }
 
+/// Cache-first resolution of one term archive (`/{taxonomy_key}/{chain}`), mirroring
+/// [`serve_front`] for the site root: try the archive-namespaced cache
+/// ([`archive_cache_key`]) and compose live on a hit; on a miss, [`build_archive`] (the
+/// rollup), write-through, and compose. `term_path` is the ALREADY-RESOLVED, trimmed chain
+/// (the caller's `taxonomies.resolve_archive_path` succeeded on it) — the exact string both
+/// the cache key and the archive's own canonical href are built from, so they can never drift.
+///
+/// An archive whose rollup is empty is a VALID page (the empty-galley shape), never a 404 —
+/// only a path nobody's `resolve_archive_path` claims 404s, and that never reaches this
+/// function at all (the caller's job). The cache is best-effort, exactly like [`serve_front`].
+#[allow(clippy::too_many_arguments)]
+async fn serve_archive(
+    store: &Arc<dyn RhypeStore>,
+    blobs: &Arc<dyn BlobStore>,
+    theme: &ThemeEngine,
+    settings: &SiteSettings,
+    authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
+    taxonomies: &TaxonomySet,
+    term_id: u64,
+    term_path: &str,
+) -> Resolved {
+    let key = archive_cache_key(term_path);
+
+    match blobs.get(&key).await {
+        Ok(bytes) => match serde_json::from_slice::<CachedTermArchive>(&bytes) {
+            Ok(archive) => {
+                return match compose_archive(
+                    theme, settings, authors, menus, index, taxonomies, &archive,
+                ) {
+                    Ok(html) => Resolved::Found(html),
+                    Err(e) => Resolved::Error(e),
+                };
+            }
+            Err(e) => {
+                // Not the current `CachedTermArchive` shape: re-render live and write-through
+                // the current format — the cache self-heals on first access, same discipline
+                // as every other envelope here.
+                tracing::warn!(%term_path, error = %e, "term-archive prerender cache entry not in the current format; re-rendering");
+            }
+        },
+        Err(CoreError::NotFound { .. }) => {
+            // Ordinary cache miss — fall through to render-on-demand.
+        }
+        Err(e) => {
+            tracing::warn!(%term_path, error = %e, "term-archive prerender cache read failed; falling back to render");
+        }
+    }
+
+    match build_archive(store, taxonomies, settings, term_id).await {
+        Ok(archive) => {
+            match serde_json::to_vec(&archive) {
+                Ok(bytes) => {
+                    if let Err(e) = blobs.put(&key, bytes).await {
+                        tracing::warn!(%term_path, error = %e, "term-archive prerender cache write-through failed; serving uncached render");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%term_path, error = %e, "could not serialize the term-archive envelope for the cache; serving uncached render");
+                }
+            }
+            match compose_archive(theme, settings, authors, menus, index, taxonomies, &archive) {
+                Ok(html) => Resolved::Found(html),
+                Err(e) => Resolved::Error(e),
+            }
+        }
+        Err(e) => Resolved::Error(e),
+    }
+}
+
 /// Build the [`CachedPage`] envelope for a permalink, or `None` if no PUBLISHED
 /// entity backs its slug. Resolves the entity, renders + media-rewrites its body,
 /// and gathers its metadata (author, featured image, SEO). `pub(crate)` so the
@@ -483,6 +619,35 @@ pub(crate) async fn build_page(
     Ok(Some(
         cached_page_from_object(store, custom, RenderMode::Publish, type_name, &object).await?,
     ))
+}
+
+/// Build the [`CachedTermArchive`] envelope for `term_id`'s rolled-up listing (page 1 — D1 has
+/// no pagination yet, but the envelope already carries `page` so D2 adds no new shape).
+/// `pub(crate)` so the regen loop could cache it directly in a future increment; today only
+/// the read path ([`serve_archive`], and `resolve_path`'s archive branch) builds it, on a miss.
+pub(crate) async fn build_archive(
+    store: &Arc<dyn RhypeStore>,
+    taxonomies: &TaxonomySet,
+    settings: &SiteSettings,
+    term_id: u64,
+) -> Result<CachedTermArchive, CoreError> {
+    let limit = settings.posts_per_page as usize;
+    let (published, author_links, term_links, total) =
+        rollup_published_posts(store, taxonomies, term_id, limit).await?;
+
+    let rows = published
+        .iter()
+        .zip(author_links.iter())
+        .zip(term_links.iter())
+        .map(|((obj, author_ids), row_term_ids)| to_cached_home_post(obj, author_ids, row_term_ids))
+        .collect();
+
+    Ok(CachedTermArchive {
+        term_id,
+        rows,
+        total,
+        page: 1,
+    })
 }
 
 /// Render a specific (possibly **unpublished**) object through the real public theme,
@@ -814,12 +979,14 @@ fn compose_front(
                 page_description: if settings.tagline.is_empty() {
                     None
                 } else {
-                    Some(&settings.tagline)
+                    Some(settings.tagline.clone())
                 },
+                canonical: None,
                 site: SiteCtx::from(settings),
                 is_home: true,
                 preview_status: None,
                 nav: menus.compose(index, taxonomies, current_path),
+                archive: None,
                 posts,
             };
 
@@ -828,6 +995,81 @@ fn compose_front(
                 .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
         }
     }
+}
+
+/// Compose a term archive's final HTML from its cached [`CachedTermArchive`] envelope, live —
+/// REUSES [`HOME_TEMPLATE`] (same shape as the front-page galley: an eyebrow + an `<ol>` of
+/// rows), with `archive: Some(ArchiveCtx { .. })` swapping the theme's eyebrow for the term's
+/// own heading. The heading's name/description, the canonical href, and the nav's
+/// `current_path` are ALL resolved live from `taxonomies` — the envelope bakes only `term_id`
+/// (identity-independence: a rename/re-parent needs no regeneration).
+///
+/// A term id the current [`TaxonomySet`] can no longer resolve (only reachable in the narrow
+/// window between a rename/delete and the taxonomy slice's blunt archive evict landing — see
+/// [`ServeEngine::apply_change`](crate::ServeEngine)) degrades to an EMPTY heading rather than
+/// erroring: the row list still renders, the page just self-heals fully once the evict catches
+/// up on the very next request.
+fn compose_archive(
+    theme: &ThemeEngine,
+    settings: &SiteSettings,
+    authors: &AuthorDirectory,
+    menus: &MenuSet,
+    index: &ContentIndex,
+    taxonomies: &TaxonomySet,
+    archive: &CachedTermArchive,
+) -> Result<String, CoreError> {
+    let entry = taxonomies.term(archive.term_id);
+    let name = entry.map(|e| e.name.clone()).unwrap_or_default();
+    let description = entry.and_then(|e| {
+        if e.description.trim().is_empty() {
+            None
+        } else {
+            Some(e.description.clone())
+        }
+    });
+    let href = taxonomies.archive_href(archive.term_id);
+    let current_path = href.as_deref();
+    let canonical = href
+        .as_deref()
+        .map(|h| format!("{}{h}", settings.url.trim_end_matches('/')));
+
+    let posts: Vec<PostSummary> = archive
+        .rows
+        .iter()
+        .map(|p| PostSummary {
+            title: p.title.clone(),
+            url: p.url.clone(),
+            excerpt: p.excerpt.clone(),
+            dateline: p
+                .published_at
+                .map(|ms| datefmt::format_datetime(ms, &settings.date_format, &settings.timezone)),
+            author: p
+                .author_id
+                .and_then(|id| authors.name(id))
+                .map(str::to_owned),
+            terms: resolve_chips(taxonomies, &p.term_ids),
+        })
+        .collect();
+
+    let ctx = HomeCtx {
+        page_title: page_title(&name, settings),
+        page_description: description.clone(),
+        canonical,
+        site: SiteCtx::from(settings),
+        is_home: false,
+        preview_status: None,
+        nav: menus.compose(index, taxonomies, current_path),
+        archive: Some(ArchiveCtx {
+            name,
+            description,
+            total: archive.total,
+        }),
+        posts,
+    };
+
+    theme
+        .render(HOME_TEMPLATE, &ctx)
+        .map_err(|e| CoreError::Store(format!("theme render failed: {e}")))
 }
 
 /// The most-recent published posts for the galley, newest first, capped at
@@ -851,15 +1093,26 @@ async fn build_galley(
         .iter()
         .zip(author_links.iter())
         .zip(term_links.iter())
-        .map(|((obj, author_ids), term_ids)| CachedHomePost {
-            title: str_field(obj, "title"),
-            url: format!("/{}", str_field(obj, "slug")),
-            excerpt: str_field(obj, "excerpt"),
-            published_at: obj.get("published_at").and_then(Value::as_datetime),
-            author_id: author_ids.first().map(|id| id.0),
-            term_ids: term_ids.iter().map(|id| id.0).collect(),
-        })
+        .map(|((obj, author_ids), term_ids)| to_cached_home_post(obj, author_ids, term_ids))
         .collect())
+}
+
+/// Project one published post + its batched author/term links into a [`CachedHomePost`] row —
+/// the ONE row-shaping rule [`build_galley`] and [`build_archive`] share, so a home row and an
+/// archive row can never independently drift on which scalar fields they carry.
+fn to_cached_home_post(
+    obj: &Object,
+    author_ids: &[ObjectId],
+    term_ids: &[ObjectId],
+) -> CachedHomePost {
+    CachedHomePost {
+        title: str_field(obj, "title"),
+        url: format!("/{}", str_field(obj, "slug")),
+        excerpt: str_field(obj, "excerpt"),
+        published_at: obj.get("published_at").and_then(Value::as_datetime),
+        author_id: author_ids.first().map(|id| id.0),
+        term_ids: term_ids.iter().map(|id| id.0).collect(),
+    }
 }
 
 /// The most-recent PUBLISHED posts (newest first, capped at `limit`) with each row's author
@@ -885,29 +1138,105 @@ pub(crate) async fn recent_published_posts(
         .filter(is_published)
         .collect();
 
-    // Newest first by publish instant (missing dates sort last).
-    published.sort_by(|a, b| {
+    sort_newest_first(&mut published);
+    published.truncate(limit);
+
+    let (author_links, term_links) = batch_author_and_term_links(store, &published).await?;
+    Ok((published, author_links, term_links))
+}
+
+/// THE shared listing order: newest-first by publish instant (missing sorts last), with an id
+/// DESCENDING tiebreak for determinism when two posts share a publish instant. Used by BOTH
+/// [`recent_published_posts`] (the front-page galley + feed) and [`rollup_published_posts`]
+/// (the term-archive listing), so the home page and every archive can never disagree on
+/// tie-breaking — a single ordering, not two independently-maintained ones.
+fn sort_newest_first(objects: &mut [Object]) {
+    objects.sort_by(|a, b| {
         let key = |o: &Object| {
-            o.get("published_at")
-                .and_then(Value::as_datetime)
-                .unwrap_or(i64::MIN)
+            (
+                o.get("published_at")
+                    .and_then(Value::as_datetime)
+                    .unwrap_or(i64::MIN),
+                o.id,
+            )
         };
         key(b).cmp(&key(a))
     });
-    published.truncate(limit);
+}
 
-    // Resolve every row's author id + term ids in ONE batched link read each (no N+1). Neither
-    // the byline name nor the chip name/href is stored — both are looked up live at compose
-    // time (the author directory / the SAME TaxonomySet the single-page path uses, so the
-    // galley/feed + permalink can never disagree).
-    let ids: Vec<ObjectId> = published.iter().map(|o| o.id).collect();
+/// Resolve `posts`' author id + term ids in ONE batched link read each (no N+1) — the batching
+/// discipline [`recent_published_posts`] and [`rollup_published_posts`] share. Neither the
+/// byline name nor the chip name/href is stored — both are looked up live at compose time (the
+/// author directory / the SAME TaxonomySet the single-page path uses, so every listing and the
+/// permalink can never disagree).
+async fn batch_author_and_term_links(
+    store: &Arc<dyn RhypeStore>,
+    posts: &[Object],
+) -> Result<(Vec<Vec<ObjectId>>, Vec<Vec<ObjectId>>), CoreError> {
+    let ids: Vec<ObjectId> = posts.iter().map(|o| o.id).collect();
     let author_links = store
         .get_links_many(&TypeName::from(POST_TYPE), &ids, "author")
         .await?;
     let term_links = store
         .get_links_many(&TypeName::from(POST_TYPE), &ids, "terms")
         .await?;
-    Ok((published, author_links, term_links))
+    Ok((author_links, term_links))
+}
+
+/// The rolled-up, published-only posts for a term ARCHIVE (`/{taxonomy_key}/{chain}`): the
+/// term's own DIRECT `Post.terms` membership `∪` every DESCENDANT term's (the WP "a parent
+/// category also lists its children's posts" convention), deduped, then [`sort_newest_first`]
+/// — the SAME order [`recent_published_posts`] uses, so the home page and every archive can
+/// never drift on tie-breaking. Returns `(rows, author_links, term_links, total)`: `total` is
+/// the FULL deduped count *before* slicing to one page — the archive heading's count and (from
+/// D2) the page-count arithmetic. `limit` slices from the start (page 1); D2 adds an offset.
+///
+/// Post membership is read off `Term.objects`, the `Post.terms` INVERSE relation ([`TERM_TYPE`]
+/// docs) — one batched [`RhypeStore::get_links_many`] over `term_id ∪ descendants` resolves
+/// every member post in a single round trip, no N+1 per term.
+async fn rollup_published_posts(
+    store: &Arc<dyn RhypeStore>,
+    taxonomies: &TaxonomySet,
+    term_id: u64,
+    limit: usize,
+) -> Result<(Vec<Object>, Vec<Vec<ObjectId>>, Vec<Vec<ObjectId>>, usize), CoreError> {
+    let mut rollup_term_ids = taxonomies.descendants(term_id);
+    rollup_term_ids.push(term_id);
+    let rollup_term_object_ids: Vec<ObjectId> =
+        rollup_term_ids.iter().map(|&id| ObjectId(id)).collect();
+
+    let member_links = store
+        .get_links_many(
+            &TypeName::from(TERM_TYPE),
+            &rollup_term_object_ids,
+            "objects",
+        )
+        .await?;
+
+    // Union + DEDUPE post ids across every term in the rollup — a post directly in BOTH a
+    // parent and a child term (or in two sibling descendants) must appear exactly once.
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut post_ids: Vec<ObjectId> = Vec::new();
+    for links in &member_links {
+        for &id in links {
+            if seen.insert(id) {
+                post_ids.push(id);
+            }
+        }
+    }
+
+    let mut published: Vec<Object> = store
+        .get_many(&TypeName::from(POST_TYPE), &post_ids)
+        .await?
+        .into_iter()
+        .filter(is_published)
+        .collect();
+    sort_newest_first(&mut published);
+    let total = published.len();
+    published.truncate(limit);
+
+    let (author_links, term_links) = batch_author_and_term_links(store, &published).await?;
+    Ok((published, author_links, term_links, total))
 }
 
 /// Resolve a request path key to the PUBLISHED entity behind it, returning its store
@@ -1151,24 +1480,50 @@ struct SingleCtx<'a> {
     body: &'a str,
 }
 
-/// The context for the front-page galley template.
+/// The context for the front-page galley template — ALSO reused, unchanged shape, for a term
+/// archive listing (`compose_archive`): the same eyebrow + `<ol>` of rows, with `archive: Some`
+/// swapping the eyebrow for the archive heading (name/description/count) instead of the
+/// site-wide "Latest …" line. `is_home` is `true` only for the actual site root; an archive is
+/// `false` (it is never the front page).
 #[derive(Serialize)]
 struct HomeCtx<'a> {
     page_title: String,
-    page_description: Option<&'a str>,
+    /// Owned (not `&'a str`, unlike [`SingleCtx::page_description`]): an archive's description
+    /// is a `String` resolved live from the [`TaxonomySet`] snapshot inside `compose_archive`'s
+    /// own stack frame, not borrowed from a longer-lived caller argument.
+    page_description: Option<String>,
+    /// The archive's own canonical URL (`settings.url` + its archive href), `None` for the
+    /// plain galley (which has no canonical target of its own today). Built the same way
+    /// [`SingleCtx::canonical`] is — a `<link rel="canonical">` the base chrome emits when set.
+    canonical: Option<String>,
     site: SiteCtx<'a>,
     is_home: bool,
-    /// Always `None` — the front page is never previewed; declared so the shared base
-    /// chrome's `preview_status` reference resolves without relying on lenient-undefined.
+    /// Always `None` — neither the front page nor an archive is ever previewed; declared so
+    /// the shared base chrome's `preview_status` reference resolves without relying on
+    /// lenient-undefined.
     preview_status: Option<&'a str>,
-    /// The composed nav menus, keyed by theme location — the front-page twin of
+    /// The composed nav menus, keyed by theme location — the front-page/archive twin of
     /// [`SingleCtx::nav`], so the shared base chrome's `menus.*` loops resolve identically on
-    /// the galley and a single page.
+    /// every listing shape.
     nav: BTreeMap<String, Vec<MenuItemCtx>>,
+    /// `Some` only when this is a term-archive listing — the theme conditionalizes its eyebrow
+    /// on this field (`{% if archive %}` the heading, `{% else %}` the site-wide "Latest …").
+    archive: Option<ArchiveCtx>,
     posts: Vec<PostSummary>,
 }
 
-/// One row in the front-page galley.
+/// The term-archive heading: name + description + the FULL rolled-up post count (before
+/// pagination slicing). Resolved LIVE from the current [`TaxonomySet`] at compose time — the
+/// envelope bakes only `term_id` (see [`CachedTermArchive`]), so a rename/re-parent needs no
+/// regeneration.
+#[derive(Serialize)]
+struct ArchiveCtx {
+    name: String,
+    description: Option<String>,
+    total: usize,
+}
+
+/// One row in the front-page galley OR a term-archive listing (`compose_front` / `compose_archive`).
 #[derive(Serialize)]
 struct PostSummary {
     title: String,

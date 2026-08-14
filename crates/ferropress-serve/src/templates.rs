@@ -154,6 +154,13 @@ main { padding: 2.4rem 0 3rem; }
   letter-spacing: .22em; text-transform: uppercase; color: var(--steel-2);
   display: flex; align-items: center; gap: .8rem; margin: 0 0 1.6rem; }
 .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+/* Term-archive heading (replaces the eyebrow-only line on a category/tag listing) */
+.archive-head { margin: 0 0 2rem; }
+.archive-head__title { font-family: var(--ff-display); font-weight: 700;
+  font-size: clamp(1.9rem, 5vw, 2.6rem); line-height: 1.15; letter-spacing: .003em;
+  color: var(--ink); margin: 0 0 .6rem; }
+.archive-head__desc { font-family: var(--ff-ui); font-size: 1rem; line-height: 1.6;
+  color: var(--steel); margin: 0; max-width: var(--measure); }
 .galley { list-style: none; margin: 0; padding: 0; }
 .proof { padding: 1.9rem 0; border-bottom: 1px solid var(--rule); }
 .proof:first-child { padding-top: 0; }
@@ -369,7 +376,15 @@ pub const SINGLE_SRC: &str = r##"{% extends "base.html" %}
 /// headline link + excerpt. Falls back to an empty-state line when there are none.
 pub const HOME_SRC: &str = r##"{% extends "base.html" %}
 {% block main %}
+    {% if archive %}
+    <header class="archive-head">
+      <p class="eyebrow">{{ archive.total }} {% if archive.total == 1 %}Proof{% else %}Proofs{% endif %} on file</p>
+      <h1 class="archive-head__title">{{ archive.name }}</h1>
+      {% if archive.description %}<p class="archive-head__desc">{{ archive.description }}</p>{% endif %}
+    </header>
+    {% else %}
     <p class="eyebrow">Latest from the galley</p>
+    {% endif %}
     {% if posts %}
     <ol class="galley">
       {% for post in posts %}
@@ -383,7 +398,7 @@ pub const HOME_SRC: &str = r##"{% extends "base.html" %}
       {% endfor %}
     </ol>
     {% else %}
-    <p class="empty">Nothing set in type yet.</p>
+    {% if archive %}<p class="empty">No proofs filed under {{ archive.name }} yet.</p>{% else %}<p class="empty">Nothing set in type yet.</p>{% endif %}
     {% endif %}
 {% endblock %}
 "##;

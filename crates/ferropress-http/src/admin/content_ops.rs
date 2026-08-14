@@ -225,6 +225,17 @@ async fn upsert_redirect(state: &AppState, from_abs: &str, to_abs: &str) -> Resu
     if from_abs == to_abs {
         return Ok(());
     }
+    // Shadow-guard, term-archive flavor: a live archive OWNS `from_abs` → never record a
+    // redirect FROM it (the archive must win over a 301, matching the live-page shadow-guard
+    // `retire_redirects_at` already enforces). Checked here — the one place a redirect is
+    // actually written — rather than at every `record_move` call site.
+    if state.taxonomies.term_path_owns(from_abs) {
+        tracing::debug!(
+            from = %from_abs,
+            "skipping a redirect record — a live term archive owns this path"
+        );
+        return Ok(());
+    }
     let existing = state
         .store
         .filter(FilterSpec {

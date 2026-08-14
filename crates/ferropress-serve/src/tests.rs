@@ -4458,3 +4458,448 @@ async fn a_page_renders_no_chip_markup() {
         envelope.term_ids
     );
 }
+
+// ---------------------------------------------------------------------------
+// Term archives: claim-only-on-resolve routing + the rollup
+// ---------------------------------------------------------------------------
+
+/// Seed one PUBLISHED (or otherwise) post with a distinct title — [`seed_post`]'s title is a
+/// fixed "Hello World", which can't distinguish rows in a multi-post archive/rollup assertion.
+async fn seed_titled_post(
+    store: &Arc<dyn RhypeStore>,
+    slug: &str,
+    title: &str,
+    status: Status,
+) -> ObjectId {
+    let mut fields: HashMap<String, Value> = HashMap::new();
+    fields.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    fields.insert(
+        "status".to_owned(),
+        Value::String(status.as_str().to_owned()),
+    );
+    fields.insert("title".to_owned(), Value::String(title.to_owned()));
+    fields.insert("post_type".to_owned(), Value::String("post".to_owned()));
+    fields.insert(
+        "block_tree".to_owned(),
+        Value::Json(paragraph_block_tree_json()),
+    );
+    store
+        .create(&TypeName::from(POST_TYPE), fields)
+        .await
+        .expect("seeding a titled post must succeed")
+}
+
+/// A root archive rolls up its OWN direct posts `∪` every descendant's, DEDUPED: a post
+/// directly assigned to both the parent and the child appears exactly once.
+#[tokio::test]
+async fn root_archive_lists_own_and_descendant_posts_deduped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let space_opera_id = seed_child_term(&store, fiction_id, "space-opera", "Space Opera").await;
+
+    let post_a = seed_titled_post(&store, "post-a", "Post A", Status::Published).await; // fiction only
+    let post_b = seed_titled_post(&store, "post-b", "Post B", Status::Published).await; // space-opera only
+    let post_c = seed_titled_post(&store, "post-c", "Post C", Status::Published).await; // BOTH — dedup target
+    link_term(&store, post_a, fiction_id).await;
+    link_term(&store, post_b, space_opera_id).await;
+    link_term(&store, post_c, fiction_id).await;
+    link_term(&store, post_c, space_opera_id).await;
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    for title in ["Post A", "Post B", "Post C"] {
+        assert_eq!(
+            html.matches(title).count(),
+            1,
+            "{title} must appear exactly once (deduped); was:\n{html}"
+        );
+    }
+
+    let key = crate::archive_cache_key("category/fiction");
+    let envelope: crate::content::CachedTermArchive =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+    assert_eq!(
+        envelope.total, 3,
+        "the rollup must count all 3 posts, deduped"
+    );
+}
+
+/// A CHILD archive lists only ITS OWN direct posts — the parent's posts do not leak down.
+#[tokio::test]
+async fn child_archive_lists_only_its_own_posts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let space_opera_id = seed_child_term(&store, fiction_id, "space-opera", "Space Opera").await;
+
+    let post_a = seed_titled_post(&store, "post-a", "Post A", Status::Published).await;
+    let post_b = seed_titled_post(&store, "post-b", "Post B", Status::Published).await;
+    link_term(&store, post_a, fiction_id).await; // fiction ONLY
+    link_term(&store, post_b, space_opera_id).await; // space-opera ONLY
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction/space-opera",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    assert!(
+        html.contains("Post B"),
+        "the child's own post must appear; was:\n{html}"
+    );
+    assert!(
+        !html.contains("Post A"),
+        "the PARENT's post must NOT roll DOWN to the child archive; was:\n{html}"
+    );
+}
+
+/// A draft post linked to a term is excluded from its archive — published-only, same gate
+/// [`recent_published_posts`] applies to the home galley/feed.
+#[tokio::test]
+async fn a_draft_post_is_excluded_from_the_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let published = seed_titled_post(&store, "pub-post", "Published Post", Status::Published).await;
+    let draft = seed_titled_post(&store, "draft-post", "Draft Post", Status::Draft).await;
+    link_term(&store, published, fiction_id).await;
+    link_term(&store, draft, fiction_id).await;
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(html.contains("Published Post"), "was:\n{html}");
+    assert!(!html.contains("Draft Post"), "was:\n{html}");
+
+    let key = crate::archive_cache_key("category/fiction");
+    let envelope: crate::content::CachedTermArchive =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+    assert_eq!(envelope.total, 1, "the draft must not count toward total");
+}
+
+/// Claim-only-on-resolve: a path shaped like an archive chain that does NOT actually resolve
+/// (no such term under that taxonomy key) falls through untouched — a real Page at that path
+/// still serves.
+#[tokio::test]
+async fn an_unresolvable_archive_chain_falls_through_to_the_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    // The "category" taxonomy key is live (has a "fiction" term), but "other-team" is not a
+    // term under it — so `/category/other-team` cannot resolve as an archive.
+    seed_term(&store, "category", "fiction", "Fiction").await;
+
+    let category_page = seed_page(&store, "category", Status::Published, "Category landing.").await;
+    let child_page = seed_page(&store, "other-team", Status::Published, "The other team.").await;
+    link_parent(&store, child_page, category_page).await;
+    crate::backfill_page_paths(&store)
+        .await
+        .expect("backfill page paths");
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/other-team",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (the page), got {other:?}"),
+    };
+    assert!(
+        html.contains("The other team."),
+        "the page must serve when the chain doesn't resolve as an archive; was:\n{html}"
+    );
+}
+
+/// When a path DOES resolve as a live archive, it wins even if a Page happens to occupy the
+/// identical materialized path (the admin write path's own redirect-guard tests cover
+/// PREVENTING this collision; this proves the serve-time PRECEDENCE directly).
+#[tokio::test]
+async fn the_archive_wins_over_a_page_at_the_same_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await;
+
+    let category_page = seed_page(&store, "category", Status::Published, "Category landing.").await;
+    let colliding_page = seed_page(
+        &store,
+        "fiction",
+        Status::Published,
+        "SHOULD NEVER RENDER — shadowed by the archive.",
+    )
+    .await;
+    link_parent(&store, colliding_page, category_page).await;
+    crate::backfill_page_paths(&store)
+        .await
+        .expect("backfill page paths");
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (the archive), got {other:?}"),
+    };
+    assert!(
+        !html.contains("SHOULD NEVER RENDER"),
+        "the archive must win over a page at the same path; was:\n{html}"
+    );
+    assert!(
+        html.contains("Fiction"),
+        "the archive heading must render; was:\n{html}"
+    );
+}
+
+/// An archive with zero rolled-up posts is a VALID page (the empty-galley shape), not a 404.
+#[tokio::test]
+async fn an_empty_archive_is_a_valid_page_not_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await; // zero posts linked
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("an empty archive must still be Found, not {other:?}"),
+    };
+    assert!(
+        html.contains("No proofs filed under Fiction yet."),
+        "the empty-archive copy must render; was:\n{html}"
+    );
+}
+
+/// The uncached form ([`content::resolve_path`]), a cache MISS build, and a cache HIT must all
+/// produce byte-for-byte identical HTML for an archive — mirrors
+/// `cached_and_uncached_front_page_are_byte_for_byte_identical`.
+#[tokio::test]
+async fn cached_and_uncached_archive_are_byte_for_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let user_id = seed_user(&store, "user-ada", "Ada Lovelace").await;
+    let post = seed_titled_post(&store, "rich", "Rich Post", Status::Published).await;
+    link_term(&store, post, fiction_id).await;
+    link_author(&store, post, user_id).await;
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let settings = SiteSettings::defaults();
+    let dir = crate::authors::load_author_directory(&store).await.unwrap();
+    let path = "/category/fiction";
+
+    let uncached = match content::resolve_path(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (uncached), got {other:?}"),
+    };
+    let miss = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (cache miss), got {other:?}"),
+    };
+    let hit = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &dir,
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found (cache hit), got {other:?}"),
+    };
+
+    // Sanity: the exercised fields actually appear (parity is not vacuously over blanks).
+    assert!(hit.contains("Rich Post"), "post rendered: {hit}");
+    assert!(hit.contains("Ada Lovelace"), "byline rendered: {hit}");
+    assert!(hit.contains("Fiction"), "archive heading rendered: {hit}");
+
+    assert_eq!(
+        uncached, miss,
+        "resolve_path and serve_path's cache-miss build must match"
+    );
+    assert_eq!(
+        miss, hit,
+        "the cache-hit render must equal the cache-miss render"
+    );
+}
+
+/// A miss write-throughs under the TERM-ARCHIVE cache key ([`archive_cache_key`]) — never the
+/// ordinary permalink key, so the two namespaces can never collide.
+#[tokio::test]
+async fn archive_write_through_uses_the_term_archive_cache_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await;
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+
+    let key = crate::archive_cache_key("category/fiction");
+    assert!(
+        !blobs.exists(&key).await.unwrap(),
+        "cache must be empty before the first serve"
+    );
+
+    let _ = serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category/fiction",
+    )
+    .await;
+
+    assert!(
+        blobs.exists(&key).await.unwrap(),
+        "a miss must write-through under the term-archive cache key"
+    );
+    assert!(
+        !blobs.exists(&cache_key("/category/fiction")).await.unwrap(),
+        "an archive must NOT also populate the ordinary permalink cache key"
+    );
+    let envelope: crate::content::CachedTermArchive =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+    assert_eq!(envelope.page, 1);
+}
+
+/// A bare taxonomy key with no chain (`/category`, no term slug) is nobody's canonical
+/// archive path — it falls through to the ordinary 404 flow (nothing else claims it either).
+#[tokio::test]
+async fn a_bare_taxonomy_key_falls_through_to_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_term(&store, "category", "fiction", "Fiction").await;
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+
+    match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/category",
+    )
+    .await
+    {
+        crate::Resolved::NotFound => {}
+        other => panic!("a bare taxonomy key must fall through to 404, got {other:?}"),
+    }
+}

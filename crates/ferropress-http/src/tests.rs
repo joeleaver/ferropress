@@ -20,7 +20,7 @@ use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{ObjectId, TypeName, Value};
 use ferropress_core::{
     Block, BlockKind, BlockTree, COMMENT_TYPE, InlineRun, POST_TYPE, REDIRECT_TYPE, Status,
-    USER_TYPE,
+    TAXONOMY_TYPE, TERM_TYPE, USER_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
@@ -872,4 +872,95 @@ async fn feed_supports_conditional_get_with_etag() {
     assert_eq!(status2, StatusCode::NOT_MODIFIED, "matching ETag → 304");
     assert!(body2.is_empty(), "a 304 carries no body");
     assert_eq!(etag2.as_ref(), Some(&etag), "304 echoes the ETag");
+}
+
+/// Seed a Taxonomy row + one Term linked to it (the serve crate's own `seed_term`, mirrored
+/// here since this file has no taxonomy fixtures yet). Returns the term's id.
+async fn seed_term(
+    store: &Arc<dyn RhypeStore>,
+    taxonomy_key: &str,
+    slug: &str,
+    name: &str,
+) -> ObjectId {
+    let mut t: HashMap<String, Value> = HashMap::new();
+    t.insert("key".to_owned(), Value::String(taxonomy_key.to_owned()));
+    t.insert("label".to_owned(), Value::String(taxonomy_key.to_owned()));
+    t.insert("hierarchical".to_owned(), Value::Bool(true));
+    t.insert("multiple".to_owned(), Value::Bool(true));
+    t.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let tax_id = store
+        .create(&TypeName::from(TAXONOMY_TYPE), t)
+        .await
+        .expect("seed taxonomy");
+
+    let mut f: HashMap<String, Value> = HashMap::new();
+    f.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    f.insert("name".to_owned(), Value::String(name.to_owned()));
+    f.insert("description".to_owned(), Value::String(String::new()));
+    f.insert("plaintext".to_owned(), Value::String(name.to_owned()));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let term_id = store
+        .create(&TypeName::from(TERM_TYPE), f)
+        .await
+        .expect("seed term");
+    store
+        .link(
+            &Edge {
+                type_name: TypeName::from(TERM_TYPE),
+                id: term_id,
+                field: "taxonomy".to_owned(),
+            },
+            tax_id,
+            HashMap::new(),
+        )
+        .await
+        .expect("link term to taxonomy");
+    term_id
+}
+
+/// The redirect shadow-guard's SERVE-time touch point: a live term archive OWNS a path, so a
+/// stale redirect recorded FROM that same path (e.g. before the term existed, or before it was
+/// re-slugged onto a once-redirected path) must never fire — the archive always wins.
+#[tokio::test]
+async fn an_archive_owned_path_wins_over_a_stale_redirect() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (store, state) = boot_state(tmp.path());
+
+    seed_term(&store, "category", "fiction", "Fiction").await;
+    let taxonomies = ferropress_serve::TaxonomyHandle::new(
+        ferropress_serve::load_taxonomies(&store)
+            .await
+            .expect("load taxonomies"),
+    );
+    let state = state.with_taxonomies(taxonomies);
+
+    // A stale redirect recorded FROM the path the archive now owns.
+    seed_redirect(&store, "/category/fiction", "/somewhere-else").await;
+    let redirects = ferropress_serve::RedirectHandle::new(
+        ferropress_serve::load_redirects(&store)
+            .await
+            .expect("load redirects"),
+    );
+    let state = state.with_redirects(redirects);
+
+    let (status, location) = get_redirect(&state, "/category/fiction").await;
+    assert_ne!(
+        status,
+        StatusCode::MOVED_PERMANENTLY,
+        "a live archive must win over a stale redirect at the same path"
+    );
+    assert_eq!(location, None, "no redirect must fire");
+    assert_eq!(status, StatusCode::OK, "the archive itself must serve");
+
+    // A path the archive does NOT own still redirects normally (the guard is narrow).
+    seed_redirect(&store, "/about", "/company").await;
+    let redirects2 = ferropress_serve::RedirectHandle::new(
+        ferropress_serve::load_redirects(&store)
+            .await
+            .expect("load redirects"),
+    );
+    let state = state.with_redirects(redirects2);
+    let (status, location) = get_redirect(&state, "/about").await;
+    assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(location.as_deref(), Some("/company"));
 }

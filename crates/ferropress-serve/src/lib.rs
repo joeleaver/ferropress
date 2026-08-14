@@ -122,6 +122,16 @@ pub fn cache_key(path: &str) -> BlobKey {
     BlobKey(format!("{CACHE_PREFIX}/permalink/{rel}.html"))
 }
 
+/// The prerender-cache key for page 1 of a term archive (D2 adds a `/page/{n}` shape beyond
+/// page 1 — see [`TERM_ARCHIVE_CACHE_PREFIX`]'s doc for both). `term_path` is the archive's own
+/// resolved chain (e.g. `"category/fiction"`, no leading/trailing slash — exactly the trimmed
+/// string [`TaxonomySet::resolve_archive_path`](crate::TaxonomySet::resolve_archive_path)
+/// consumed to find it), so the read path's claim-only-on-resolve routing and this key
+/// derivation can never disagree — both key off the SAME trimmed chain.
+pub(crate) fn archive_cache_key(term_path: &str) -> BlobKey {
+    BlobKey(format!("{TERM_ARCHIVE_CACHE_PREFIX}/{term_path}.html"))
+}
+
 /// The prerender-cache key for an [`OutputPage`]. Thin wrapper over [`cache_key`]
 /// keyed on the page's path, so the regen loop and the read path derive the SAME
 /// key for a given page.
