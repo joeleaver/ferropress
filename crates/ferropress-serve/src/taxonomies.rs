@@ -86,6 +86,16 @@ pub struct TaxonomySet {
 impl TaxonomySet {
     /// Build a set from parts, deriving every index — the single constructor the
     /// loader AND tests use, so index derivation can never diverge from the data.
+    ///
+    /// `Term.slug` is `@indexed`, not `@unique` — per-sibling uniqueness is enforced only by
+    /// an app-level pre-check under a process-local lock, so two rows sharing a
+    /// `(taxonomy, parent, slug)` are representable (a should-be-impossible race between two
+    /// instances, or externally-corrupted data). Routing MUST still resolve deterministically
+    /// — the root/child routing indices always keep the LOWEST term id on a collision,
+    /// regardless of the source `terms` iteration order, the same precedent
+    /// [`crate::menus::load_menus`] documents for a duplicate menu-location binding. (F6 /
+    /// review finding C8: before this, last-write-wins over an unordered `HashMap` meant the
+    /// winner could silently flip on every unrelated rebuild.)
     pub fn build(
         taxonomies: impl IntoIterator<Item = TaxonomyInfo>,
         terms: impl IntoIterator<Item = (u64, TermEntry)>,
@@ -94,18 +104,27 @@ impl TaxonomySet {
             taxonomies.into_iter().map(|t| (t.key.clone(), t)).collect();
         let terms: HashMap<u64, TermEntry> = terms.into_iter().collect();
 
-        let mut root_index = HashMap::new();
-        let mut child_index = HashMap::new();
+        let mut root_index: HashMap<(String, String), u64> = HashMap::new();
+        let mut child_index: HashMap<(u64, String), u64> = HashMap::new();
         let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
         let mut ordered: HashMap<String, Vec<u64>> = HashMap::new();
         for (id, entry) in &terms {
             match entry.parent {
                 Some(parent) => {
-                    child_index.insert((parent, entry.slug.clone()), *id);
+                    // Deterministic dedupe: lowest term id wins a duplicate (parent, slug).
+                    child_index
+                        .entry((parent, entry.slug.clone()))
+                        .and_modify(|winner| *winner = (*winner).min(*id))
+                        .or_insert(*id);
                     children.entry(parent).or_default().push(*id);
                 }
                 None => {
-                    root_index.insert((entry.taxonomy_key.clone(), entry.slug.clone()), *id);
+                    // Same dedupe, root siblings: lowest term id wins a duplicate
+                    // (taxonomy, slug).
+                    root_index
+                        .entry((entry.taxonomy_key.clone(), entry.slug.clone()))
+                        .and_modify(|winner| *winner = (*winner).min(*id))
+                        .or_insert(*id);
                 }
             }
             ordered
@@ -447,6 +466,61 @@ mod tests {
         for id in [2, 5] {
             let href = set.archive_href(id).unwrap();
             assert_eq!(set.resolve_archive_path(&href), Some(id), "{href}");
+        }
+    }
+
+    /// F6 (review finding C8): TRUE siblings — same taxonomy, same parent (both `None` here,
+    /// i.e. both roots), same slug — must resolve to a STABLE winner (lowest term id),
+    /// regardless of the order `TaxonomySet::build` receives them in. This is the collision
+    /// `per_sibling_duplicates_resolve_by_their_chains` deliberately does NOT exercise (its two
+    /// `space-opera` terms have DIFFERENT parents, so their chains already disambiguate them —
+    /// this test's two terms are truly indistinguishable by path).
+    #[test]
+    fn duplicate_sibling_slugs_resolve_deterministically_to_the_lowest_id() {
+        let tax = [TaxonomyInfo {
+            id: 100,
+            key: "category".into(),
+            label: "Categories".into(),
+            hierarchical: true,
+        }];
+        // Two ROOT terms sharing (taxonomy="category", slug="duplicate") — ids 21 and 20 (20 is
+        // lower). Built in BOTH id orders, over an underlying `HashMap` whose iteration order is
+        // otherwise unspecified, so a pass here can't be a coincidence of insertion order.
+        let terms_desc = [
+            (21, entry("category", "duplicate", "Duplicate (21)", None)),
+            (20, entry("category", "duplicate", "Duplicate (20)", None)),
+        ];
+        let terms_asc = [
+            (20, entry("category", "duplicate", "Duplicate (20)", None)),
+            (21, entry("category", "duplicate", "Duplicate (21)", None)),
+        ];
+        for terms in [terms_desc, terms_asc] {
+            let set = TaxonomySet::build(tax.clone(), terms);
+            assert_eq!(
+                set.resolve_archive_path("category/duplicate"),
+                Some(20),
+                "the lowest id must win regardless of build order"
+            );
+        }
+
+        // The CHILD-sibling twin: two terms sharing (parent, slug) under a common parent.
+        let terms_children_desc = [
+            (1, entry("category", "parent", "Parent", None)),
+            (31, entry("category", "child", "Child (31)", Some(1))),
+            (30, entry("category", "child", "Child (30)", Some(1))),
+        ];
+        let terms_children_asc = [
+            (1, entry("category", "parent", "Parent", None)),
+            (30, entry("category", "child", "Child (30)", Some(1))),
+            (31, entry("category", "child", "Child (31)", Some(1))),
+        ];
+        for terms in [terms_children_desc, terms_children_asc] {
+            let set = TaxonomySet::build(tax.clone(), terms);
+            assert_eq!(
+                set.resolve_archive_path("category/parent/child"),
+                Some(30),
+                "the lowest CHILD id must win regardless of build order"
+            );
         }
     }
 
