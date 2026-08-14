@@ -88,6 +88,7 @@ async fn render(
         &state.authors.current(),
         &state.menus.current(),
         &state.content_index.current(),
+        &state.taxonomies.current(),
         type_name,
         obj,
     )

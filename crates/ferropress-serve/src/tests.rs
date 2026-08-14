@@ -566,6 +566,7 @@ async fn serve_path_read_through_populates_cache() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         &path,
     )
     .await
@@ -621,6 +622,7 @@ async fn serve_path_cache_hit_composes_from_stored_envelope() {
         author_id: None,
         featured_image: None,
         is_post: true,
+        term_ids: Vec::new(),
         template: None,
         seo: None,
         body: SENTINEL_BODY.to_owned(),
@@ -640,6 +642,7 @@ async fn serve_path_cache_hit_composes_from_stored_envelope() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         &path,
     )
     .await
@@ -1631,6 +1634,7 @@ async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         &path,
     )
     .await;
@@ -1652,6 +1656,7 @@ async fn render_preview_serves_a_draft_uncached_with_banner_and_noindex() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         POST_TYPE,
         &obj,
     )
@@ -1709,6 +1714,7 @@ async fn front_page_renders_configured_static_page() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -1751,6 +1757,7 @@ async fn front_page_falls_back_to_galley_for_unpublished_target() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -1799,6 +1806,7 @@ async fn logo_resolves_and_renders_in_masthead() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         &format!("/{SLUG}"),
     )
     .await
@@ -1903,6 +1911,7 @@ async fn byline_resolves_live_from_the_author_directory_without_regen() {
         &dir1,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         &path,
     )
     .await
@@ -1945,6 +1954,7 @@ async fn byline_resolves_live_from_the_author_directory_without_regen() {
         &dir2,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         &path,
     )
     .await
@@ -2031,6 +2041,7 @@ async fn home_galley_byline_resolves_from_the_directory() {
         &dir,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2095,6 +2106,7 @@ async fn legacy_format_envelope_is_rejected_and_self_heals() {
         &dir,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         &path,
     )
     .await
@@ -2158,6 +2170,7 @@ async fn serve_front_galley_read_through_populates_cache() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2216,6 +2229,7 @@ async fn serve_front_cache_hit_composes_from_stored_galley() {
         excerpt: String::new(),
         published_at: None,
         author_id: None,
+        term_ids: Vec::new(),
     }]);
     blobs
         .put(&home_key, serde_json::to_vec(&front).unwrap())
@@ -2231,6 +2245,7 @@ async fn serve_front_cache_hit_composes_from_stored_galley() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2276,6 +2291,7 @@ async fn serve_front_static_read_through_then_hit() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2314,6 +2330,7 @@ async fn serve_front_static_read_through_then_hit() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2359,6 +2376,7 @@ async fn post_change_evicts_home_cache() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await;
@@ -2387,6 +2405,7 @@ async fn post_change_evicts_home_cache() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await;
@@ -2427,6 +2446,7 @@ async fn page_change_evicts_home_only_for_the_configured_front_page() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await;
@@ -2482,6 +2502,7 @@ async fn setting_change_evicts_home_only_for_front_shaping_keys() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await;
@@ -2543,6 +2564,7 @@ async fn home_galley_byline_stays_live_on_cached_front_without_regen() {
         &dir1,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2587,6 +2609,7 @@ async fn home_galley_byline_stays_live_on_cached_front_without_regen() {
         &dir2,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2636,6 +2659,7 @@ async fn corrupt_home_cache_entry_is_rejected_and_self_heals() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2680,6 +2704,7 @@ async fn delete_evicts_home_even_without_a_slug_on_the_change() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await;
@@ -2803,6 +2828,7 @@ async fn home_rebuild_honors_new_posts_per_page_after_eviction() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await;
@@ -2839,6 +2865,7 @@ async fn home_rebuild_honors_new_posts_per_page_after_eviction() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await;
@@ -2885,6 +2912,7 @@ async fn home_rebuild_reflects_edited_static_front_after_eviction() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2935,6 +2963,7 @@ async fn home_rebuild_reflects_edited_static_front_after_eviction() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -2994,6 +3023,7 @@ async fn structurally_drifted_home_envelope_is_rejected_and_self_heals() {
             &AuthorDirectory::default(),
             &crate::MenuSet::default(),
             &crate::ContentIndex::default(),
+            &crate::TaxonomySet::default(),
             "/",
         )
         .await
@@ -3065,6 +3095,7 @@ async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
         &dir,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -3081,6 +3112,7 @@ async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
         &dir,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -3097,6 +3129,7 @@ async fn cached_and_uncached_front_page_are_byte_for_byte_identical() {
         &dir,
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -3293,6 +3326,7 @@ async fn nested_page_resolves_at_its_full_path_only() {
                 &AuthorDirectory::default(),
                 &crate::MenuSet::default(),
                 &crate::ContentIndex::default(),
+                &crate::TaxonomySet::default(),
                 path,
             )
             .await
@@ -3474,6 +3508,7 @@ async fn a_page_template_renders_a_different_layout() {
                 &AuthorDirectory::default(),
                 &crate::MenuSet::default(),
                 &crate::ContentIndex::default(),
+                &crate::TaxonomySet::default(),
                 path,
             )
             .await
@@ -3540,6 +3575,7 @@ async fn front_page_that_is_a_page_honors_its_template() {
         &AuthorDirectory::default(),
         &crate::MenuSet::default(),
         &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
         "/",
     )
     .await
@@ -4008,5 +4044,269 @@ async fn a_post_change_blunt_evicts_the_archive_subtree_too() {
     assert!(
         blobs.exists(&cache_key(&format!("/{SLUG}"))).await.unwrap(),
         "the post's own permalink regen still ran (write-through)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Term chips: baked ids, resolved LIVE from the TaxonomySet at compose time
+// ---------------------------------------------------------------------------
+
+/// Link a post's to-many `terms` relation to a term — the M:N membership
+/// [`content::cached_page_from_object`] bakes into `CachedPage::term_ids` /
+/// [`content::recent_published_posts`] batches into `CachedHomePost::term_ids`.
+async fn link_term(store: &Arc<dyn RhypeStore>, post_id: ObjectId, term_id: ObjectId) {
+    let edge = Edge {
+        type_name: TypeName::from(POST_TYPE),
+        id: post_id,
+        field: "terms".to_owned(),
+    };
+    store
+        .link(&edge, term_id, HashMap::new())
+        .await
+        .expect("linking the post term must succeed");
+}
+
+/// A post's chips render both the term NAME and its canonical archive href, resolved live
+/// from the [`TaxonomySet`](crate::TaxonomySet) — the envelope bakes only ids, never the
+/// resolved name/href (mirrors the byline id/name split).
+#[tokio::test]
+async fn term_chips_render_with_name_and_href() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let space_opera_id = seed_term(&store, "tag", "space-opera", "Space Opera").await;
+    let post_id = seed_post(&store, SLUG, Status::Published).await;
+    link_term(&store, post_id, fiction_id).await;
+    link_term(&store, post_id, space_opera_id).await;
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let settings = SiteSettings::defaults();
+    let path = format!("/{SLUG}");
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        &path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    assert!(
+        html.contains("class=\"chips\""),
+        "the chip list must render; was:\n{html}"
+    );
+    // Hrefs are HTML-entity-escaped by the theme's autoescape (`/` -> `&#x2f;`, the same
+    // discipline every other chrome URL — canonical, featured image, logo — already carries),
+    // which the browser decodes back to `/`.
+    assert!(
+        html.contains("class=\"chip\" href=\"&#x2f;category&#x2f;fiction\">Fiction</a>"),
+        "the Fiction chip must show its name + archive href; was:\n{html}"
+    );
+    assert!(
+        html.contains("class=\"chip\" href=\"&#x2f;tag&#x2f;space-opera\">Space Opera</a>"),
+        "the Space Opera chip must show its name + archive href; was:\n{html}"
+    );
+
+    // The envelope bakes only the ids — Term.slug/name/parent are NOT stored redundantly.
+    // Link order is unspecified (Term has no ordinal column), so compare as a set.
+    let envelope: crate::content::CachedPage =
+        serde_json::from_slice(&blobs.get(&cache_key(&path)).await.unwrap()).unwrap();
+    let baked: HashSet<u64> = envelope.term_ids.iter().copied().collect();
+    assert_eq!(
+        baked,
+        HashSet::from([fiction_id.0, space_opera_id.0]),
+        "the envelope must bake exactly the linked term ids"
+    );
+}
+
+/// THE term-chip fix: a chip is resolved LIVE from the taxonomy set, so renaming a term
+/// updates its chip on the ALREADY-CACHED page with NO regeneration — the envelope caches
+/// only the term id, never the name (mirrors the byline live-resolve pair).
+#[tokio::test]
+async fn term_chips_resolve_live_and_survive_a_rename_without_regen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+
+    let term_id = seed_term(&store, "category", "news", "News").await;
+    let post_id = seed_post(&store, SLUG, Status::Published).await;
+    link_term(&store, post_id, term_id).await;
+
+    let path = format!("/{SLUG}");
+    let key = cache_key(&path);
+    let settings = SiteSettings::defaults();
+
+    // First render (a MISS): the taxonomy set reflects the original name.
+    let taxonomies1 = crate::load_taxonomies(&store).await.unwrap();
+    let html1 = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies1,
+        &path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html1.contains(">News</a>"),
+        "the original term name must render; was:\n{html1}"
+    );
+    let envelope: crate::content::CachedPage =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+
+    // Rename the term in the store, then rebuild the taxonomy set exactly as the regen
+    // loop's `Term`-change handler does (`load_taxonomies` full-reload) — WITHOUT touching
+    // the page cache at all.
+    let mut patch: HashMap<String, Value> = HashMap::new();
+    patch.insert(
+        "name".to_owned(),
+        Value::String("Current Events".to_owned()),
+    );
+    store
+        .update(&TypeName::from(ferropress_core::TERM_TYPE), term_id, patch)
+        .await
+        .unwrap();
+    let taxonomies2 = crate::load_taxonomies(&store).await.unwrap();
+
+    // Render AGAIN — a cache HIT (no regeneration): the chip reflects the new name purely
+    // because it is composed live from the taxonomy set.
+    let html2 = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies2,
+        &path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html2.contains(">Current Events</a>"),
+        "the renamed term must render live; was:\n{html2}"
+    );
+    assert!(
+        !html2.contains(">News</a>"),
+        "the stale name must be gone; was:\n{html2}"
+    );
+
+    // Prove no regeneration happened: the cached envelope is byte-for-byte unchanged.
+    let envelope_after: crate::content::CachedPage =
+        serde_json::from_slice(&blobs.get(&key).await.unwrap()).unwrap();
+    assert_eq!(
+        envelope_after, envelope,
+        "the chip changed with NO page regeneration — the cached envelope is unchanged"
+    );
+}
+
+/// A term id the current [`TaxonomySet`](crate::TaxonomySet) can't resolve (a deleted term
+/// whose cache eviction hasn't landed yet, or corrupt data) is silently dropped from the
+/// chip list — a listing degrades, it never breaks the page.
+#[tokio::test]
+async fn an_unresolvable_term_id_is_dropped_from_chips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    seed_post(&store, SLUG, Status::Published).await;
+
+    let path = format!("/{SLUG}");
+    let key = cache_key(&path);
+
+    // Pre-put an envelope whose term_ids references a term nobody seeded.
+    let envelope = crate::content::CachedPage {
+        title: "Title".to_owned(),
+        excerpt: String::new(),
+        published_at: None,
+        author_id: None,
+        featured_image: None,
+        is_post: true,
+        term_ids: vec![999_999],
+        template: None,
+        seo: None,
+        body: "<p>Body</p>".to_owned(),
+    };
+    blobs
+        .put(&key, serde_json::to_vec(&envelope).unwrap())
+        .await
+        .unwrap();
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        &path,
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        !html.contains("class=\"chips\""),
+        "an unresolvable term id must be dropped, not rendered as a broken chip; was:\n{html}"
+    );
+}
+
+/// The front-page galley's chips are the twin of the single-page chips: baked per-row term
+/// ids, resolved live in `compose_front` — exercising [`content::build_galley`]'s batched
+/// `terms` link read alongside its batched `author` read.
+#[tokio::test]
+async fn galley_rows_render_term_chips_from_baked_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, _blobs, theme) = boot(tmp.path());
+
+    let term_id = seed_term(&store, "category", "fiction", "Fiction").await;
+    let post_id = seed_post(&store, SLUG, Status::Published).await;
+    link_term(&store, post_id, term_id).await;
+
+    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
+    let html = match content::resolve_path(
+        &store,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &taxonomies,
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        html.contains("class=\"chip\" href=\"&#x2f;category&#x2f;fiction\">Fiction</a>"),
+        "the galley row's chip must show its name + archive href; was:\n{html}"
     );
 }

@@ -405,6 +405,7 @@ async fn serve_page(State(state): State<AppState>, req: Request) -> Response {
         &state.authors.current(),
         &state.menus.current(),
         &state.content_index.current(),
+        &state.taxonomies.current(),
         &path,
     )
     .await

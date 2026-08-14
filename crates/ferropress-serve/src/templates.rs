@@ -201,6 +201,14 @@ main { padding: 2.4rem 0 3rem; }
 .byline__avatar { width: 26px; height: 26px; border-radius: 50%; background: var(--minium);
   color: #fff; display: grid; place-items: center; font-weight: 600; font-size: .74rem;
   font-family: var(--ff-ui); letter-spacing: 0; }
+/* Term chips — a post/page's category+tag membership, resolved live. */
+.chips { list-style: none; display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0 0; padding: 0; }
+.chip { display: inline-flex; align-items: center; font-family: var(--ff-mono); font-size: .7rem;
+  font-weight: 500; letter-spacing: .07em; text-transform: uppercase; color: var(--steel);
+  text-decoration: none; padding: .22rem .6rem; border: 1px solid var(--rule); border-radius: 999px;
+  transition: color .14s, border-color .14s; }
+.chip:hover { color: var(--minium-deep); border-color: var(--minium); }
+.proof .chips { margin: .7rem 0 0; }
 .figure { margin: 0 0 2rem; }
 .figure img { width: 100%; height: auto; display: block;
   border: 1px solid var(--rule); border-radius: var(--radius); }
@@ -345,6 +353,7 @@ pub const SINGLE_SRC: &str = r##"{% extends "base.html" %}
         {% if dateline or kicker %}<span class="slugline">{% if dateline %}<b>{{ dateline }}</b>{% endif %}{% if dateline and kicker %}<span class="dot"></span>{% endif %}{% if kicker %}{{ kicker }}{% endif %}</span>{% endif %}
         <h1 class="article__title">{{ title }}</h1>
         {% if author %}<div class="byline"><span class="byline__avatar" aria-hidden="true">{{ author_initials }}</span> By {{ author }}</div>{% endif %}
+        {% if terms %}<ul class="chips">{% for term in terms %}<li><a class="chip" href="{{ term.href }}">{{ term.name }}</a></li>{% endfor %}</ul>{% endif %}
       </header>
       {% if featured_image %}<figure class="figure"><img src="{{ featured_image }}" alt="{{ title }}" loading="lazy"></figure>{% endif %}
       <div class="proof-body">{{ body | safe }}</div>
@@ -368,6 +377,7 @@ pub const HOME_SRC: &str = r##"{% extends "base.html" %}
         <span class="slugline">{% if post.dateline %}<b>{{ post.dateline }}</b>{% endif %}{% if post.dateline and post.author %}<span class="dot"></span>{% endif %}{% if post.author %}{{ post.author }}{% endif %}</span>
         <h2 class="proof__title"><a href="{{ post.url }}">{{ post.title }}</a></h2>
         {% if post.excerpt %}<p class="proof__excerpt">{{ post.excerpt }}</p>{% endif %}
+        {% if post.terms %}<ul class="chips">{% for term in post.terms %}<li><a class="chip" href="{{ term.href }}">{{ term.name }}</a></li>{% endfor %}</ul>{% endif %}
         <a class="proof__more" href="{{ post.url }}">Read the proof &rarr;</a>
       </li>
       {% endfor %}
@@ -390,6 +400,7 @@ pub const PAGE_WIDE_SRC: &str = r##"{% extends "base.html" %}
         {% if dateline or kicker %}<span class="slugline">{% if dateline %}<b>{{ dateline }}</b>{% endif %}{% if dateline and kicker %}<span class="dot"></span>{% endif %}{% if kicker %}{{ kicker }}{% endif %}</span>{% endif %}
         <h1 class="article__title">{{ title }}</h1>
         {% if author %}<div class="byline"><span class="byline__avatar" aria-hidden="true">{{ author_initials }}</span> By {{ author }}</div>{% endif %}
+        {% if terms %}<ul class="chips">{% for term in terms %}<li><a class="chip" href="{{ term.href }}">{{ term.name }}</a></li>{% endfor %}</ul>{% endif %}
       </header>
       {% if featured_image %}<figure class="figure"><img src="{{ featured_image }}" alt="{{ title }}" loading="lazy"></figure>{% endif %}
       <div class="proof-body">{{ body | safe }}</div>

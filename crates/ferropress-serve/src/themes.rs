@@ -280,7 +280,8 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
     let empty = serde_json::json!([]);
     let one_post = serde_json::json!([{
         "title": "Sample Post", "url": "/sample-post", "excerpt": "An excerpt.",
-        "dateline": "January 1, 2026", "author": "A. Writer"
+        "dateline": "January 1, 2026", "author": "A. Writer",
+        "terms": [{"name": "Fiction", "href": "/category/fiction"}, {"name": "Space Opera", "href": "/tag/space-opera"}]
     }]);
     let single_ctx = sample_context(false, empty.clone());
     let home_full = sample_context(true, one_post);
@@ -335,6 +336,7 @@ fn sample_context(is_home: bool, posts: serde_json::Value) -> serde_json::Value 
         "author": "A. Writer",
         "author_initials": "AW",
         "featured_image": null,
+        "terms": [{"name": "Fiction", "href": "/category/fiction"}, {"name": "Space Opera", "href": "/tag/space-opera"}],
         "body": "<p>Sample <strong>body</strong>.</p>",
         "posts": posts
     })

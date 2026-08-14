@@ -51,6 +51,7 @@ use crate::cache_key;
 use crate::content_index::ContentIndex;
 use crate::datefmt;
 use crate::menus::{MenuItemCtx, MenuSet};
+use crate::taxonomies::TaxonomySet;
 use crate::templates::{HOME_TEMPLATE, template_name_for};
 
 /// Build a [`ThemeEngine`] for the **default** theme (the built-in letterpress "Composing
@@ -134,6 +135,17 @@ pub(crate) struct CachedPage {
     pub featured_image: Option<String>,
     /// Whether this is a `Post` (shows a byline) vs a `Page` (does not).
     pub is_post: bool,
+    /// The `Post.terms` M:N membership as BAKED ids only (posts only; a `Page` has no
+    /// `terms` relation so this is always empty for one). The chip NAME + archive href are
+    /// **not** baked here — they are resolved LIVE from the current
+    /// [`TaxonomySet`](crate::taxonomies::TaxonomySet) at compose time (same discipline as
+    /// [`author_id`](Self::author_id)'s byline name), so a term rename/re-parent is
+    /// reflected on the next request with no page regeneration. Direct assignments only —
+    /// never rolled up to ancestors. `#[serde(default)]` so a pre-taxonomy legacy envelope
+    /// (missing this key entirely) deserializes to an empty chip list rather than failing
+    /// (the `template` field's precedent).
+    #[serde(default)]
+    pub term_ids: Vec<u64>,
     /// The chosen theme template VALUE for a page (e.g. `"page-wide"`), or `None` for the
     /// default single template. Content-stable (a template edit is a Page save that
     /// regenerates this envelope), so it is cached rather than resolved live. Posts never set
@@ -192,6 +204,12 @@ pub(crate) struct CachedHomePost {
     pub published_at: Option<i64>,
     /// The author's `User` id; the byline NAME is resolved live from the author directory.
     pub author_id: Option<u64>,
+    /// The post's `terms` M:N membership as baked ids only — same discipline as
+    /// [`CachedPage::term_ids`], resolved to live chips at compose time. `#[serde(default)]`
+    /// for legacy-envelope missing-key tolerance (the `Option` fields above predate this
+    /// field and are NOT independently default-tolerant; only newly-added fields need it).
+    #[serde(default)]
+    pub term_ids: Vec<u64>,
 }
 
 /// Derive the lookup **path key** from a request path.
@@ -220,10 +238,14 @@ pub async fn resolve_path(
     authors: &AuthorDirectory,
     menus: &MenuSet,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
-        return front_page(store, theme, custom, settings, authors, menus, index).await;
+        return front_page(
+            store, theme, custom, settings, authors, menus, index, taxonomies,
+        )
+        .await;
     }
     match build_page(store, custom, path).await {
         Ok(Some(page)) => {
@@ -233,6 +255,7 @@ pub async fn resolve_path(
                 authors,
                 menus,
                 index,
+                taxonomies,
                 &page,
                 false,
                 None,
@@ -273,6 +296,7 @@ pub async fn serve_path(
     authors: &AuthorDirectory,
     menus: &MenuSet,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
     path: &str,
 ) -> Resolved {
     if slug_from_path(path).is_empty() {
@@ -280,7 +304,10 @@ pub async fn serve_path(
         // live from the current settings + author directory. `serve_front` is cache-first
         // (build + write-through on a miss); the change-driven regen loop EVICTS `/` when a
         // content/settings change can reshape it, and this read path is the sole populator.
-        return serve_front(store, blobs, theme, custom, settings, authors, menus, index).await;
+        return serve_front(
+            store, blobs, theme, custom, settings, authors, menus, index, taxonomies,
+        )
+        .await;
     }
 
     let key = cache_key(path);
@@ -297,6 +324,7 @@ pub async fn serve_path(
                     authors,
                     menus,
                     index,
+                    taxonomies,
                     &page,
                     false,
                     None,
@@ -346,6 +374,7 @@ pub async fn serve_path(
                 authors,
                 menus,
                 index,
+                taxonomies,
                 &page,
                 false,
                 None,
@@ -387,13 +416,16 @@ async fn serve_front(
     authors: &AuthorDirectory,
     menus: &MenuSet,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
 ) -> Resolved {
     let key = cache_key("/");
 
     match blobs.get(&key).await {
         Ok(bytes) => match serde_json::from_slice::<CachedFront>(&bytes) {
             Ok(front) => {
-                return match compose_front(theme, settings, authors, menus, index, &front) {
+                return match compose_front(
+                    theme, settings, authors, menus, index, taxonomies, &front,
+                ) {
                     Ok(html) => Resolved::Found(html),
                     Err(e) => Resolved::Error(e),
                 };
@@ -425,7 +457,7 @@ async fn serve_front(
                     tracing::warn!(error = %e, "could not serialize the home envelope for the cache; serving uncached render");
                 }
             }
-            match compose_front(theme, settings, authors, menus, index, &front) {
+            match compose_front(theme, settings, authors, menus, index, taxonomies, &front) {
                 Ok(html) => Resolved::Found(html),
                 Err(e) => Resolved::Error(e),
             }
@@ -480,6 +512,7 @@ pub async fn render_preview(
     authors: &AuthorDirectory,
     menus: &MenuSet,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
     type_name: &'static str,
     obj: &Object,
 ) -> Resolved {
@@ -493,6 +526,7 @@ pub async fn render_preview(
             authors,
             menus,
             index,
+            taxonomies,
             &page,
             false,
             Some(&label),
@@ -570,6 +604,13 @@ pub(crate) async fn cached_page_from_object(
         },
         featured_image: featured_image_url(store, type_name, obj.id).await,
         is_post,
+        // `Post.terms` is a Post-only relation — a Page has no `terms` field at all, so it
+        // always bakes an empty chip list (WP parity, mirroring the `author_id` gate above).
+        term_ids: if is_post {
+            multi_link(store, type_name, obj.id, "terms").await
+        } else {
+            Vec::new()
+        },
         // The page's chosen template value (posts carry no `template` field → None). An empty
         // string is treated as the default (None), matching the "" default in `page_templates`.
         template: match obj.get("template") {
@@ -603,6 +644,7 @@ fn compose_single(
     authors: &AuthorDirectory,
     menus: &MenuSet,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
     page: &CachedPage,
     is_home: bool,
     preview_status: Option<&str>,
@@ -643,6 +685,7 @@ fn compose_single(
         author,
         author_initials: author.map(initials).unwrap_or_default(),
         featured_image: page.featured_image.as_deref(),
+        terms: resolve_chips(taxonomies, &page.term_ids),
         body: &page.body,
     };
 
@@ -668,12 +711,15 @@ async fn front_page(
     authors: &AuthorDirectory,
     menus: &MenuSet,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
 ) -> Resolved {
     match build_front(store, custom, settings).await {
-        Ok(front) => match compose_front(theme, settings, authors, menus, index, &front) {
-            Ok(html) => Resolved::Found(html),
-            Err(e) => Resolved::Error(e),
-        },
+        Ok(front) => {
+            match compose_front(theme, settings, authors, menus, index, taxonomies, &front) {
+                Ok(html) => Resolved::Found(html),
+                Err(e) => Resolved::Error(e),
+            }
+        }
         Err(e) => Resolved::Error(e),
     }
 }
@@ -727,6 +773,7 @@ fn compose_front(
     authors: &AuthorDirectory,
     menus: &MenuSet,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
     front: &CachedFront,
 ) -> Result<String, CoreError> {
     // The front page's own path is the site root, so nav items pointing at `/` are current.
@@ -738,6 +785,7 @@ fn compose_front(
             authors,
             menus,
             index,
+            taxonomies,
             page,
             true,
             None,
@@ -757,6 +805,7 @@ fn compose_front(
                         .author_id
                         .and_then(|id| authors.name(id))
                         .map(str::to_owned),
+                    terms: resolve_chips(taxonomies, &p.term_ids),
                 })
                 .collect();
 
@@ -783,47 +832,52 @@ fn compose_front(
 
 /// The most-recent published posts for the galley, newest first, capped at
 /// `settings.posts_per_page`, as content-stable [`CachedHomePost`] rows (raw `published_at`
-/// millis + the author *id* — the dateline is formatted and the byline name resolved live in
-/// [`compose_front`], so a settings edit or an author rename needs no `/` regeneration).
+/// millis + the author *id* + the `terms` membership ids — the dateline is formatted and the
+/// byline name + term chips resolved live in [`compose_front`], so a settings edit, an author
+/// rename, or a term rename needs no `/` regeneration).
 ///
 /// Scans posts and filters/sorts in Rust: v1 has no compound "status == published ORDER BY
 /// published_at DESC LIMIT n" query primitive, and the post table is small. Posts with no
-/// `published_at` sort last (keyed as `i64::MIN`). Each row's author id is resolved with ONE
-/// batched link read (no N+1).
+/// `published_at` sort last (keyed as `i64::MIN`). Each row's author id + term ids are each
+/// resolved with ONE batched link read (no N+1).
 async fn build_galley(
     store: &Arc<dyn RhypeStore>,
     settings: &SiteSettings,
 ) -> Result<Vec<CachedHomePost>, CoreError> {
-    let (published, author_links) =
+    let (published, author_links, term_links) =
         recent_published_posts(store, settings.posts_per_page as usize).await?;
 
     Ok(published
         .iter()
         .zip(author_links.iter())
-        .map(|(obj, author_ids)| CachedHomePost {
+        .zip(term_links.iter())
+        .map(|((obj, author_ids), term_ids)| CachedHomePost {
             title: str_field(obj, "title"),
             url: format!("/{}", str_field(obj, "slug")),
             excerpt: str_field(obj, "excerpt"),
             published_at: obj.get("published_at").and_then(Value::as_datetime),
             author_id: author_ids.first().map(|id| id.0),
+            term_ids: term_ids.iter().map(|id| id.0).collect(),
         })
         .collect())
 }
 
 /// The most-recent PUBLISHED posts (newest first, capped at `limit`) with each row's author
-/// target ids in ONE batched link read — the scan/filter/sort/truncate + no-N+1 author query
-/// shared by BOTH the front-page galley ([`build_galley`]) and the syndication feed
-/// ([`crate::feed::build_feed`]), so the two listings can never drift on which posts they
-/// include or on the batched-author discipline.
+/// target ids AND `terms` membership ids each in ONE batched link read — the
+/// scan/filter/sort/truncate + no-N+1 author query shared by BOTH the front-page galley
+/// ([`build_galley`]) and the syndication feed ([`crate::feed::build_feed`]), so the two
+/// listings can never drift on which posts they include or on the batched-link discipline.
+/// The feed does not (yet) surface term chips, so it simply ignores the third element.
 ///
 /// Scans posts and filters/sorts in Rust: v1 has no compound "status == published ORDER BY
 /// published_at DESC LIMIT n" primitive, and the post table is small. Posts with no
 /// `published_at` sort last (keyed `i64::MIN`). Returns the truncated objects and, positionally
-/// aligned by index, each object's `author` target ids (empty vec when unlinked).
+/// aligned by index, each object's `author` target ids and `terms` target ids (empty vec when
+/// unlinked).
 pub(crate) async fn recent_published_posts(
     store: &Arc<dyn RhypeStore>,
     limit: usize,
-) -> Result<(Vec<Object>, Vec<Vec<ObjectId>>), CoreError> {
+) -> Result<(Vec<Object>, Vec<Vec<ObjectId>>, Vec<Vec<ObjectId>>), CoreError> {
     let mut published: Vec<Object> = store
         .scan(&TypeName::from(POST_TYPE))
         .await?
@@ -842,14 +896,18 @@ pub(crate) async fn recent_published_posts(
     });
     published.truncate(limit);
 
-    // Resolve every row's author id in ONE batched link read (no N+1). The display name is
-    // NOT stored — it is looked up live from the author directory at compose time (the SAME
-    // directory the single-page byline uses, so the galley/feed + permalink can never disagree).
+    // Resolve every row's author id + term ids in ONE batched link read each (no N+1). Neither
+    // the byline name nor the chip name/href is stored — both are looked up live at compose
+    // time (the author directory / the SAME TaxonomySet the single-page path uses, so the
+    // galley/feed + permalink can never disagree).
     let ids: Vec<ObjectId> = published.iter().map(|o| o.id).collect();
     let author_links = store
         .get_links_many(&TypeName::from(POST_TYPE), &ids, "author")
         .await?;
-    Ok((published, author_links))
+    let term_links = store
+        .get_links_many(&TypeName::from(POST_TYPE), &ids, "terms")
+        .await?;
+    Ok((published, author_links, term_links))
 }
 
 /// Resolve a request path key to the PUBLISHED entity behind it, returning its store
@@ -982,6 +1040,27 @@ async fn single_link(
         .map(|(target, _)| target)
 }
 
+/// Every target id of a to-many relation `field` on `(type_name, id)` (empty when unlinked
+/// OR on a read fault — a term-chip miss must degrade the page, never fail it, matching
+/// [`featured_image_url`]'s best-effort discipline).
+async fn multi_link(
+    store: &Arc<dyn RhypeStore>,
+    type_name: &str,
+    id: ObjectId,
+    field: &str,
+) -> Vec<u64> {
+    let edge = Edge {
+        type_name: TypeName::from(type_name),
+        id,
+        field: field.to_owned(),
+    };
+    store
+        .get_links(&edge)
+        .await
+        .map(|links| links.into_iter().map(|(target, _)| target.0).collect())
+        .unwrap_or_default()
+}
+
 /// The document `<title>`: `"Entry — Site"`, or just the site title when the entry
 /// has none.
 fn page_title(title: &str, settings: &SiteSettings) -> String {
@@ -1066,6 +1145,9 @@ struct SingleCtx<'a> {
     author: Option<&'a str>,
     author_initials: String,
     featured_image: Option<&'a str>,
+    /// This entry's term chips, resolved live (see [`resolve_chips`]) — direct
+    /// assignments only, in the envelope's baked order.
+    terms: Vec<TermChipCtx>,
     body: &'a str,
 }
 
@@ -1094,6 +1176,33 @@ struct PostSummary {
     excerpt: String,
     dateline: Option<String>,
     author: Option<String>,
+    /// This row's term chips — the galley twin of [`SingleCtx::terms`].
+    terms: Vec<TermChipCtx>,
+}
+
+/// One resolved term chip: display name + canonical archive href. Both fields are resolved
+/// LIVE from the current [`TaxonomySet`] at compose time (see [`resolve_chips`]) — the
+/// envelope bakes only the term *id*, so a term rename or re-parent is reflected on the next
+/// request with no page regeneration, the same discipline as the byline name.
+#[derive(Serialize)]
+struct TermChipCtx {
+    name: String,
+    href: String,
+}
+
+/// Resolve baked `term_ids` to their live chips, in the baked (direct-assignment) order —
+/// never rolled up to ancestors. An id the current [`TaxonomySet`] can't resolve (a deleted
+/// term whose cache eviction hasn't landed yet, or corrupt data) is silently dropped: a chip
+/// list degrades, it never breaks the page.
+fn resolve_chips(taxonomies: &TaxonomySet, term_ids: &[u64]) -> Vec<TermChipCtx> {
+    term_ids
+        .iter()
+        .filter_map(|&id| {
+            let name = taxonomies.term(id)?.name.clone();
+            let href = taxonomies.archive_href(id)?;
+            Some(TermChipCtx { name, href })
+        })
+        .collect()
 }
 
 /// Render a block tree to its final, media-rewritten HTML body.

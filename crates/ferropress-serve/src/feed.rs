@@ -162,7 +162,9 @@ pub(crate) async fn build_feed(
     custom: &dyn CustomBlockRenderer,
     settings: &SiteSettings,
 ) -> Result<CachedFeed, CoreError> {
-    let (objects, author_links) =
+    // The feed does not (yet) surface term chips — `recent_published_posts` also batches term
+    // links for the galley/single-page chip resolution, ignored here.
+    let (objects, author_links, _term_links) =
         content::recent_published_posts(store, settings.feed_items as usize).await?;
 
     let mut items = Vec::with_capacity(objects.len());
