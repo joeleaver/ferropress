@@ -1145,8 +1145,8 @@ struct SingleCtx<'a> {
     author: Option<&'a str>,
     author_initials: String,
     featured_image: Option<&'a str>,
-    /// This entry's term chips, resolved live (see [`resolve_chips`]) — direct
-    /// assignments only, in the envelope's baked order.
+    /// This entry's term chips, resolved live (see [`resolve_chips`]) — direct assignments
+    /// only, name-sorted for a deterministic display order.
     terms: Vec<TermChipCtx>,
     body: &'a str,
 }
@@ -1190,19 +1190,28 @@ struct TermChipCtx {
     href: String,
 }
 
-/// Resolve baked `term_ids` to their live chips, in the baked (direct-assignment) order —
-/// never rolled up to ancestors. An id the current [`TaxonomySet`] can't resolve (a deleted
-/// term whose cache eviction hasn't landed yet, or corrupt data) is silently dropped: a chip
-/// list degrades, it never breaks the page.
+/// Resolve baked `term_ids` to their live chips — direct assignments only, never rolled up
+/// to ancestors. An id the current [`TaxonomySet`] can't resolve (a deleted term whose cache
+/// eviction hasn't landed yet, or corrupt data) is silently dropped: a chip list degrades, it
+/// never breaks the page. Sorted case-folded name ascending (id tiebreak) for a DETERMINISTIC
+/// display order regardless of the store's (unordered) link order — the same discipline
+/// [`TaxonomySet`]'s own per-taxonomy listing order uses.
 fn resolve_chips(taxonomies: &TaxonomySet, term_ids: &[u64]) -> Vec<TermChipCtx> {
-    term_ids
+    let mut resolved: Vec<(u64, TermChipCtx)> = term_ids
         .iter()
         .filter_map(|&id| {
             let name = taxonomies.term(id)?.name.clone();
             let href = taxonomies.archive_href(id)?;
-            Some(TermChipCtx { name, href })
+            Some((id, TermChipCtx { name, href }))
         })
-        .collect()
+        .collect();
+    resolved.sort_by(|(a_id, a), (b_id, b)| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then(a_id.cmp(b_id))
+    });
+    resolved.into_iter().map(|(_, chip)| chip).collect()
 }
 
 /// Render a block tree to its final, media-rewritten HTML body.

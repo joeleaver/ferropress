@@ -4066,19 +4066,84 @@ async fn link_term(store: &Arc<dyn RhypeStore>, post_id: ObjectId, term_id: Obje
         .expect("linking the post term must succeed");
 }
 
-/// A post's chips render both the term NAME and its canonical archive href, resolved live
-/// from the [`TaxonomySet`](crate::TaxonomySet) — the envelope bakes only ids, never the
-/// resolved name/href (mirrors the byline id/name split).
+/// Seed a Term as a CHILD of `parent_id`, in the SAME taxonomy as the parent — the
+/// ancestor-chain case [`seed_term`] (roots only) can't produce. Returns the child's id.
+async fn seed_child_term(
+    store: &Arc<dyn RhypeStore>,
+    parent_id: ObjectId,
+    slug: &str,
+    name: &str,
+) -> ObjectId {
+    let mut f: HashMap<String, Value> = HashMap::new();
+    f.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    f.insert("name".to_owned(), Value::String(name.to_owned()));
+    f.insert("description".to_owned(), Value::String(String::new()));
+    f.insert("plaintext".to_owned(), Value::String(name.to_owned()));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let term_id = store
+        .create(&TypeName::from(ferropress_core::TERM_TYPE), f)
+        .await
+        .expect("seed child term");
+
+    let tax_links = store
+        .get_links(&Edge {
+            type_name: TypeName::from(ferropress_core::TERM_TYPE),
+            id: parent_id,
+            field: "taxonomy".to_owned(),
+        })
+        .await
+        .expect("read the parent term's taxonomy link");
+    let tax_id = tax_links
+        .first()
+        .expect("the parent term must have a taxonomy")
+        .0;
+    store
+        .link(
+            &Edge {
+                type_name: TypeName::from(ferropress_core::TERM_TYPE),
+                id: term_id,
+                field: "taxonomy".to_owned(),
+            },
+            tax_id,
+            HashMap::new(),
+        )
+        .await
+        .expect("link child term to the parent's taxonomy");
+    store
+        .link(
+            &Edge {
+                type_name: TypeName::from(ferropress_core::TERM_TYPE),
+                id: term_id,
+                field: "parent".to_owned(),
+            },
+            parent_id,
+            HashMap::new(),
+        )
+        .await
+        .expect("link child term to its parent");
+    term_id
+}
+
+/// A post's chips render the term NAME and its canonical archive href, resolved live from
+/// the [`TaxonomySet`](crate::TaxonomySet) — the envelope bakes only ids, never the resolved
+/// name/href (mirrors the byline id/name split). Covers a term in each of two DIFFERENT
+/// taxonomies, a CHILD term whose href must be the full ancestor chain (not just its own
+/// slug), and the name-sorted, case-insensitive DISPLAY ORDER (`Debut` / `Fiction` / `Space
+/// Opera`) — deterministic regardless of link-creation order.
 #[tokio::test]
 async fn term_chips_render_with_name_and_href() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, blobs, theme) = boot(tmp.path());
 
     let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
-    let space_opera_id = seed_term(&store, "tag", "space-opera", "Space Opera").await;
+    let space_opera_id = seed_child_term(&store, fiction_id, "space-opera", "Space Opera").await;
+    let debut_id = seed_term(&store, "tag", "debut", "Debut").await;
     let post_id = seed_post(&store, SLUG, Status::Published).await;
-    link_term(&store, post_id, fiction_id).await;
+    // Link in a DELIBERATELY non-alphabetical order — the render order must come from the
+    // name sort, not the link order.
     link_term(&store, post_id, space_opera_id).await;
+    link_term(&store, post_id, fiction_id).await;
+    link_term(&store, post_id, debut_id).await;
 
     let taxonomies = crate::load_taxonomies(&store).await.unwrap();
     let settings = SiteSettings::defaults();
@@ -4109,13 +4174,30 @@ async fn term_chips_render_with_name_and_href() {
     // Hrefs are HTML-entity-escaped by the theme's autoescape (`/` -> `&#x2f;`, the same
     // discipline every other chrome URL — canonical, featured image, logo — already carries),
     // which the browser decodes back to `/`.
+    let debut_chip = "class=\"chip\" href=\"&#x2f;tag&#x2f;debut\">Debut</a>";
+    let fiction_chip = "class=\"chip\" href=\"&#x2f;category&#x2f;fiction\">Fiction</a>";
+    let space_opera_chip =
+        "class=\"chip\" href=\"&#x2f;category&#x2f;fiction&#x2f;space-opera\">Space Opera</a>";
     assert!(
-        html.contains("class=\"chip\" href=\"&#x2f;category&#x2f;fiction\">Fiction</a>"),
+        html.contains(debut_chip),
+        "the Debut chip (a different taxonomy) must show its name + archive href; was:\n{html}"
+    );
+    assert!(
+        html.contains(fiction_chip),
         "the Fiction chip must show its name + archive href; was:\n{html}"
     );
     assert!(
-        html.contains("class=\"chip\" href=\"&#x2f;tag&#x2f;space-opera\">Space Opera</a>"),
-        "the Space Opera chip must show its name + archive href; was:\n{html}"
+        html.contains(space_opera_chip),
+        "the Space Opera chip's href must be the FULL ancestor chain, not just its own slug; was:\n{html}"
+    );
+    let (debut_pos, fiction_pos, space_opera_pos) = (
+        html.find(debut_chip).unwrap(),
+        html.find(fiction_chip).unwrap(),
+        html.find(space_opera_chip).unwrap(),
+    );
+    assert!(
+        debut_pos < fiction_pos && fiction_pos < space_opera_pos,
+        "chips must render name-sorted (Debut, Fiction, Space Opera), not link order; was:\n{html}"
     );
 
     // The envelope bakes only the ids — Term.slug/name/parent are NOT stored redundantly.
@@ -4125,7 +4207,7 @@ async fn term_chips_render_with_name_and_href() {
     let baked: HashSet<u64> = envelope.term_ids.iter().copied().collect();
     assert_eq!(
         baked,
-        HashSet::from([fiction_id.0, space_opera_id.0]),
+        HashSet::from([fiction_id.0, space_opera_id.0, debut_id.0]),
         "the envelope must bake exactly the linked term ids"
     );
 }
@@ -4308,5 +4390,71 @@ async fn galley_rows_render_term_chips_from_baked_ids() {
     assert!(
         html.contains("class=\"chip\" href=\"&#x2f;category&#x2f;fiction\">Fiction</a>"),
         "the galley row's chip must show its name + archive href; was:\n{html}"
+    );
+}
+
+/// An envelope written before `term_ids` existed carries no `term_ids` key.
+/// `deny_unknown_fields` rejects only EXTRA keys, and `#[serde(default)]` defaults a missing
+/// `Vec` to empty — so a legacy envelope loads cleanly with `term_ids: vec![]` and renders no
+/// chips, with NO re-render herd (mirrors `legacy_envelope_without_template_deserializes_to_none`).
+#[test]
+fn legacy_envelope_without_term_ids_deserializes_to_empty() {
+    let json = serde_json::json!({
+        "title": "Legacy",
+        "excerpt": "",
+        "published_at": null,
+        "author_id": null,
+        "featured_image": null,
+        "is_post": true,
+        "template": null,
+        "seo": null,
+        "body": "<p>x</p>"
+    });
+    let page: crate::content::CachedPage =
+        serde_json::from_value(json).expect("a pre-term_ids envelope must still deserialize");
+    assert_eq!(page.term_ids, Vec::<u64>::new());
+}
+
+/// A `Page` has no `terms` relation at all — only `Post` carries taxonomy membership (WP
+/// parity) — so its served HTML must never contain chip markup, and its envelope must bake
+/// an empty `term_ids` (the `is_post` gate mirroring `author_id`'s).
+#[tokio::test]
+async fn a_page_renders_no_chip_markup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+
+    seed_page(&store, "about", Status::Published, "About the Press body.").await;
+    crate::backfill_page_paths(&store)
+        .await
+        .expect("backfill page paths");
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &SiteSettings::defaults(),
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/about",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+    assert!(
+        !html.contains("class=\"chips\""),
+        "a Page must never render chip markup; was:\n{html}"
+    );
+
+    let envelope: crate::content::CachedPage =
+        serde_json::from_slice(&blobs.get(&cache_key("/about")).await.unwrap()).unwrap();
+    assert!(
+        envelope.term_ids.is_empty(),
+        "a Page's envelope must bake no term ids; was: {:?}",
+        envelope.term_ids
     );
 }
