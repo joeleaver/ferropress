@@ -284,13 +284,28 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
         "terms": [{"name": "Fiction", "href": "/category/fiction"}, {"name": "Space Opera", "href": "/tag/space-opera"}]
     }]);
     let single_ctx = sample_context(false, empty.clone());
-    let home_full = sample_context(true, one_post.clone());
-    let home_empty = sample_context(true, empty);
+    // A multi-page home galley (`pager: Some`) — the home twin of the archive-paged shape
+    // below; `home_empty` deliberately stays pager-less (an empty galley never paginates).
+    let mut home_full = sample_context(true, one_post.clone());
+    if let Some(obj) = home_full.as_object_mut() {
+        obj.insert(
+            "pager".to_owned(),
+            serde_json::json!({
+                "older": "/page/2",
+                "newer": null,
+                "page": 1,
+                "total_pages": 2
+            }),
+        );
+    }
+    let home_empty = sample_context(true, empty.clone());
     // A term-archive listing (`archive: Some`) is a DISTINCT branch of the same HOME_TEMPLATE
     // (the eyebrow swaps for the heading) — exercised here so a theme whose archive markup is
     // structurally broken (bad `{% if %}`/`{% endif %}` nesting) is caught at load, not on a
-    // live category/tag page.
-    let mut home_archive = sample_context(true, one_post);
+    // live category/tag page. This shape's `total` (3) fits on one page, so `pager` is
+    // deliberately left unset here — the PAGINATED archive shape below is what exercises
+    // `pager: Some`.
+    let mut home_archive = sample_context(true, one_post.clone());
     if let Some(obj) = home_archive.as_object_mut() {
         obj.insert(
             "page_title".to_owned(),
@@ -305,12 +320,64 @@ fn load_theme(dir: &Path, manifest_path: &Path) -> Result<(String, ThemeSources)
             }),
         );
     }
+    // A term archive that SPANS MULTIPLE PAGES (`pager: Some`) — until now NO probe shape ever
+    // set `pager` at all, so the whole `{% if pager %}` block (the older/newer links + the D3
+    // endless-scroll hooks `data-fp-pager`/`data-fp-next`, which share this exact markup on
+    // both home and an archive) was never exercised at theme load; a theme with a broken pager
+    // block would pass registration and only blow up on a live paginated request. Page 1 shape:
+    // an "older" link, no "newer" (mirrors `build_pager`'s real output for page 1 of N>1).
+    let mut home_archive_paged = sample_context(true, one_post);
+    if let Some(obj) = home_archive_paged.as_object_mut() {
+        obj.insert(
+            "page_title".to_owned(),
+            serde_json::json!("Fiction — Sample Site"),
+        );
+        obj.insert(
+            "archive".to_owned(),
+            serde_json::json!({
+                "name": "Fiction",
+                "description": "Stories that could have happened, but didn't.",
+                "total": 30
+            }),
+        );
+        obj.insert(
+            "pager".to_owned(),
+            serde_json::json!({
+                "older": "/category/fiction/page/2",
+                "newer": null,
+                "page": 1,
+                "total_pages": 3
+            }),
+        );
+    }
+    // An EMPTY term archive — `archive: Some` but zero rows and no pager (a category/tag with
+    // zero, or only unpublished, posts). Exercises the archive-specific empty-state copy (the
+    // twin of `home_empty`'s site-wide empty state), which is a DIFFERENT branch than the
+    // plain `is_home` empty shape above (`{% if archive %}...{% else %}...{% endif %}` inside
+    // the empty-state paragraph itself).
+    let mut archive_empty = sample_context(true, empty);
+    if let Some(obj) = archive_empty.as_object_mut() {
+        obj.insert(
+            "page_title".to_owned(),
+            serde_json::json!("Fiction — Sample Site"),
+        );
+        obj.insert(
+            "archive".to_owned(),
+            serde_json::json!({
+                "name": "Fiction",
+                "description": null,
+                "total": 0
+            }),
+        );
+    }
     for (template, ctx) in [
         (SINGLE_TEMPLATE, &single_ctx),
         (PAGE_WIDE_TEMPLATE, &single_ctx),
         (HOME_TEMPLATE, &home_full),
         (HOME_TEMPLATE, &home_empty),
         (HOME_TEMPLATE, &home_archive),
+        (HOME_TEMPLATE, &home_archive_paged),
+        (HOME_TEMPLATE, &archive_empty),
     ] {
         engine
             .render(template, ctx)
