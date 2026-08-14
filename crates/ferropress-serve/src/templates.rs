@@ -358,7 +358,27 @@ main { padding: 2.4rem 0 3rem; }
    (enhancement confirmed working), and reappears if a LATER fetch fails (graceful degrade
    back to manual pagination — no retry loop). It stays hidden once the listing is legitimately
    exhausted (a fetched page carried no further [data-fp-next]). Never steals focus — appended
-   rows are inert, static content, exactly like the ones already on the page. */
+   rows are inert, static content, exactly like the ones already on the page.
+
+   Hiding the pager sets an INLINE `display` style, not the `hidden` IDL attribute — `hidden`
+   only works through the UA stylesheet's `[hidden] { display: none }` rule, which loses to
+   ANY author `display` declaration on the same element (both themes give the pager's own
+   class `display: flex`), so `pagerNav.hidden = true` was a silent no-op. An inline style wins
+   the cascade regardless of what a theme's stylesheet declares; restoring it to `''` (not
+   `'flex'`) hands control back to the stylesheet rather than hardcoding a value here.
+
+   Two more corrections past the FIRST successful fetch:
+   - `history.replaceState` fires at the actual PAGE BOUNDARY, not when the fetch resolves —
+     a one-shot IntersectionObserver on the newly-appended batch's FIRST row flips the address
+     bar only once the reader has genuinely scrolled to it. This also fixes an auto-fetch at
+     load (a short page 1 whose sentinel starts within the trigger margin) from silently
+     rewriting the URL before any interaction, which would destroy the "/" history entry.
+   - After a successful append, the sentinel is re-checked directly (`getBoundingClientRect`)
+     and another fetch is chained immediately if it's still within the trigger margin — an
+     IntersectionObserver callback only fires on a THRESHOLD CROSSING, so a target that was
+     already intersecting and is STILL intersecting after the DOM mutation gets no further
+     callback; without this, a short appended batch (few rows, no excerpts, a tall viewport)
+     could strand the observer in an always-intersecting state with nothing left to trigger it. */
 (function () {
   var rows = document.querySelector('[data-fp-rows]');
   var pagerNav = document.querySelector('[data-fp-pager]');
@@ -382,28 +402,47 @@ main { padding: 2.4rem 0 3rem; }
       .then(function (html) {
         var doc = new DOMParser().parseFromString(html, 'text/html');
         var fetchedRows = doc.querySelector('[data-fp-rows]');
+        var firstNewRow = null;
         if (fetchedRows) {
           Array.prototype.slice.call(fetchedRows.children).forEach(function (li) {
-            rows.appendChild(document.adoptNode(li));
+            var adopted = document.adoptNode(li);
+            rows.appendChild(adopted);
+            if (!firstNewRow) firstNewRow = adopted;
           });
         }
-        history.replaceState(null, '', href);
-        pagerNav.hidden = true; // this fetch succeeded — enhancement is confirmed working
+        if (firstNewRow) {
+          // Name THIS batch's URL only once its own first row is actually in view.
+          var boundary = new IntersectionObserver(function (entries) {
+            if (entries.some(function (entry) { return entry.isIntersecting; })) {
+              history.replaceState(null, '', href);
+              boundary.disconnect();
+            }
+          });
+          boundary.observe(firstNewRow);
+        }
+        pagerNav.style.display = 'none'; // this fetch succeeded — enhancement is confirmed working
         var fetchedNext = doc.querySelector('[data-fp-next]');
+        busy = false;
         if (fetchedNext) {
           // Keep the (now-hidden) pager's own link truthful, so a LATER failure can
           // un-hide it pointing at the page that actually failed, not a stale one.
           nextEl.setAttribute('href', fetchedNext.getAttribute('href'));
+          // The append may not have pushed the sentinel out of the trigger margin (a short
+          // batch on a tall viewport) — re-check directly and keep chaining rather than
+          // waiting for an IntersectionObserver callback that a still-intersecting target
+          // will never receive. Only on success: a failure leaves the visible fallback pager
+          // in control instead of retrying in a loop.
+          var rect = sentinel.getBoundingClientRect();
+          if (rect.top < window.innerHeight + 400) loadNext();
         } else {
           nextEl = null; // exhausted — nothing further to fetch
           observer.disconnect();
         }
-        busy = false;
       })
       .catch(function () {
         // A network/server fault — fall back to the visible, manual pager (pointing at
         // whichever page actually failed) rather than silently stalling with no way forward.
-        pagerNav.hidden = false;
+        pagerNav.style.display = '';
         busy = false;
         observer.disconnect();
       });

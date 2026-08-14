@@ -6148,12 +6148,33 @@ async fn endless_scroll_script_present_in_built_in_theme() {
         "querySelector('[data-fp-next]')",
         "history.replaceState",
         "DOMParser",
+        // F7 (review findings C9/C12): the pager must be hidden via an inline style, never
+        // the `hidden` IDL attribute (a no-op against the theme's own `display: flex` rule).
+        "pagerNav.style.display = 'none'",
+        "pagerNav.style.display = ''",
+        // F8 (review finding C10): a successful append re-checks the sentinel directly rather
+        // than waiting on an IntersectionObserver callback a still-intersecting target will
+        // never receive.
+        "getBoundingClientRect",
+        // F9 (review finding C11): the URL flips at the batch's own first-row boundary, not
+        // when the fetch resolves — a second, one-shot IntersectionObserver.
+        "firstNewRow",
     ] {
         assert!(
             html.contains(needle),
             "endless-scroll script must reference {needle:?}; was:\n{html}"
         );
     }
+    // The doc comment above the script mentions "pagerNav.hidden = true" in BACKTICKED
+    // PROSE (explaining why the fix was needed) — a bare-substring check would be vacuous
+    // against that, the same class of bug the D2 aria_current tests already caught. The real
+    // (now-removed) buggy assignment always ended in a semicolon immediately, which the prose
+    // mention never does; check for THAT specific, code-only form instead.
+    assert!(
+        !html.contains("pagerNav.hidden = true;") && !html.contains("pagerNav.hidden = false;"),
+        "F7: the pager must never be hidden/shown via the `hidden` IDL attribute again (silent \
+         no-op against the theme's own `display: flex` rule); was:\n{html}"
+    );
 }
 
 /// The fellstone-site theme's OWN endless-scroll script — a real smoke-render against its
@@ -6183,12 +6204,33 @@ async fn endless_scroll_script_present_in_fellstone_theme() {
         "querySelector('[data-fp-next]')",
         "history.replaceState",
         "DOMParser",
+        // F7 (review findings C9/C12): the pager must be hidden via an inline style, never
+        // the `hidden` IDL attribute (a no-op against the theme's own `display: flex` rule).
+        "pagerNav.style.display = 'none'",
+        "pagerNav.style.display = ''",
+        // F8 (review finding C10): a successful append re-checks the sentinel directly rather
+        // than waiting on an IntersectionObserver callback a still-intersecting target will
+        // never receive.
+        "getBoundingClientRect",
+        // F9 (review finding C11): the URL flips at the batch's own first-row boundary, not
+        // when the fetch resolves — a second, one-shot IntersectionObserver.
+        "firstNewRow",
     ] {
         assert!(
             html.contains(needle),
             "fellstone's endless-scroll script must reference {needle:?}; was:\n{html}"
         );
     }
+    // The doc comment above the script mentions "pagerNav.hidden = true" in BACKTICKED
+    // PROSE (explaining why the fix was needed) — a bare-substring check would be vacuous
+    // against that, the same class of bug the D2 aria_current tests already caught. The real
+    // (now-removed) buggy assignment always ended in a semicolon immediately, which the prose
+    // mention never does; check for THAT specific, code-only form instead.
+    assert!(
+        !html.contains("pagerNav.hidden = true;") && !html.contains("pagerNav.hidden = false;"),
+        "F7: the pager must never be hidden/shown via the `hidden` IDL attribute again (silent \
+         no-op against the theme's own `display: flex` rule); was:\n{html}"
+    );
 }
 
 /// The endless-scroll script lives in the SHARED base chrome (present on every page, matching
