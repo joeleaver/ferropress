@@ -34,6 +34,7 @@ use serde::Serialize;
 
 use crate::content_index::ContentIndex;
 use crate::redirects::normalize_path;
+use crate::taxonomies::TaxonomySet;
 
 /// A defensive cap on how deep [`load_menus`] will descend when rebuilding a menu tree
 /// from stored parent links. Guards against externally-corrupted data forming a loop; set
@@ -95,9 +96,9 @@ impl MenuSet {
     /// theme renders — the ONE join of menu structure with the live [`ContentIndex`]. Pure
     /// and store-free (the cache-hit read path depends on it staying so).
     ///
-    /// Per item (see [`compose_node`]): a `Post`/`Page`/`Custom` target resolves to an href
-    /// (published-gated for content, scheme-allow-listed for a custom URL), a `Term` never
-    /// does this slice. An unresolvable LEAF is dropped; an unresolvable PARENT survives as a
+    /// Per item (see [`compose_node`]): a `Post`/`Page`/`Term`/`Custom` target resolves to an
+    /// href (published-gated for content, live-archive for a term, scheme-allow-listed for a
+    /// custom URL). An unresolvable LEAF is dropped; an unresolvable PARENT survives as a
     /// label-only entry keeping its subtree. `current_path` (the normalized request path, or
     /// `None` for a preview) marks the active item via EXACT normalized-path equality.
     ///
@@ -106,13 +107,14 @@ impl MenuSet {
     pub fn compose(
         &self,
         index: &ContentIndex,
+        taxonomies: &TaxonomySet,
         current_path: Option<&str>,
     ) -> BTreeMap<String, Vec<MenuItemCtx>> {
         let mut out = BTreeMap::new();
         for (location, forest) in &self.by_location {
             let items: Vec<MenuItemCtx> = forest
                 .iter()
-                .filter_map(|node| compose_node(node, index, current_path, 1))
+                .filter_map(|node| compose_node(node, index, taxonomies, current_path, 1))
                 .collect();
             if !items.is_empty() {
                 out.insert(location.clone(), items);
@@ -148,9 +150,14 @@ struct ResolvedTarget {
 }
 
 /// Resolve one [`LinkTarget`] to its live href, or `None` when it currently resolves to
-/// nothing (an unpublished/absent Post/Page, a `Term` this slice, or a `Custom` URL that
-/// fails the scheme allow-list — the defensive render-time half of the two-layer XSS guard).
-fn resolve_target(target: &LinkTarget, index: &ContentIndex) -> Option<ResolvedTarget> {
+/// nothing (an unpublished/absent Post/Page, a `Term` deleted since the item was saved, or a
+/// `Custom` URL that fails the scheme allow-list — the defensive render-time half of the
+/// two-layer XSS guard).
+fn resolve_target(
+    target: &LinkTarget,
+    index: &ContentIndex,
+    taxonomies: &TaxonomySet,
+) -> Option<ResolvedTarget> {
     match target {
         LinkTarget::Post { id } => index.post(*id).map(|e| ResolvedTarget {
             href: e.href.clone(),
@@ -160,9 +167,18 @@ fn resolve_target(target: &LinkTarget, index: &ContentIndex) -> Option<ResolvedT
             href: e.href.clone(),
             live_title: Some(e.title.clone()),
         }),
-        // Taxonomy terms have no archive URL until the taxonomy slice lands; this arm
-        // lights up unchanged then.
-        LinkTarget::Term { .. } => None,
+        // The term's own canonical archive href (the full ancestor chain) + its live name —
+        // same id/name split as Post/Page, resolved from the live TaxonomySet rather than the
+        // ContentIndex. A deleted term (or corrupt data) resolves to `None` exactly like a
+        // deleted Post/Page: a leaf drops, a parent-with-children survives as a label-only span.
+        LinkTarget::Term { id } => {
+            let name = taxonomies.term(*id)?.name.clone();
+            let href = taxonomies.archive_href(*id)?;
+            Some(ResolvedTarget {
+                href,
+                live_title: Some(name),
+            })
+        }
         LinkTarget::Custom { url } => sanitize_href(url).map(|href| ResolvedTarget {
             href,
             live_title: None,
@@ -180,6 +196,7 @@ fn resolve_target(target: &LinkTarget, index: &ContentIndex) -> Option<ResolvedT
 fn compose_node(
     node: &MenuNode,
     index: &ContentIndex,
+    taxonomies: &TaxonomySet,
     current_path: Option<&str>,
     depth: usize,
 ) -> Option<MenuItemCtx> {
@@ -198,11 +215,11 @@ fn compose_node(
     } else {
         node.children
             .iter()
-            .filter_map(|child| compose_node(child, index, current_path, depth + 1))
+            .filter_map(|child| compose_node(child, index, taxonomies, current_path, depth + 1))
             .collect()
     };
 
-    match resolve_target(&node.target, index) {
+    match resolve_target(&node.target, index, taxonomies) {
         Some(resolved) => {
             let label = if node.label.trim().is_empty() {
                 resolved
@@ -498,6 +515,7 @@ impl Default for MenuHandle {
 mod tests {
     use super::*;
     use crate::content_index::ContentIndexHandle;
+    use crate::taxonomies::{TaxonomyInfo, TermEntry};
     use ferropress_core::query::{Change, ChangeKind};
     use ferropress_core::value::ObjectId;
     use ferropress_core::{PAGE_TYPE, POST_TYPE};
@@ -520,6 +538,42 @@ mod tests {
             });
         }
         handle.current()
+    }
+
+    /// A taxonomy set with a root "Fiction" (id 5, `category`) and its child "Space Opera"
+    /// (id 6) — enough to exercise a term's live name, its own root href, AND a child's href
+    /// as the FULL ancestor chain (not just its own slug).
+    fn sample_taxonomies() -> TaxonomySet {
+        TaxonomySet::build(
+            [TaxonomyInfo {
+                id: 1,
+                key: "category".to_owned(),
+                label: "Category".to_owned(),
+                hierarchical: true,
+            }],
+            [
+                (
+                    5,
+                    TermEntry {
+                        taxonomy_key: "category".to_owned(),
+                        slug: "fiction".to_owned(),
+                        name: "Fiction".to_owned(),
+                        description: String::new(),
+                        parent: None,
+                    },
+                ),
+                (
+                    6,
+                    TermEntry {
+                        taxonomy_key: "category".to_owned(),
+                        slug: "space-opera".to_owned(),
+                        name: "Space Opera".to_owned(),
+                        description: String::new(),
+                        parent: Some(5),
+                    },
+                ),
+            ],
+        )
     }
 
     fn leaf(label: &str, target: LinkTarget) -> MenuNode {
@@ -547,7 +601,7 @@ mod tests {
                 ),
             ],
         )]);
-        let nav = set.compose(&index, Some("/hello"));
+        let nav = set.compose(&index, &TaxonomySet::default(), Some("/hello"));
         let primary = &nav["primary"];
         assert_eq!(primary[0].href.as_deref(), Some("/hello"));
         assert_eq!(primary[1].href.as_deref(), Some("/about"));
@@ -563,10 +617,13 @@ mod tests {
     #[test]
     fn an_unresolvable_leaf_is_dropped_but_a_parent_survives_as_a_span() {
         let index = sample_index();
+        // Term id 9 is absent from this (otherwise populated) taxonomy set — a deleted term
+        // whose menu item wasn't cleaned up, exactly like a deleted Post/Page.
+        let taxonomies = sample_taxonomies();
         let set = MenuSet::from_locations([(
             "primary".to_owned(),
             vec![
-                // Unresolvable leaf (a term, or a deleted page) → dropped.
+                // Unresolvable leaf (an unknown term id, or a deleted page) → dropped.
                 leaf("Ghost", LinkTarget::Term { id: 9 }),
                 // Unresolvable parent WITH a resolvable child → kept as a label-only span.
                 MenuNode {
@@ -577,7 +634,7 @@ mod tests {
                 },
             ],
         )]);
-        let nav = set.compose(&index, None);
+        let nav = set.compose(&index, &taxonomies, None);
         let primary = &nav["primary"];
         assert_eq!(primary.len(), 1, "the unresolvable leaf was dropped");
         assert_eq!(primary[0].label, "Reads");
@@ -600,7 +657,7 @@ mod tests {
                 ), // blank custom → its URL
             ],
         )]);
-        let nav = set.compose(&index, None);
+        let nav = set.compose(&index, &TaxonomySet::default(), None);
         assert_eq!(nav["primary"][0].label, "Hello Post");
         assert_eq!(nav["primary"][1].label, "/free-reads");
     }
@@ -618,7 +675,10 @@ mod tests {
             )],
         )]);
         // A lone unsafe leaf resolves to nothing → dropped → location omitted entirely.
-        assert!(set.compose(&index, None).is_empty());
+        assert!(
+            set.compose(&index, &TaxonomySet::default(), None)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -645,7 +705,7 @@ mod tests {
             };
         }
         let set = MenuSet::from_locations([("primary".to_owned(), vec![node])]);
-        let nav = set.compose(&index, None);
+        let nav = set.compose(&index, &TaxonomySet::default(), None);
 
         fn rendered_depth(items: &[MenuItemCtx]) -> usize {
             items
@@ -664,11 +724,87 @@ mod tests {
     #[test]
     fn an_empty_location_is_omitted_so_the_theme_falls_back() {
         let index = sample_index();
-        // A location bound to an all-unresolvable forest composes to nothing.
+        // A location bound to an all-unresolvable forest composes to nothing. Term id 9 is
+        // absent from this taxonomy set.
         let set = MenuSet::from_locations([(
             "footer".to_owned(),
             vec![leaf("Ghost", LinkTarget::Term { id: 9 })],
         )]);
-        assert!(!set.compose(&index, None).contains_key("footer"));
+        assert!(
+            !set.compose(&index, &sample_taxonomies(), None)
+                .contains_key("footer")
+        );
+    }
+
+    /// The Term arm's live resolution: a blank label falls back to the term's live NAME (the
+    /// same live_title fallback Post/Page already use), and a child term's href is the FULL
+    /// ancestor chain, not just its own slug — proving `resolve_target` calls
+    /// `TaxonomySet::archive_href`, not some shortcut that only handles roots.
+    #[test]
+    fn a_term_link_resolves_to_its_live_name_and_ancestor_chain_href() {
+        let index = sample_index();
+        let taxonomies = sample_taxonomies();
+        let set = MenuSet::from_locations([(
+            "primary".to_owned(),
+            vec![leaf("", LinkTarget::Term { id: 6 })],
+        )]);
+        let nav = set.compose(&index, &taxonomies, None);
+        let primary = &nav["primary"];
+        assert_eq!(
+            primary.len(),
+            1,
+            "a resolvable term link must not be dropped"
+        );
+        assert_eq!(
+            primary[0].label, "Space Opera",
+            "a blank label falls back to the term's live name"
+        );
+        assert_eq!(
+            primary[0].href.as_deref(),
+            Some("/category/fiction/space-opera"),
+            "a child term's href must be the full ancestor chain, not just its own slug"
+        );
+    }
+
+    /// An explicit menu-item label overrides the term's live name, identically to how it
+    /// already overrides a Post/Page's live title.
+    #[test]
+    fn a_term_link_keeps_an_explicit_label_override() {
+        let index = sample_index();
+        let taxonomies = sample_taxonomies();
+        let set = MenuSet::from_locations([(
+            "primary".to_owned(),
+            vec![leaf("Space Operas", LinkTarget::Term { id: 6 })],
+        )]);
+        let nav = set.compose(&index, &taxonomies, None);
+        assert_eq!(
+            nav["primary"][0].label, "Space Operas",
+            "an explicit item label must override the term's live name"
+        );
+    }
+
+    /// `aria_current` on a term link is EXACT normalized-path equality, not a prefix match —
+    /// the site-wide discipline [`href_is_current`] enforces for every target kind.
+    #[test]
+    fn a_term_links_aria_current_is_an_exact_path_match() {
+        let index = sample_index();
+        let taxonomies = sample_taxonomies();
+        let set = MenuSet::from_locations([(
+            "primary".to_owned(),
+            vec![leaf("Fiction", LinkTarget::Term { id: 5 })],
+        )]);
+
+        let on_archive = set.compose(&index, &taxonomies, Some("/category/fiction"));
+        assert!(
+            on_archive["primary"][0].aria_current,
+            "the term's own archive path must mark it current"
+        );
+
+        let on_child_archive =
+            set.compose(&index, &taxonomies, Some("/category/fiction/space-opera"));
+        assert!(
+            !on_child_archive["primary"][0].aria_current,
+            "EXACT-match: a descendant archive path must NOT mark the parent term current"
+        );
     }
 }

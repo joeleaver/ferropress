@@ -678,7 +678,7 @@ fn compose_single(
         site,
         is_home,
         preview_status,
-        nav: menus.compose(index, current_path),
+        nav: menus.compose(index, taxonomies, current_path),
         title: &page.title,
         dateline,
         kicker: None,
@@ -819,7 +819,7 @@ fn compose_front(
                 site: SiteCtx::from(settings),
                 is_home: true,
                 preview_status: None,
-                nav: menus.compose(index, current_path),
+                nav: menus.compose(index, taxonomies, current_path),
                 posts,
             };
 
