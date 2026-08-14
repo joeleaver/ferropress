@@ -5413,9 +5413,20 @@ async fn pager_hooks_present_in_fellstone_theme_markup() {
         .render(crate::templates::HOME_TEMPLATE, &page2)
         .expect("fellstone home.html must render the last page too");
     assert!(html2.contains("data-fp-pager"), "page 2: {html2}");
+    // Isolate the rendered pager `<nav>` — the D3 SCRIPT text (shared chrome, present on every
+    // page) also mentions "data-fp-next" as a selector string, so a whole-document check would
+    // be vacuous (the same class of bug the D2 aria_current tests already hit and fixed).
+    let nav_start = html2
+        .find("<nav class=\"pager\"")
+        .expect("the pager nav must render");
+    let nav_end = html2[nav_start..]
+        .find("</nav>")
+        .map(|i| nav_start + i + "</nav>".len())
+        .unwrap();
+    let pager_nav = &html2[nav_start..nav_end];
     assert!(
-        !html2.contains("data-fp-next"),
-        "the LAST page has no older link, so no data-fp-next; page 2: {html2}"
+        !pager_nav.contains("data-fp-next"),
+        "the LAST page has no older link, so its pager nav must carry no data-fp-next; nav was: {pager_nav}"
     );
 }
 
@@ -5528,4 +5539,93 @@ async fn archive_page_2_nav_item_is_not_current() {
         !fiction_link.contains("aria-current"),
         "the Fiction nav item must NOT be current on page 2 (EXACT-match against .../page/2, not the base); link was: {fiction_link}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// D3: the endless-scroll progressive-enhancement script
+// ---------------------------------------------------------------------------
+
+/// The built-in theme's endless-scroll script SHIPS and references the SAME D3 hooks the D2
+/// pager markup carries — a static (non-runtime) check that the script is present and wired
+/// to the right selectors. The actual scroll/fetch/append BEHAVIOR is a browser-only concern,
+/// out of a Rust unit test's reach (verified ad hoc with a real browser instead).
+#[tokio::test]
+async fn endless_scroll_script_present_in_built_in_theme() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, blobs, theme) = boot(tmp.path());
+    for slug in ["p1", "p2", "p3"] {
+        seed_post(&store, slug, Status::Published).await;
+    }
+    let mut settings = SiteSettings::defaults();
+    settings.posts_per_page = 2;
+
+    let html = match serve_path(
+        &store,
+        &blobs,
+        &theme,
+        &NoCustomBlocks,
+        &settings,
+        &AuthorDirectory::default(),
+        &crate::MenuSet::default(),
+        &crate::ContentIndex::default(),
+        &crate::TaxonomySet::default(),
+        "/",
+    )
+    .await
+    {
+        crate::Resolved::Found(h) => h,
+        other => panic!("expected Found, got {other:?}"),
+    };
+
+    for needle in [
+        "IntersectionObserver",
+        "querySelector('[data-fp-rows]')",
+        "querySelector('[data-fp-pager]')",
+        "querySelector('[data-fp-next]')",
+        "history.replaceState",
+        "DOMParser",
+    ] {
+        assert!(
+            html.contains(needle),
+            "endless-scroll script must reference {needle:?}; was:\n{html}"
+        );
+    }
+}
+
+/// The fellstone-site theme's OWN endless-scroll script — a real smoke-render against its
+/// actual template files, the same "registered ⇒ renderable" discipline `ThemeRegistry::
+/// load_dir` enforces at boot.
+#[tokio::test]
+async fn endless_scroll_script_present_in_fellstone_theme() {
+    let registry = crate::themes::ThemeRegistry::load_dir(std::path::Path::new(
+        "/home/joe/dev/fellstone-site/theme",
+    ));
+    let engine = registry
+        .build("fellstone")
+        .expect("the fellstone theme must build");
+    let ctx = serde_json::json!({
+        "page_title": "Sample", "page_description": null, "canonical": null,
+        "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
+        "is_home": true, "preview_status": null, "nav": {},
+        "archive": null,
+        "pager": {"older": "/page/2", "newer": null, "page": 1, "total_pages": 2},
+        "posts": [{"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}],
+    });
+    let html = engine
+        .render(crate::templates::HOME_TEMPLATE, &ctx)
+        .expect("fellstone home.html must render");
+
+    for needle in [
+        "IntersectionObserver",
+        "querySelector('[data-fp-rows]')",
+        "querySelector('[data-fp-pager]')",
+        "querySelector('[data-fp-next]')",
+        "history.replaceState",
+        "DOMParser",
+    ] {
+        assert!(
+            html.contains(needle),
+            "fellstone's endless-scroll script must reference {needle:?}; was:\n{html}"
+        );
+    }
 }

@@ -342,6 +342,70 @@ main { padding: 2.4rem 0 3rem; }
     });
   });
 })();
+/* Endless-scroll enhancement (progressive enhancement over the structural /page/{n} pager
+   above — that pager is BOTH the no-JS/crawler fallback and this script's fetch source; no
+   separate endpoint). Works identically on the home galley and a term archive, since both
+   share this template and its data-fp-* hooks. An IntersectionObserver sentinel placed just
+   above the pager fetches the OLDER page's HTML (same-origin, plain GET), lifts its
+   [data-fp-rows] children into THIS page's own list, and advances to THAT fetched page's own
+   [data-fp-next] href — so scrolling can walk arbitrarily many pages, one fetch at a time.
+   The pager hides once enhancement takes over (nothing left to click) and reappears only if a
+   fetch fails (graceful degrade back to manual pagination); it stays hidden once the listing
+   is legitimately exhausted (the fetched page carried no further [data-fp-next]). Never steals
+   focus — appended rows are inert, static content, exactly like the ones already on the page. */
+(function () {
+  var rows = document.querySelector('[data-fp-rows]');
+  var pagerNav = document.querySelector('[data-fp-pager]');
+  var nextEl = document.querySelector('[data-fp-next]');
+  if (!rows || !pagerNav || !nextEl || typeof IntersectionObserver === 'undefined') return;
+  var nextHref = nextEl.getAttribute('href');
+
+  var sentinel = document.createElement('div');
+  pagerNav.insertAdjacentElement('beforebegin', sentinel);
+  pagerNav.hidden = true;
+
+  var busy = false;
+
+  function loadNext() {
+    if (busy || !nextHref) return;
+    busy = true;
+    fetch(nextHref, { headers: { 'Accept': 'text/html' } })
+      .then(function (res) {
+        if (!res.ok) throw new Error('fp-scroll: ' + res.status);
+        return res.text();
+      })
+      .then(function (html) {
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+        var fetchedRows = doc.querySelector('[data-fp-rows]');
+        if (fetchedRows) {
+          Array.prototype.slice.call(fetchedRows.children).forEach(function (li) {
+            rows.appendChild(document.adoptNode(li));
+          });
+        }
+        history.replaceState(null, '', nextHref);
+        var fetchedNext = doc.querySelector('[data-fp-next]');
+        nextHref = fetchedNext ? fetchedNext.getAttribute('href') : null;
+        busy = false;
+        if (!nextHref) observer.disconnect();
+      })
+      .catch(function () {
+        // A network/server fault — fall back to the visible, manual pager rather than
+        // silently stalling with no way forward.
+        pagerNav.hidden = false;
+        nextHref = null;
+        busy = false;
+        observer.disconnect();
+      });
+  }
+
+  var observer = new IntersectionObserver(
+    function (entries) {
+      if (entries.some(function (entry) { return entry.isIntersecting; })) loadNext();
+    },
+    { rootMargin: '400px' },
+  );
+  observer.observe(sentinel);
+})();
 {% endraw %}</script>
 <script type="module">
 import init from '/_fp/islands/ferropress_islands.js';
