@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ferropress · Taxonomies (mockup)</title>
+<!--
+  HTML-first mockup for taxonomy Increment 3 — the admin surfaces for categories + tags, in the
+  established "composing room" letterpress identity (tokens/classes lifted from
+  crates/ferropress-admin/src/styles.rs, crates/ferropress-admin/design/mockup.html and
+  menus-mockup.html). This is a DESIGN DOCUMENT, not an interactive prototype like
+  menus-mockup.html: the taxonomy slice's hard problems are already solved (SDL, CRUD, serving —
+  see the ferropress-taxonomy-design memory) and settled by inc3-design-ruling.md; this file's job
+  is to nail the VISUAL LANGUAGE and lay out every state a reviewer needs to see side by side,
+  including several that only exist after a failed request. Interactive JS is therefore minimal:
+  one breakpoint toggle (the thing this file is asked to settle) and nothing else. Every other
+  "state" is simply a separate, permanently-visible section — closer to a printed proof sheet than
+  a live app.
+
+  Five surfaces, in reading order:
+    §A Post editor — the Categories + Tags panels, at both the normal (below-sheet) and wide
+       (aside-rail) layouts (settles SF5).
+    §B Panel states — loading / error / empty-vocabulary / a rejected chip after a failed save.
+    §C View::Terms — the taxonomy switcher + flat depth-indented term list (Categories, then Tags).
+    §D View::TermEditor — Name/Slug/Description/Parent/Delete, editing "Sea Stories".
+    §E The menu-item picker's Categories + Tags tabs (5 tabs total; Categories shown active).
+
+  Sample content is a neutral nautical-press vocabulary (Dispatches, Fiction > Sea Stories > …,
+  Engine Room, Tide Tables; tags like galley-proofs, letterpress, salt-spray) — no consumer-site
+  names anywhere in this file.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper:      #EEEFEA;
+    --paper-sink: #E5E6E0;
+    --paper-raise:#F5F6F1;
+    --ink:        #17191C;
+    --ink-2:      #383B40;
+    --steel:      #6B6F76;
+    --steel-2:    #9CA0A6;
+    --rule:       #D3D4CD;
+    --rule-ink:   #2C2F34;
+    --minium:     #C23A18;
+    --minium-hi:  #D6431E;
+    --minium-deep:#9A2E11;
+    --ochre:      #8A6412;
+    --green:      #2E6A4E;
+    --steel-tag:  #566069;
+
+    --measure: 34rem;
+    --radius: 3px;
+    --shadow: 0 1px 0 var(--rule), 0 12px 32px -20px rgba(23,25,28,.4);
+    --ff-display: "Zilla Slab", Georgia, serif;
+    --ff-ui: "IBM Plex Sans", system-ui, sans-serif;
+    --ff-mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+  body {
+    background: var(--paper);
+    color: var(--ink-2);
+    font-family: var(--ff-ui);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; }
+  button { font-family: inherit; cursor: pointer; }
+
+  .ruler { height: 6px; background-image: repeating-linear-gradient(90deg, var(--rule-ink) 0 1px, transparent 1px 12px); opacity: .5; }
+  .regmark { display: inline-flex; align-items: center; color: var(--minium); }
+  .regmark svg { display: block; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+  /* ── DOC CHROME (this file's own shell — not part of the product) ──────── */
+  .dochead { background: var(--ink); color: #E7E8E2; padding: 1.5rem 1.5rem 1.3rem; }
+  .dochead__title { font-family: var(--ff-display); font-weight: 700; font-size: 1.5rem; color: #F3F4EE; margin: 0 0 .3rem; letter-spacing: .01em; }
+  .dochead__sub { font-family: var(--ff-mono); font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; color: #9CA0A6; margin: 0 0 1rem; max-width: 46rem; line-height: 1.6; text-transform: none; }
+  .dochead__nav { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .dochead__nav a { font-family: var(--ff-mono); font-size: .72rem; letter-spacing: .04em; color: #C7CACF; text-decoration: none; padding: .32rem .65rem; border: 1px solid #3A3D42; border-radius: 2px; }
+  .dochead__nav a:hover { color: #fff; border-color: #5A5D62; }
+
+  .docsection { max-width: 68rem; margin: 0 auto; padding: 2.75rem 1.25rem 1.25rem; border-top: 1px solid var(--rule); }
+  .docsection:first-of-type { border-top: 0; }
+  .docsection__eyebrow { font-family: var(--ff-mono); font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--minium-deep); margin: 0 0 .3rem; }
+  .docsection__title { font-family: var(--ff-display); font-weight: 600; font-size: 1.65rem; color: var(--ink); margin: 0 0 .5rem; }
+  .docsection__desc { color: var(--steel); font-size: .92rem; max-width: 46rem; margin: 0 0 1.4rem; }
+  .docsection__desc code { font-family: var(--ff-mono); font-size: .85em; background: var(--paper-sink); padding: .05em .3em; border-radius: 2px; }
+
+  .designnote { margin: 1.1rem 0; padding: .85rem 1.05rem; border: 1px dashed var(--minium); border-radius: var(--radius); background: #FBF2EE; color: var(--ink-2); font-size: .85rem; line-height: 1.55; max-width: 46rem; }
+  .designnote strong { color: var(--minium-deep); }
+  .designnote__label { display: block; font-family: var(--ff-mono); font-size: .64rem; letter-spacing: .12em; text-transform: uppercase; color: var(--minium-deep); margin-bottom: .4rem; }
+  .designnote--quiet { border-color: var(--steel-2); background: var(--paper-raise); }
+  .designnote--quiet .designnote__label { color: var(--steel); }
+
+  .statesgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(15.5rem, 1fr)); gap: 1.1rem; align-items: start; }
+  .stateslabel { font-family: var(--ff-mono); font-size: .66rem; letter-spacing: .1em; text-transform: uppercase; color: var(--steel); margin: 0 0 .5rem; }
+
+  /* ── SHARED APP CHROME (verbatim from styles.rs) ─────────────────────── */
+  .masthead { background: var(--ink); color: #E7E8E2; border-bottom: 1px solid #000; }
+  .masthead__bar { display: flex; align-items: center; gap: 1rem; padding: 0 1.25rem; height: 52px; max-width: 68rem; margin: 0 auto; flex-wrap: wrap; }
+  .masthead__brand { display: flex; align-items: center; gap: .5rem; font-family: var(--ff-display); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: 1.02rem; color: #F3F4EE; }
+  .masthead__sep { color: #4A4D53; }
+  .masthead__here { color: #A9ADB2; font-weight: 500; font-size: .9rem; }
+  .masthead__spacer { flex: 1; }
+  .masthead .btn--quiet { color: #A9ADB2; }
+  .masthead .btn--quiet:hover { color: #fff; }
+  .masthead .btn--quiet.is-current { color: #F3F4EE; font-weight: 500; cursor: default; }
+
+  .wrap { max-width: 68rem; margin: 0 auto; padding: 1.6rem 1.25rem 3rem; }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; padding: .55rem 1.05rem; border: 1px solid transparent; border-radius: var(--radius); font-weight: 600; font-size: .9rem; letter-spacing: .02em; transition: background .15s, color .15s, border-color .15s; }
+  .btn:active { transform: translateY(1px); }
+  .btn--primary { background: var(--minium); color: #FCF6F2; box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 0 var(--minium-deep); }
+  .btn--primary:hover { background: var(--minium-hi); }
+  .btn--ghost { background: transparent; color: var(--ink-2); border-color: var(--rule); }
+  .btn--ghost:hover { background: var(--paper-sink); border-color: var(--steel-2); }
+  .btn--quiet { background: transparent; color: var(--steel); padding: .4rem .5rem; }
+  .btn--quiet:hover { color: var(--ink); }
+  .btn--danger { background: transparent; color: var(--minium-deep); border-color: #D8C4BC; }
+  .btn--danger:hover { background: #F3E7E2; border-color: var(--minium); }
+  .btn:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--minium); outline-offset: 2px; }
+
+  .input { width: 100%; padding: .5rem .65rem; background: var(--paper-sink); border: 1px solid var(--rule); border-bottom: 2px solid #C6C7C0; border-radius: var(--radius); color: var(--ink); font-family: var(--ff-ui); font-size: .92rem; }
+  .input:focus { outline: none; background: var(--paper-raise); border-color: var(--steel); border-bottom-color: var(--minium); }
+  .input--mono { font-family: var(--ff-mono); font-size: .85rem; }
+  .input::placeholder { color: var(--steel-2); }
+  textarea.input { resize: vertical; min-height: 5rem; font-family: var(--ff-ui); }
+
+  .select { font-family: var(--ff-mono); font-size: .85rem; padding: .4rem 1.7rem .4rem .65rem; border: 1px solid var(--rule); border-radius: var(--radius); color: var(--ink);
+    background: var(--paper-sink) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'><path d='M1 1l4 4 4-4' stroke='%236B6F76' stroke-width='1.5' fill='none'/></svg>") no-repeat right .6rem center;
+    appearance: none; -webkit-appearance: none; width: 100%; max-width: 28rem; }
+  .select:focus { outline: none; border-color: var(--minium); }
+
+  .field { margin-bottom: 1rem; }
+  .field > label { display: block; font-size: .72rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--steel); margin-bottom: .4rem; }
+  .field__help { margin: .5rem 0 0; font-size: .82rem; line-height: 1.5; color: var(--steel); max-width: 32rem; }
+
+  .panel { background: var(--paper-raise); border: 1px solid var(--rule); border-radius: var(--radius); box-shadow: var(--shadow); padding: 1.3rem 1.5rem; margin-bottom: 1.3rem; }
+  .panel__title { font-family: var(--ff-display); font-weight: 600; font-size: 1.15rem; color: var(--ink); margin: 0 0 .2rem; padding-bottom: .65rem; border-bottom: 2px solid var(--ink); }
+  .panel__note { margin: .6rem 0 0; font-size: .82rem; color: var(--steel); }
+
+  .galley__head { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 2px solid var(--ink); padding-bottom: .6rem; margin-bottom: 1rem; flex-wrap: wrap; gap: .5rem; }
+  .galley__title { font-family: var(--ff-display); font-weight: 600; font-size: 1.6rem; color: var(--ink); margin: 0; }
+  .galley__count { font-family: var(--ff-mono); font-size: .78rem; letter-spacing: .1em; text-transform: uppercase; color: var(--steel); }
+
+  .stamp { font-family: var(--ff-mono); font-size: .68rem; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; padding: .18rem .5rem; border-radius: 2px; border: 1.5px solid currentColor; white-space: nowrap; }
+  .stamp--draft { color: var(--ochre); border-style: dashed; }
+
+  .editor__meta { display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap; padding-bottom: 1rem; margin-bottom: 1rem; border-bottom: 1px solid var(--rule); }
+  .metaitem { display: flex; align-items: center; gap: .55rem; }
+  .metaitem > label { font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--steel); }
+  .slugbox { display: inline-flex; align-items: center; background: var(--paper-sink); border: 1px solid var(--rule); border-radius: var(--radius); padding: .3rem .5rem; font-family: var(--ff-mono); font-size: .85rem; color: var(--ink); }
+  .slugbox__host { color: var(--steel-2); }
+
+  .sheet { background: var(--paper-raise); border: 1px solid var(--rule); border-radius: var(--radius); box-shadow: var(--shadow); padding: 2.2rem; }
+  .sheet__inner { max-width: var(--measure); margin: 0 auto; }
+  .doc { font-family: var(--ff-display); color: var(--ink); }
+  .doc h1 { font-size: 1.8rem; font-weight: 700; line-height: 1.14; margin: 0 0 .9rem; }
+  .doc p { font-size: 1.05rem; line-height: 1.6; margin: 0 0 1rem; color: var(--ink-2); }
+  .doc p.stub { color: var(--steel-2); font-style: italic; }
+
+  /* ── SETTINGS-STYLE SET LINE (reused for the picker/candidate parity note) */
+  .setrow { display: grid; grid-template-columns: 13rem 1fr; gap: .4rem 1.6rem; align-items: start; padding: 1rem 0; border-bottom: 1px solid var(--rule); }
+  .setrow:last-child { border-bottom: 0; }
+  .setrow__label { font-size: .78rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--steel); padding-top: .5rem; }
+  .setrow__control { min-width: 0; }
+  .setrow__help { grid-column: 2; margin: .45rem 0 0; font-size: .82rem; line-height: 1.4; color: var(--steel); max-width: 32rem; }
+  @media (max-width: 640px) { .setrow { grid-template-columns: 1fr; gap: .3rem; } .setrow__label { padding-top: 0; } .setrow__help { grid-column: 1; } }
+
+  /* ══════════════════════════════════════════════════════════════════════
+     NEW: §A taxonomy panels — chips, checklist, token-input combobox
+     ══════════════════════════════════════════════════════════════════════ */
+  .chipline { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 .7rem; min-height: 1.9rem; }
+  .chip {
+    display: inline-flex; align-items: center; gap: .4rem; padding: .28rem .35rem .28rem .7rem;
+    background: var(--paper-sink); border: 1px solid var(--rule); border-radius: 999px;
+    font-family: var(--ff-ui); font-size: .88rem; color: var(--ink-2); line-height: 1.2; max-width: 100%;
+  }
+  .chip small { font-family: var(--ff-mono); font-size: .64rem; letter-spacing: .03em; color: var(--steel); white-space: nowrap; }
+  .chip--new { border-style: dashed; border-color: #C6B27A; color: var(--ochre); background: transparent; }
+  .chip--new small { color: var(--ochre); }
+  .chip--oov { border-style: dashed; border-color: var(--steel-2); color: var(--steel); background: transparent; }
+  .chip--oov small { color: var(--steel-2); }
+  .chip--rejected { border-color: var(--minium); color: var(--minium-deep); background: #F3E7E2; }
+  .chip--rejected small { color: var(--minium-deep); }
+  .chip__x { width: 16px; height: 16px; flex: none; display: inline-flex; align-items: center; justify-content: center; border: 0; background: transparent; border-radius: 50%; color: var(--steel); font-size: .82rem; line-height: 1; padding: 0; }
+  .chip__x:hover { background: var(--paper); color: var(--minium-deep); }
+  .chip--rejected .chip__x:hover { background: #EAD2C8; }
+
+  /* Categories: fieldset > legend, search, chip line, fixed-height checklist. */
+  .termcheck { border: 0; margin: 0; padding: 0; }
+  .termcheck__legend { font-size: .78rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--steel); padding: 0; margin: 0 0 .7rem; }
+  .termcheck__search { margin-bottom: .7rem; }
+  .termcheck__scroll { max-height: 16rem; overflow-y: auto; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--paper-sink); padding: .35rem; }
+  .termcheck__row { display: flex; align-items: center; gap: .55rem; padding: .42rem .5rem; border-radius: 2px; cursor: pointer; font-size: .92rem; color: var(--ink-2); }
+  .termcheck__row:hover { background: var(--paper-raise); }
+  .termcheck__row input { accent-color: var(--minium); width: 1rem; height: 1rem; margin: 0; flex: none; }
+  .termcheck__row:has(input:focus-visible) { outline: 2px solid var(--minium); outline-offset: -2px; background: var(--paper-raise); }
+  .termcheck__row--ctx { color: var(--steel); font-style: italic; }
+  .termcheck__row--ctx .termcheck__name { font-style: italic; }
+  .termcheck__row--match .termcheck__name { font-weight: 500; color: var(--ink); }
+  .termcheck__count { margin-left: auto; font-family: var(--ff-mono); font-size: .68rem; color: var(--steel-2); }
+
+  /* Tags: chip line + token input (the whole shell gets a focus-within ring) + combobox list. */
+  .tokenfield { border: 1px solid transparent; border-radius: var(--radius); padding: .25rem; margin: 0 -.25rem; position: relative; }
+  .tokenfield:focus-within { outline: 2px solid var(--minium); outline-offset: 1px; }
+  .tokenfield__input { max-width: 100%; }
+  .combobox__list { list-style: none; margin: .35rem 0 0; padding: .3rem; background: var(--paper-raise); border: 1px solid var(--rule); border-radius: var(--radius); box-shadow: var(--shadow); max-height: 13rem; overflow-y: auto; }
+  .combobox__opt { padding: .42rem .6rem; border-radius: 2px; font-size: .9rem; color: var(--ink-2); cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: .6rem; }
+  .combobox__opt.is-active { background: var(--minium); color: #FCF6F2; }
+  .combobox__opt.is-active .combobox__hint { color: #F3D9CD; }
+  .combobox__hint { font-family: var(--ff-mono); font-size: .68rem; letter-spacing: .04em; text-transform: uppercase; color: var(--steel); }
+  .combobox__meta { font-family: var(--ff-mono); font-size: .68rem; margin: .45rem .2rem 0; color: var(--steel-2); letter-spacing: .04em; }
+
+  .panelstate { padding: .9rem .2rem; color: var(--steel); font-family: var(--ff-mono); font-size: .8rem; letter-spacing: .03em; }
+  .panelerror { padding: .65rem .75rem; margin: 0; color: var(--minium-deep); background: #F3E7E2; border: 1px solid #D8C4BC; border-radius: var(--radius); font-size: .85rem; line-height: 1.5; }
+
+  /* Below-sheet (normal width) vs aside-rail (wide) — the SF5 breakpoint under test. */
+  .bptoggle { display: flex; align-items: center; gap: .7rem; margin-bottom: 1.1rem; flex-wrap: wrap; }
+  .bptoggle__label { font-family: var(--ff-mono); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--steel); }
+  /* No overflow:hidden here — it would become the nearest ancestor with a scroll
+     mechanism and silently break .editor__aside's position:sticky below. */
+  .bpframe { border: 1px dashed var(--steel-2); border-radius: var(--radius); margin: 0 auto; background: var(--paper); transition: max-width .28s ease; }
+  .bpframe--normal { max-width: 46rem; }
+  .bpframe--wide { max-width: 76rem; }
+  .bpframe__inner { padding: 1.5rem; }
+  .bpframe__tag { display: block; text-align: center; font-family: var(--ff-mono); font-size: .64rem; letter-spacing: .1em; text-transform: uppercase; color: var(--steel-2); padding: .35rem; background: var(--paper-sink); border-bottom: 1px dashed var(--steel-2); }
+
+  .editor__body { display: block; }
+  .editor__body.is-wide { display: grid; grid-template-columns: 1fr 19rem; gap: 1.75rem; align-items: start; }
+  .editor__below { margin-top: 1.4rem; }
+  .editor__aside { display: none; }
+  .editor__body.is-wide .editor__below { display: none; }
+  .editor__body.is-wide .editor__aside { display: block; position: sticky; top: 1rem; }
+  .editor__aside .panel:last-child, .editor__below .panel:last-child { margin-bottom: 0; }
+
+  /* ── §C View::Terms — term list rows (no reorder handles: terms carry no ordinal) ─ */
+  .trow { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 1rem; padding: .75rem .5rem; border-bottom: 1px solid var(--rule); }
+  .trow:last-child { border-bottom: 0; }
+  .trow__name { font-family: var(--ff-display); font-weight: 500; font-size: 1.05rem; color: var(--ink); }
+  .trow__slug { display: block; font-family: var(--ff-mono); font-size: .72rem; color: var(--steel); margin-top: .1rem; }
+  .trow__count { font-family: var(--ff-mono); font-size: .78rem; color: var(--steel); white-space: nowrap; text-align: right; }
+  .trow__countlabel { display: block; font-size: .6rem; letter-spacing: .08em; text-transform: uppercase; color: var(--steel-2); margin-top: .15rem; }
+  .trow__edit { font-size: .82rem; font-weight: 600; color: var(--steel); background: transparent; border: 0; padding: .3rem .2rem; }
+  .trow:hover .trow__edit { color: var(--minium-deep); }
+  .emptytree { padding: 1.6rem; text-align: center; color: var(--steel); border: 1px dashed var(--rule); border-radius: var(--radius); }
+
+  /* ── §E the picker modal (media-modal chrome, per menus-mockup.html) ────── */
+  .modal { position: relative; z-index: 1; display: grid; place-items: center; padding: 0; background: transparent; }
+  .modal__scrim { position: absolute; inset: -1.4rem; background: rgba(23,25,28,.55); border-radius: var(--radius); z-index: -1; }
+  .modal__plate { width: 100%; max-width: 40rem; display: flex; flex-direction: column; background: var(--paper-raise); border: 1px solid var(--rule); border-radius: var(--radius); box-shadow: 0 24px 60px -18px rgba(0,0,0,.55); }
+  .modal__head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 1.1rem 1.3rem .7rem; border-bottom: 2px solid var(--ink); }
+  .modal__title { font-family: var(--ff-display); font-weight: 600; font-size: 1.2rem; color: var(--ink); margin: 0; }
+  .modal__body { padding: 1rem 1.3rem; max-height: 26rem; overflow: auto; }
+  .modal__foot { display: flex; align-items: center; justify-content: flex-end; gap: .6rem; padding: .8rem 1.3rem; border-top: 1px solid var(--rule); }
+  .tabs { display: inline-flex; gap: .3rem; margin-bottom: .8rem; flex-wrap: wrap; }
+  .tab { padding: .35rem .8rem; border: 1px solid var(--rule); border-radius: 2px; background: transparent; font-family: var(--ff-mono); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--steel); }
+  .tab.is-on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .pickerfield { margin-bottom: .8rem; }
+  .pickerfield > label { display: block; font-size: .7rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--steel); margin-bottom: .35rem; }
+  .candidate { display: flex; align-items: center; gap: .6rem; width: 100%; text-align: left; padding: .5rem .6rem; background: transparent; border: 0; border-bottom: 1px solid var(--rule); color: inherit; font: inherit; }
+  .candidate:hover { background: var(--paper-sink); }
+  .candidate.is-selected { background: var(--paper-sink); }
+  .candidate.is-added { cursor: default; opacity: .55; }
+  .candidate__check { flex: 0 0 auto; width: 1.15rem; font-size: 1rem; line-height: 1; color: var(--steel); }
+  .candidate.is-selected .candidate__check { color: var(--minium-deep); }
+  .candidate.is-added .candidate__check { color: var(--green); }
+  .candidate__title { flex: 1 1 auto; font-family: var(--ff-display); font-size: 1rem; color: var(--ink); }
+  .candidate__slug { flex: 0 0 auto; font-family: var(--ff-mono); font-size: .72rem; color: var(--steel); }
+  .candidate__addednote { flex: 0 0 auto; font-family: var(--ff-mono); font-size: .64rem; letter-spacing: .06em; text-transform: uppercase; color: var(--green); }
+  .pickerempty { padding: 1.4rem .6rem; text-align: center; color: var(--steel); font-family: var(--ff-mono); font-size: .8rem; letter-spacing: .03em; }
+
+  @media (max-width: 640px) {
+    .sheet { padding: 1.4rem; }
+    .doc h1 { font-size: 1.5rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div class="ruler"></div>
+<header class="dochead">
+  <h1 class="dochead__title">Taxonomies — Increment 3 design mockup</h1>
+  <p class="dochead__sub">Categories checklist · tags token-input · View::Terms · TermEditor · the menu picker's Categories/Tags tabs. Settles the inc3-design-ruling.md layout question (SF5) and gives every SF6/SF7/SF9/SF13 state a concrete visual. Sample vocabulary is a neutral nautical-press set — no consumer-site names.</p>
+  <nav class="dochead__nav" aria-label="Sections">
+    <a href="#sec-a">§A Editor panels</a>
+    <a href="#sec-b">§B Panel states</a>
+    <a href="#sec-c">§C View::Terms</a>
+    <a href="#sec-d">§D TermEditor</a>
+    <a href="#sec-e">§E Picker tabs</a>
+    <a href="#sec-notes">Implementation notes</a>
+  </nav>
+</header>
+
+<!-- ══════════════════════════ §A POST EDITOR — TAXONOMY PANELS ══════════════════════════ -->
+<section class="docsection" id="sec-a">
+  <p class="docsection__eyebrow">§A · settles SF5</p>
+  <h2 class="docsection__title">Post editor — Categories &amp; Tags panels</h2>
+  <p class="docsection__desc">Two layouts, same markup, toggled by viewport width — <strong>not</strong> two designs to pick between. Panels never join <code>.editor__meta</code> (that strip is a one-line flex row; a 16rem scroller inside it would blow out on every chip wrap). They render as <code>.panel</code>/<code>.setrow</code>-family blocks, mounted below the sheet at normal widths and promoted to a right-hand <code>.editor__aside</code> rail once there's room.</p>
+
+  <div class="bptoggle">
+    <span class="bptoggle__label">Viewport:</span>
+    <button class="btn btn--ghost" id="bpNormalBtn" type="button" aria-pressed="true">Normal width (below sheet)</button>
+    <button class="btn btn--ghost" id="bpWideBtn" type="button" aria-pressed="false">Wide (aside rail, ≥1280px)</button>
+  </div>
+
+  <div class="bpframe bpframe--normal" id="bpFrame">
+    <span class="bpframe__tag" id="bpFrameTag">≈736px — panels stack below the sheet</span>
+    <div class="bpframe__inner">
+      <header class="masthead" style="margin: -1.5rem -1.5rem 1.5rem; border-radius: var(--radius) var(--radius) 0 0;">
+        <div class="masthead__bar" style="height:auto; padding: .7rem 1.1rem;">
+          <button class="btn btn--quiet" type="button" style="padding:.3rem .4rem">← Posts</button>
+          <span class="masthead__sep">·</span>
+          <span class="masthead__here">A Squall Off Cape Horn</span>
+          <span class="masthead__spacer"></span>
+          <button class="btn btn--primary" type="button" style="padding:.5rem .9rem">Save</button>
+        </div>
+      </header>
+
+      <div class="editor__meta">
+        <div class="metaitem"><label>Slug</label><span class="slugbox"><span class="slugbox__host">/</span>a-squall-off-cape-horn</span></div>
+        <div class="metaitem"><label>Status</label><span class="stamp stamp--draft">Draft</span></div>
+      </div>
+
+      <div class="editor__body" id="editorBody">
+        <div class="sheet">
+          <div class="sheet__inner">
+            <div class="doc">
+              <h1>A Squall Off Cape Horn</h1>
+              <p>The barometer had been falling since noon, and by four bells the mate had already doubled the watch. Grey water climbed the rail in long, unhurried swells, the kind that promise more than they show.</p>
+              <p>We took in the topgallants before the light went, and it was well we did — the wind came round out of the southwest inside the hour, and with it a sea that turned the whole ship into a single working animal, every line and timber straining together.</p>
+              <p>There is a particular quiet that settles over a crew in weather like that. No one speaks beyond what the work requires. The bosun's calls carry further than they should, flattened by the wind into something almost conversational.</p>
+              <p>By the middle watch the squall had blown itself out as quickly as it came, leaving the sea confused and the sky scrubbed clean. Cape Horn does that — gives you an hour to remember it by and calls it even.</p>
+              <p class="stub">(sheet lengthened here on purpose, to demonstrate the aside rail's sticky behaviour below — see mockup.html for the real editor chrome and toolbar, which this mockup deliberately omits)</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Normal-width slot: panels stacked below the sheet. -->
+        <div class="editor__below" id="editorBelow">
+          <!-- CATEGORIES -->
+          <div class="panel">
+            <fieldset class="termcheck" aria-describedby="cat-note-a">
+              <legend class="termcheck__legend">Categories</legend>
+              <div class="chipline" aria-label="Assigned categories">
+                <span class="chip">Sea Stories<button class="chip__x" type="button" aria-label="Remove Sea Stories">✕</button></span>
+                <span class="chip chip--oov">Wreck Reports <small>(unavailable)</small><button class="chip__x" type="button" aria-label="Remove Wreck Reports">✕</button></span>
+              </div>
+              <div class="termcheck__search">
+                <input class="input" type="search" value="sea" aria-label="Filter categories" placeholder="Filter categories…" />
+              </div>
+              <div class="termcheck__scroll">
+                <label class="termcheck__row termcheck__row--ctx"><input type="checkbox" /><span class="termcheck__name">Fiction</span></label>
+                <label class="termcheck__row termcheck__row--match" style="padding-left:1.65rem"><input type="checkbox" checked /><span class="termcheck__name">Sea Stories</span></label>
+              </div>
+              <p class="panel__note" id="cat-note-a">Ancestors of a match stay visible (in italics, still checkable) so the hierarchy still reads. Ancestors themselves are excluded from the text match.</p>
+            </fieldset>
+          </div>
+
+          <!-- TAGS -->
+          <div class="panel">
+            <fieldset class="termcheck">
+              <legend class="termcheck__legend">Tags</legend>
+              <div class="tokenfield">
+                <div class="chipline" aria-label="Assigned tags">
+                  <span class="chip">galley-proofs<button class="chip__x" type="button" aria-label="Remove galley-proofs">✕</button></span>
+                  <span class="chip">letterpress<button class="chip__x" type="button" aria-label="Remove letterpress">✕</button></span>
+                  <span class="chip chip--new">salt-spray <small>will be created</small><button class="chip__x" type="button" aria-label="Remove salt-spray">✕</button></span>
+                </div>
+                <input class="input input--mono tokenfield__input" role="combobox" aria-expanded="true" aria-controls="tag-listbox-a" aria-activedescendant="tag-opt-a0" value="b" placeholder="Add a tag…" aria-label="Add a tag" />
+                <ul class="combobox__list" role="listbox" id="tag-listbox-a">
+                  <li class="combobox__opt is-active" role="option" id="tag-opt-a0" aria-selected="true">brass-fittings <span class="combobox__hint">Enter to add</span></li>
+                </ul>
+              </div>
+              <p class="panel__note">Comma or Enter commits the buffer; unmatched text stages a dashed "will be created" chip. Suggestions cap at ~8 rows, server-filtered.</p>
+            </fieldset>
+          </div>
+        </div>
+
+        <!-- Wide slot: identical panels, promoted to a right-hand rail. -->
+        <aside class="editor__aside" id="editorAside">
+          <div class="panel">
+            <fieldset class="termcheck" aria-describedby="cat-note-a2">
+              <legend class="termcheck__legend">Categories</legend>
+              <div class="chipline" aria-label="Assigned categories">
+                <span class="chip">Sea Stories<button class="chip__x" type="button" aria-label="Remove Sea Stories">✕</button></span>
+                <span class="chip chip--oov">Wreck Reports <small>(unavailable)</small><button class="chip__x" type="button" aria-label="Remove Wreck Reports">✕</button></span>
+              </div>
+              <div class="termcheck__search">
+                <input class="input" type="search" value="sea" aria-label="Filter categories" placeholder="Filter categories…" />
+              </div>
+              <div class="termcheck__scroll">
+                <label class="termcheck__row termcheck__row--ctx"><input type="checkbox" /><span class="termcheck__name">Fiction</span></label>
+                <label class="termcheck__row termcheck__row--match" style="padding-left:1.65rem"><input type="checkbox" checked /><span class="termcheck__name">Sea Stories</span></label>
+              </div>
+              <p class="panel__note" id="cat-note-a2">Same rules, narrower column — the 19rem rail is wide enough for a two-level indent before names truncate.</p>
+            </fieldset>
+          </div>
+          <div class="panel">
+            <fieldset class="termcheck">
+              <legend class="termcheck__legend">Tags</legend>
+              <div class="tokenfield">
+                <div class="chipline" aria-label="Assigned tags">
+                  <span class="chip">galley-proofs<button class="chip__x" type="button" aria-label="Remove galley-proofs">✕</button></span>
+                  <span class="chip">letterpress<button class="chip__x" type="button" aria-label="Remove letterpress">✕</button></span>
+                  <span class="chip chip--new">salt-spray <small>will be created</small><button class="chip__x" type="button" aria-label="Remove salt-spray">✕</button></span>
+                </div>
+                <input class="input input--mono tokenfield__input" placeholder="Add a tag…" aria-label="Add a tag" />
+              </div>
+            </fieldset>
+          </div>
+        </aside>
+      </div>
+      <div class="visually-hidden" role="status" aria-live="polite">Saved. Categories and tags updated.</div>
+    </div>
+  </div>
+
+  <div class="designnote">
+    <span class="designnote__label">Recommendation</span>
+    Ship the responsive split as ruled: below-sheet at normal widths, promoted to a <code>19rem</code> <code>.editor__aside</code> rail at <strong>≥1280px</strong>. That threshold (not the <code>.wrap</code>'s own 68rem/1088px breakpoint) leaves headroom for the sheet's <code>34rem</code> measure plus its <code>3rem</code> padding to stay centered-ish rather than getting shoved hard left the moment the rail appears. Below 1280px the stacked layout reads better than a cramped rail would. The panel content and every class inside it is identical in both slots — only the grid wrapper differs — so the rinch port is one <code>if viewport_is_wide</code> around which <code>&lt;div&gt;</code>/<code>&lt;aside&gt;</code> wraps the same panel markup, not two implementations to keep in sync.
+    <br /><br />
+    Found by testing this frame with real content: a real post body is usually much taller than two taxonomy panels, so a static aside would end its short column and leave a tall dead zone of paper beside the rest of the sheet. <code>.editor__aside</code> is therefore <code>position: sticky; top: 1rem</code> (toggle to wide and scroll the sheet to see it hold) — the panels stay in view the whole time you're writing, instead of scrolling out of reach after the first screenful.
+  </div>
+</section>
+
+<!-- ══════════════════════════ §B PANEL STATES ══════════════════════════ -->
+<section class="docsection" id="sec-b">
+  <p class="docsection__eyebrow">§B · settles SF3, SF13</p>
+  <h2 class="docsection__title">Panel states</h2>
+  <p class="docsection__desc">Four states that can't coexist with the populated panel above. Loading and error both still show the chip line — chips are seeded from <code>PostDetail.terms</code> independently of the vocabulary fetch (B4/Q2), so a slow or failed vocab load never blanks out what's already assigned.</p>
+
+  <div class="statesgrid">
+    <div>
+      <p class="stateslabel">Loading</p>
+      <div class="panel">
+        <fieldset class="termcheck">
+          <legend class="termcheck__legend">Categories</legend>
+          <div class="chipline"><span class="chip">Sea Stories<button class="chip__x" type="button" aria-label="Remove Sea Stories">✕</button></span></div>
+          <p class="panelstate">Loading categories…</p>
+        </fieldset>
+      </div>
+    </div>
+
+    <div>
+      <p class="stateslabel">Error (vocab fetch failed)</p>
+      <div class="panel">
+        <fieldset class="termcheck">
+          <legend class="termcheck__legend">Categories</legend>
+          <div class="chipline"><span class="chip">Sea Stories<button class="chip__x" type="button" aria-label="Remove Sea Stories">✕</button></span></div>
+          <p class="panelerror" role="alert">Couldn't load categories — your existing assignments are preserved.</p>
+        </fieldset>
+      </div>
+    </div>
+
+    <div>
+      <p class="stateslabel">Empty vocabulary (new post, no terms exist yet)</p>
+      <div class="panel">
+        <fieldset class="termcheck">
+          <legend class="termcheck__legend">Categories</legend>
+          <p class="panelstate">No categories exist yet.</p>
+        </fieldset>
+      </div>
+    </div>
+
+    <div>
+      <p class="stateslabel">Rejected chip (after a failed save)</p>
+      <div class="panel">
+        <fieldset class="termcheck">
+          <legend class="termcheck__legend">Tags</legend>
+          <div class="tokenfield">
+            <div class="chipline">
+              <span class="chip">galley-proofs<button class="chip__x" type="button" aria-label="Remove galley-proofs">✕</button></span>
+              <span class="chip chip--rejected">quarterdeck <small>couldn't add — try again</small><button class="chip__x" type="button" aria-label="Remove quarterdeck">✕</button></span>
+            </div>
+            <input class="input input--mono tokenfield__input" placeholder="Add a tag…" aria-label="Add a tag" />
+          </div>
+        </fieldset>
+      </div>
+    </div>
+  </div>
+
+  <div class="designnote designnote--quiet">
+    <span class="designnote__label">SF13 — one rejected chip, not one global banner</span>
+    A save failure that names a specific bad tag marks <em>that chip</em> rejected in place, in the tag's own row — not a page-level notice plus N indistinguishable chips the reader has to cross-reference. The rejection message and the affected chip travel together; a global <code>notice</code> is reserved for failures that aren't attributable to one term (auth, network).
+  </div>
+</section>
+
+<!-- ══════════════════════════ §C VIEW::TERMS ══════════════════════════ -->
+<section class="docsection" id="sec-c">
+  <p class="docsection__eyebrow">§C · settles SF9, SF14</p>
+  <h2 class="docsection__title">View::Terms</h2>
+  <p class="docsection__desc">Mirrors View::Menus exactly: back-link, <code>masthead__sep</code>, a quiet-button taxonomy switcher with <code>masthead__here</code> naming the active one (the Posts/Pages toggle idiom — not a <code>.tabs</code> strip, which is picker-modal chrome), <code>masthead__spacer</code>, primary action. No drag handles: terms carry no ordinal.</p>
+
+  <header class="masthead">
+    <div class="masthead__bar">
+      <button class="btn btn--quiet" type="button">← Posts</button>
+      <span class="masthead__sep">·</span>
+      <span class="masthead__here">Categories</span>
+      <span class="masthead__sep">|</span>
+      <button class="btn btn--quiet" type="button">Tags</button>
+      <span class="masthead__spacer"></span>
+      <button class="btn btn--primary" type="button">＋ New category</button>
+    </div>
+  </header>
+  <div class="wrap">
+    <div class="galley__head">
+      <h2 class="galley__title">Categories</h2>
+      <span class="galley__count">8 categories</span>
+    </div>
+    <div>
+      <div class="trow">
+        <span><span class="trow__name">Dispatches</span><span class="trow__slug">/category/dispatches/</span></span>
+        <span class="trow__count">12<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow">
+        <span><span class="trow__name">Fiction</span><span class="trow__slug">/category/fiction/</span></span>
+        <span class="trow__count">3<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow" style="padding-left:2rem">
+        <span><span class="trow__name">Sea Stories</span><span class="trow__slug">/category/fiction/sea-stories/</span></span>
+        <span class="trow__count">8<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow" style="padding-left:3.5rem">
+        <span><span class="trow__name">First Voyages</span><span class="trow__slug">/category/fiction/sea-stories/first-voyages/</span></span>
+        <span class="trow__count">2<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow" style="padding-left:3.5rem">
+        <span><span class="trow__name">Wrecked &amp; Rescued</span><span class="trow__slug">/category/fiction/sea-stories/wrecked-rescued/</span></span>
+        <span class="trow__count">4<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow" style="padding-left:3.5rem">
+        <span><span class="trow__name">Mutiny Tales</span><span class="trow__slug">/category/fiction/sea-stories/mutiny-tales/</span></span>
+        <span class="trow__count">2<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow" style="padding-left:2rem">
+        <span><span class="trow__name">Short Fiction</span><span class="trow__slug">/category/fiction/short-fiction/</span></span>
+        <span class="trow__count">5<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow">
+        <span><span class="trow__name">Engine Room</span><span class="trow__slug">/category/engine-room/</span></span>
+        <span class="trow__count">1<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+      <div class="trow">
+        <span><span class="trow__name">Tide Tables</span><span class="trow__slug">/category/tide-tables/</span></span>
+        <span class="trow__count">0<span class="trow__countlabel">Published</span></span>
+        <button class="trow__edit" type="button">Edit →</button>
+      </div>
+    </div>
+    <p class="panel__note" style="margin-top:1rem">"Published" counts <strong>direct</strong> assignments only (the same publish-gated count the server already computes) — a parent's own row does not fold in its children's posts. That rollup is a public-archive concern, not this list's.</p>
+  </div>
+
+  <p class="docsection__desc" style="margin-top:2rem">The Tags switch is the same list component with <code>depth: 0</code> throughout — proving the row doesn't assume hierarchy:</p>
+  <header class="masthead">
+    <div class="masthead__bar">
+      <button class="btn btn--quiet" type="button">← Posts</button>
+      <span class="masthead__sep">·</span>
+      <button class="btn btn--quiet" type="button">Categories</button>
+      <span class="masthead__sep">|</span>
+      <span class="masthead__here">Tags</span>
+      <span class="masthead__spacer"></span>
+      <button class="btn btn--primary" type="button">＋ New tag</button>
+    </div>
+  </header>
+  <div class="wrap">
+    <div class="galley__head">
+      <h2 class="galley__title">Tags</h2>
+      <span class="galley__count">8 tags</span>
+    </div>
+    <div>
+      <div class="trow"><span><span class="trow__name">galley-proofs</span><span class="trow__slug">/tag/galley-proofs/</span></span><span class="trow__count">6<span class="trow__countlabel">Published</span></span><button class="trow__edit" type="button">Edit →</button></div>
+      <div class="trow"><span><span class="trow__name">letterpress</span><span class="trow__slug">/tag/letterpress/</span></span><span class="trow__count">9<span class="trow__countlabel">Published</span></span><button class="trow__edit" type="button">Edit →</button></div>
+      <div class="trow"><span><span class="trow__name">salt-spray</span><span class="trow__slug">/tag/salt-spray/</span></span><span class="trow__count">3<span class="trow__countlabel">Published</span></span><button class="trow__edit" type="button">Edit →</button></div>
+      <div class="trow"><span><span class="trow__name">dead-reckoning</span><span class="trow__slug">/tag/dead-reckoning/</span></span><span class="trow__count">2<span class="trow__countlabel">Published</span></span><button class="trow__edit" type="button">Edit →</button></div>
+    </div>
+  </div>
+
+  <p class="stateslabel" style="margin-top:2rem">Empty state (either taxonomy, zero terms)</p>
+  <div class="wrap" style="padding-top:0">
+    <div class="emptytree">No categories yet. Use "+ New category" above to create one.</div>
+  </div>
+</section>
+
+<!-- ══════════════════════════ §D TERMEDITOR ══════════════════════════ -->
+<section class="docsection" id="sec-d">
+  <p class="docsection__eyebrow">§D · settles SF9, SF10, SF11</p>
+  <h2 class="docsection__title">View::TermEditor — editing "Sea Stories"</h2>
+  <p class="docsection__desc">Name / Slug / Description / Parent / Delete — the page-editor idiom (<code>parent_options</code>, NBSP depth indent, "(current parent)" out-of-vocab fallback) ported to terms.</p>
+
+  <header class="masthead">
+    <div class="masthead__bar">
+      <button class="btn btn--quiet" type="button">← Categories</button>
+      <span class="masthead__sep">·</span>
+      <span class="masthead__here">Sea Stories</span>
+      <span class="masthead__spacer"></span>
+      <button class="btn btn--primary" type="button">Save</button>
+    </div>
+  </header>
+  <div class="wrap">
+    <div class="panel">
+      <div class="setrow">
+        <div class="setrow__label">Name</div>
+        <div class="setrow__control"><input class="input" value="Sea Stories" style="max-width:24rem" /></div>
+      </div>
+      <div class="setrow">
+        <div class="setrow__label">Slug</div>
+        <div class="setrow__control"><input class="input input--mono" value="sea-stories" style="max-width:24rem" /></div>
+        <p class="setrow__help">Changing the slug breaks the old archive URL — Ferropress does not redirect a renamed category's link (unlike posts and pages, which record a 301). This is a deliberate, WP-parity trade-off for v1.</p>
+      </div>
+      <div class="setrow">
+        <div class="setrow__label">Description</div>
+        <div class="setrow__control"><textarea class="input" style="max-width:28rem">Tales from blue water — storms, wrecks, and the long watch between them.</textarea></div>
+      </div>
+      <div class="setrow">
+        <div class="setrow__label">Parent</div>
+        <div class="setrow__control">
+          <select class="select">
+            <option>— None (top level) —</option>
+            <option>Dispatches</option>
+            <option selected>Fiction</option>
+            <option>&nbsp;&nbsp;Short Fiction</option>
+            <option>Engine Room</option>
+            <option>Tide Tables</option>
+          </select>
+        </div>
+        <p class="setrow__help">"Sea Stories" and its own children (First Voyages, Wrecked &amp; Rescued, Mutiny Tales) are excluded from this list — picking one of them would create a cycle. Computed by walking each term's <code>parent</code> field, not by scanning depth runs (a flattened tree can append stray/cyclic rows at depth 0 after the real tree, which a depth-run scan would misread).</p>
+      </div>
+      <div class="setrow">
+        <div class="setrow__label"></div>
+        <div class="setrow__control"><button class="btn btn--danger" type="button">Delete category</button></div>
+      </div>
+    </div>
+
+    <div class="designnote">
+      <span class="designnote__label">window.confirm() copy — not a bespoke modal</span>
+      Delete "Sea Stories"? Its 3 child categories move under "Fiction". Posts in it lose this category (they will not be re-assigned).
+    </div>
+    <p class="docsection__desc" style="margin-top:.6rem">Child count and the resolved new parent (or "become top-level") come from the already-loaded term tree — never phrased from <code>TermDto.count</code>, which is a published-post count, not a blast radius.</p>
+  </div>
+</section>
+
+<!-- ══════════════════════════ §E PICKER — CATEGORIES + TAGS TABS ══════════════════════════ -->
+<section class="docsection" id="sec-e">
+  <p class="docsection__eyebrow">§E · settles B3, SF8 + owner call #2 (both tabs)</p>
+  <h2 class="docsection__title">Menu-item picker — Categories &amp; Tags tabs</h2>
+  <p class="docsection__desc">Five tabs total (Pages · Posts · Categories · Tags · Custom link). Categories shown active below; the Tags tab underneath proves the same row renders flat terms without the indent breaking anything.</p>
+
+  <div class="modal">
+    <div class="modal__scrim" aria-hidden="true"></div>
+    <div class="modal__plate" role="dialog" aria-modal="true" aria-label="Add a menu item">
+      <div class="modal__head"><h3 class="modal__title">Add a menu item</h3><button class="btn btn--quiet" type="button" aria-label="Close">✕</button></div>
+      <div class="modal__body">
+        <div class="tabs" role="tablist" aria-label="Item source">
+          <button class="tab" role="tab" type="button">Pages</button>
+          <button class="tab" role="tab" type="button">Posts</button>
+          <button class="tab is-on" role="tab" aria-selected="true" type="button">Categories</button>
+          <button class="tab" role="tab" type="button">Tags</button>
+          <button class="tab" role="tab" type="button">Custom link</button>
+        </div>
+        <div class="pickerfield">
+          <label for="pk-search">Search categories</label>
+          <input class="input" id="pk-search" type="search" placeholder="e.g. Sea Stories" />
+        </div>
+        <div>
+          <button class="candidate is-added" type="button" disabled>
+            <span class="candidate__check" aria-hidden="true">✓</span>
+            <span class="candidate__title">Dispatches</span>
+            <span class="candidate__addednote">already in menu</span>
+            <span class="candidate__slug">/category/dispatches/</span>
+          </button>
+          <button class="candidate" type="button">
+            <span class="candidate__check" aria-hidden="true"></span>
+            <span class="candidate__title">Fiction</span>
+            <span class="candidate__slug">/category/fiction/</span>
+          </button>
+          <button class="candidate is-selected" type="button" style="padding-left:2.15rem">
+            <span class="candidate__check" aria-hidden="true">✓</span>
+            <span class="candidate__title">Sea Stories</span>
+            <span class="candidate__slug">/category/fiction/sea-stories/</span>
+          </button>
+          <button class="candidate" type="button" style="padding-left:2.15rem">
+            <span class="candidate__check" aria-hidden="true"></span>
+            <span class="candidate__title">Short Fiction</span>
+            <span class="candidate__slug">/category/fiction/short-fiction/</span>
+          </button>
+          <button class="candidate" type="button">
+            <span class="candidate__check" aria-hidden="true"></span>
+            <span class="candidate__title">Engine Room</span>
+            <span class="candidate__slug">/category/engine-room/</span>
+          </button>
+          <button class="candidate" type="button">
+            <span class="candidate__check" aria-hidden="true"></span>
+            <span class="candidate__title">Tide Tables</span>
+            <span class="candidate__slug">/category/tide-tables/</span>
+          </button>
+        </div>
+      </div>
+      <div class="modal__foot"><button class="btn btn--ghost" type="button">Done</button></div>
+    </div>
+  </div>
+
+  <p class="stateslabel" style="margin-top:1.5rem">Empty state (search "whaling")</p>
+  <div class="modal">
+    <div class="modal__scrim" aria-hidden="true"></div>
+    <div class="modal__plate" role="dialog" aria-modal="true" aria-label="Add a menu item">
+      <div class="modal__head"><h3 class="modal__title">Add a menu item</h3><button class="btn btn--quiet" type="button" aria-label="Close">✕</button></div>
+      <div class="modal__body">
+        <div class="tabs" role="tablist" aria-label="Item source">
+          <button class="tab" role="tab" type="button">Pages</button>
+          <button class="tab" role="tab" type="button">Posts</button>
+          <button class="tab is-on" role="tab" aria-selected="true" type="button">Categories</button>
+          <button class="tab" role="tab" type="button">Tags</button>
+          <button class="tab" role="tab" type="button">Custom link</button>
+        </div>
+        <div class="pickerfield">
+          <label for="pk-search-2">Search categories</label>
+          <input class="input" id="pk-search-2" type="search" value="whaling" />
+        </div>
+        <p class="pickerempty">No matching categories.</p>
+      </div>
+      <div class="modal__foot"><button class="btn btn--ghost" type="button">Done</button></div>
+    </div>
+  </div>
+
+  <p class="stateslabel" style="margin-top:1.5rem">Tags tab — same row component, flat (no indent)</p>
+  <div class="modal">
+    <div class="modal__scrim" aria-hidden="true"></div>
+    <div class="modal__plate" role="dialog" aria-modal="true" aria-label="Add a menu item">
+      <div class="modal__head"><h3 class="modal__title">Add a menu item</h3><button class="btn btn--quiet" type="button" aria-label="Close">✕</button></div>
+      <div class="modal__body">
+        <div class="tabs" role="tablist" aria-label="Item source">
+          <button class="tab" role="tab" type="button">Pages</button>
+          <button class="tab" role="tab" type="button">Posts</button>
+          <button class="tab" role="tab" type="button">Categories</button>
+          <button class="tab is-on" role="tab" aria-selected="true" type="button">Tags</button>
+          <button class="tab" role="tab" type="button">Custom link</button>
+        </div>
+        <div class="pickerfield">
+          <label for="pk-search-3">Search tags</label>
+          <input class="input" id="pk-search-3" type="search" placeholder="e.g. letterpress" />
+        </div>
+        <div>
+          <button class="candidate" type="button">
+            <span class="candidate__check" aria-hidden="true"></span>
+            <span class="candidate__title">galley-proofs</span>
+            <span class="candidate__slug">/tag/galley-proofs/</span>
+          </button>
+          <button class="candidate is-selected" type="button">
+            <span class="candidate__check" aria-hidden="true">✓</span>
+            <span class="candidate__title">letterpress</span>
+            <span class="candidate__slug">/tag/letterpress/</span>
+          </button>
+          <button class="candidate" type="button">
+            <span class="candidate__check" aria-hidden="true"></span>
+            <span class="candidate__title">salt-spray</span>
+            <span class="candidate__slug">/tag/salt-spray/</span>
+          </button>
+        </div>
+      </div>
+      <div class="modal__foot"><button class="btn btn--ghost" type="button">Done</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════ IMPLEMENTATION NOTES ══════════════════════════ -->
+<section class="docsection" id="sec-notes">
+  <p class="docsection__eyebrow">Carry into the rinch port</p>
+  <h2 class="docsection__title">Implementation notes</h2>
+  <ul class="docsection__desc" style="max-width:56rem">
+    <li>Rows in <code>.termcheck__row</code> are <code>label &gt; input[type=checkbox] + span</code> per SF6 — never a <code>&lt;button&gt;</code> with a glyph checkbox (rinch dispatches <code>onclick</code> from pointerdown only, which is mouse-only). Each panel is a real <code>fieldset</code>/<code>legend</code>.</li>
+    <li><code>.chip</code> is a deliberately new family, not a reuse of <code>.tag</code> (SF7): <code>.tag</code> is an uppercase mono kind-stamp where the dashed border already means "targets a term" (menu rows); reusing it for a category/tag name would both shout the name in caps and overload the dashed language with a second, conflicting meaning ("pending create" here vs "is a term" there).</li>
+    <li><code>.trow</code> (§C) is visually identical to the existing <code>.mrow</code> (menu list rows) — same grid shape, same hover treatment. Worth just reusing <code>.mrow</code> directly rather than shipping a near-duplicate class; the only difference is the count column, which can be a slotted child either way.</li>
+    <li>The combobox list only appears when there's a matching real vocab entry to suggest — a buffer that matches nothing renders no list at all (not an empty listbox), so Enter unambiguously commits the typed text as a staged chip.</li>
+    <li><code>role="status"</code> live region (see the hidden node under §A's normal-width frame) is where a save/delete outcome gets announced per SF16 — today's toast is visual-only and announces nothing.</li>
+    <li>The breakpoint toggle above is the only interactive JS in this file, on purpose (see the file's header comment) — every other "state" is a separate static section, not a JS-driven variant, so a reviewer can see all of them at once without clicking through.</li>
+  </ul>
+</section>
+
+<script>
+  // The ONE interactive affordance in this file: flip the SF5 layout between
+  // below-sheet (normal) and aside-rail (wide) so both can be reviewed without
+  // resizing the browser. Nothing else in this mockup is wired up.
+  const frame = document.getElementById('bpFrame');
+  const frameTag = document.getElementById('bpFrameTag');
+  const body = document.getElementById('editorBody');
+  const normalBtn = document.getElementById('bpNormalBtn');
+  const wideBtn = document.getElementById('bpWideBtn');
+  function setBp(wide) {
+    frame.className = 'bpframe ' + (wide ? 'bpframe--wide' : 'bpframe--normal');
+    body.classList.toggle('is-wide', wide);
+    frameTag.textContent = wide
+      ? '≈1216px — panels promoted to the .editor__aside rail'
+      : '≈736px — panels stack below the sheet';
+    normalBtn.setAttribute('aria-pressed', String(!wide));
+    wideBtn.setAttribute('aria-pressed', String(wide));
+  }
+  normalBtn.addEventListener('click', () => setBp(false));
+  wideBtn.addEventListener('click', () => setBp(true));
+</script>
+</body>
+</html>
