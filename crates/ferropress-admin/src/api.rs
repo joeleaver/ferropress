@@ -44,6 +44,33 @@ pub struct FeaturedMedia {
     pub url: String,
 }
 
+/// One term (category/tag) assigned to a post, resolved for the editor: the
+/// assignment panel's current-selection seed AND the chip/checklist label — mirrors
+/// `ferropress-http::admin::posts::TermRefDto`. `taxonomy` is the owning taxonomy's
+/// KEY, so a pooled `PostDetail.terms` (all taxonomies together, matching how the
+/// server stores membership) can be split back out per-panel client-side.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct TermRefDto {
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub taxonomy: String,
+}
+
+/// An inline new-tag request riding a post save/create (WP's "add new tag" box):
+/// create-or-reuse a root term in a FLAT taxonomy and assign it. Mirrors
+/// `ferropress-http::admin::posts::NewTermRequest`. Tags-only server-side (a
+/// hierarchical taxonomy 400s) — see the ADMIN+AUTH pinned design.
+#[derive(Serialize)]
+pub struct NewTermRequest {
+    /// The FLAT taxonomy's key (e.g. `"tag"`).
+    pub taxonomy: String,
+    pub name: String,
+}
+
 /// One row of `GET /admin/api/posts`.
 #[derive(Clone, PartialEq, Deserialize)]
 pub struct PostSummary {
@@ -78,6 +105,10 @@ pub struct PostDetail {
     /// The featured image, shown in the editor's featured-image control.
     #[serde(default)]
     pub featured_media: Option<FeaturedMedia>,
+    /// The post's currently assigned terms, pooled across every taxonomy (mirrors
+    /// how the server stores membership) — the assignment panels' initial seed.
+    #[serde(default)]
+    pub terms: Vec<TermRefDto>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +126,16 @@ pub struct SaveRequest {
     pub block_tree: serde_json::Value,
     /// The featured image's Media id, or `None` to clear it.
     pub featured_media: Option<u64>,
+    /// Desired term memberships (term ids), SF1 "dirty-send" — build this with
+    /// [`dirty_terms`]. `None` = LEAVE UNCHANGED (an absent/unchanged field must
+    /// never clear a post's categories/tags); `Some(v)` set-reconciles the
+    /// membership to exactly `v` (plus any `new_terms`); `Some([])` is the
+    /// deliberate "clear everything" signal. Mirrors
+    /// `ferropress-http::admin::posts::SaveRequest::terms` exactly.
+    pub terms: Option<Vec<u64>>,
+    /// Inline new tags to create-or-reuse and assign, ADDITIVE on top of `terms` (or
+    /// the current membership when `terms` is `None`). Flat taxonomies only.
+    pub new_terms: Option<Vec<NewTermRequest>>,
 }
 
 /// `POST /admin/api/posts` body — create a new post. Same shape as [`SaveRequest`]
@@ -107,12 +148,42 @@ pub struct CreateRequest {
     pub block_tree: serde_json::Value,
     /// An optional featured image (Media id) for the new post.
     pub featured_media: Option<u64>,
+    /// Initial term memberships (term ids). Same contract as [`SaveRequest::terms`];
+    /// on create, `None` simply means "no terms".
+    pub terms: Option<Vec<u64>>,
+    /// Inline new tags to create-or-reuse and assign (see [`NewTermRequest`]).
+    pub new_terms: Option<Vec<NewTermRequest>>,
 }
 
-/// `{ id }` from a successful create (the rest of the response is ignored).
+/// `{ id }` from a successful page create (the rest of the response is ignored). Kept
+/// distinct from [`PostCreateResponse`] — a page has no `terms`, so widening this
+/// shared shape with a defaulted `terms` field would let a page create silently
+/// deserialize into a post-shaped path.
 #[derive(Deserialize)]
 struct CreateResponse {
     id: u64,
+}
+
+/// `PUT /admin/api/posts/{id}` response (SF4): the AUTHORITATIVE terms after the
+/// save's reconcile — an inline-created tag comes back with its real id, so the
+/// editor re-seeds its assignment panel from this rather than trusting what it sent.
+/// Mirrors `ferropress-http::admin::posts::SaveResponse`; `updated_at` is on the wire
+/// too but unread here (the module doc's "the client reads only what it renders").
+#[derive(Deserialize)]
+pub struct PostSaveResponse {
+    pub id: u64,
+    #[serde(default)]
+    pub terms: Vec<TermRefDto>,
+}
+
+/// `POST /admin/api/posts` response (SF4): the newly assigned id + the AUTHORITATIVE
+/// terms after the create's reconcile. See [`CreateResponse`] for why this is NOT the
+/// shared page-create shape.
+#[derive(Deserialize)]
+pub struct PostCreateResponse {
+    pub id: u64,
+    #[serde(default)]
+    pub terms: Vec<TermRefDto>,
 }
 
 #[derive(Deserialize)]
@@ -235,10 +306,11 @@ pub async fn get_post(id: u64) -> Result<PostDetail, ApiError> {
         .map_err(|e| ApiError::Message(e.to_string()))
 }
 
-/// `PUT /admin/api/posts/{id}` — persist an edit. On failure the server's
+/// `PUT /admin/api/posts/{id}` — persist an edit; returns the AUTHORITATIVE post
+/// (SF4) the editor's assignment panel re-seeds from. On failure the server's
 /// `{ error }` message (e.g. a 409 slug clash, a 400 bad status transition) is
 /// surfaced verbatim; a 401 routes back to login.
-pub async fn save_post(id: u64, body: &SaveRequest) -> Result<(), ApiError> {
+pub async fn save_post(id: u64, body: &SaveRequest) -> Result<PostSaveResponse, ApiError> {
     let built = Request::put(&format!("/admin/api/posts/{id}"))
         .credentials(RequestCredentials::SameOrigin)
         .json(body);
@@ -250,13 +322,16 @@ pub async fn save_post(id: u64, body: &SaveRequest) -> Result<(), ApiError> {
     if !resp.ok() {
         return Err(classify(resp).await);
     }
-    Ok(())
+    resp.json::<PostSaveResponse>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
 }
 
-/// `POST /admin/api/posts` — create a new post; returns its new id. On failure the
-/// server's `{ error }` message (a 409 slug clash, a 400 bad slug/status) is
-/// surfaced verbatim; a 401 routes back to login.
-pub async fn create_post(body: &CreateRequest) -> Result<u64, ApiError> {
+/// `POST /admin/api/posts` — create a new post; returns its new id + the
+/// AUTHORITATIVE terms (SF4). On failure the server's `{ error }` message (a 409
+/// slug clash, a 400 bad slug/status) is surfaced verbatim; a 401 routes back to
+/// login.
+pub async fn create_post(body: &CreateRequest) -> Result<PostCreateResponse, ApiError> {
     let built = Request::post("/admin/api/posts")
         .credentials(RequestCredentials::SameOrigin)
         .json(body);
@@ -268,10 +343,241 @@ pub async fn create_post(body: &CreateRequest) -> Result<u64, ApiError> {
     if !resp.ok() {
         return Err(classify(resp).await);
     }
-    resp.json::<CreateResponse>()
+    resp.json::<PostCreateResponse>()
         .await
-        .map(|r| r.id)
         .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+// ── taxonomies + terms ──────────────────────────────────────────────────────────
+//
+// Mirrors `ferropress-http::admin::terms`. Reads (`list_taxonomies`, `list_terms`)
+// are any editing role; writes (`create_term`/`update_term`/`delete_term`) are
+// Editor+ (`ManageTerms`) — the post editor's own inline TAG creation does not go
+// through these (it rides `SaveRequest::new_terms`/`CreateRequest::new_terms`
+// instead, gated by the post-edit permission, never `ManageTerms`).
+
+/// One taxonomy, for the assignment panels + the term-management screen. Mirrors
+/// `ferropress-http::admin::terms::TaxonomyDto`.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct TaxonomyDto {
+    pub id: u64,
+    /// Stable key (`"category"`, `"tag"`) — the archive URL base + the API handle.
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub hierarchical: bool,
+    #[serde(default)]
+    pub multiple: bool,
+}
+
+/// One term row, flat-with-depth (the client renders the hierarchy by indenting
+/// `depth`, the pages/menus idiom). Mirrors `ferropress-http::admin::terms::TermDto`.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct TermDto {
+    pub id: u64,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The parent term's id (`None` = a root term).
+    #[serde(default)]
+    pub parent: Option<u64>,
+    /// Depth in the tree (root = 0) — the indent the checklist/list renders.
+    #[serde(default)]
+    pub depth: usize,
+    /// DIRECT published-post assignments (see the server doc comment for why this
+    /// is never "posts affected by deleting this term").
+    #[serde(default)]
+    pub count: usize,
+    /// `meta._rev` (SF12) — a TermEditor form should snapshot this on load and echo
+    /// it back as [`update_term`]'s `expected_rev` on save.
+    #[serde(default)]
+    pub rev: i64,
+}
+
+/// `GET /admin/api/terms` response: the taxonomy's terms plus a truncation flag
+/// (mirrors [`LinkCandidates::posts_truncated`]).
+#[derive(Clone, Deserialize)]
+pub struct ListTermsResponse {
+    #[serde(default)]
+    pub terms: Vec<TermDto>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// The created/updated term echoed back to the client. Mirrors
+/// `ferropress-http::admin::terms::TermRef`.
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct TermRef {
+    pub id: u64,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub parent: Option<u64>,
+    /// `meta._rev` AFTER this write (SF12) — refresh the client's local snapshot
+    /// with this rather than re-fetching, so an immediate second edit still carries
+    /// a live precondition.
+    #[serde(default)]
+    pub rev: i64,
+}
+
+#[derive(Serialize)]
+struct CreateTermBody<'a> {
+    taxonomy: &'a str,
+    name: &'a str,
+    slug: Option<&'a str>,
+    description: &'a str,
+    parent: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct UpdateTermBody<'a> {
+    name: &'a str,
+    slug: Option<&'a str>,
+    description: &'a str,
+    parent: Option<u64>,
+    /// SF12 optimistic-concurrency precondition — see [`TermDto::rev`].
+    expected_rev: Option<i64>,
+}
+
+/// `GET /admin/api/taxonomies` — every taxonomy, key-sorted. Any editing role.
+pub async fn list_taxonomies() -> Result<Vec<TaxonomyDto>, ApiError> {
+    let resp = Request::get("/admin/api/taxonomies")
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<Vec<TaxonomyDto>>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `GET /admin/api/terms?taxonomy={key}` — a taxonomy's terms, flat-with-depth.
+/// `counts: false` funds the post editor's cheap `?counts=0` mode (the management
+/// screen, which shows the count column, passes `true`); `q`/`limit` fund bounded
+/// suggestions — `q: None, limit: None` returns the whole vocabulary, unbounded.
+pub async fn list_terms(
+    taxonomy: &str,
+    counts: bool,
+    q: Option<&str>,
+    limit: Option<usize>,
+) -> Result<ListTermsResponse, ApiError> {
+    let mut url = format!("/admin/api/terms?taxonomy={}", encode_query(taxonomy));
+    if !counts {
+        url.push_str("&counts=0");
+    }
+    if let Some(needle) = q.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&q={}", encode_query(needle)));
+    }
+    if let Some(limit) = limit {
+        url.push_str(&format!("&limit={limit}"));
+    }
+    let resp = Request::get(&url)
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<ListTermsResponse>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `POST /admin/api/terms` — create a term (`ManageTerms`). `slug: None` derives one
+/// from `name`. On failure the server's `{ error }` message (400 empty name/bad
+/// parent/cycle/depth, 409 sibling-slug or archive-path clash) is surfaced verbatim;
+/// a 401 routes back to login.
+pub async fn create_term(
+    taxonomy: &str,
+    name: &str,
+    slug: Option<&str>,
+    description: &str,
+    parent: Option<u64>,
+) -> Result<TermRef, ApiError> {
+    let built = Request::post("/admin/api/terms")
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&CreateTermBody {
+            taxonomy,
+            name,
+            slug,
+            description,
+            parent,
+        });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<TermRef>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `PUT /admin/api/terms/{id}` — update a term to the full desired state
+/// (`ManageTerms`). `expected_rev` is the SF12 lost-update guard: `Some` and stale →
+/// the server 409s the whole write rather than silently reverting a rename/re-parent
+/// that happened elsewhere; `None` skips the check. On failure the server's message
+/// (400/409, including the 409 the stale-rev guard produces) is surfaced verbatim; a
+/// 401 routes back to login.
+pub async fn update_term(
+    id: u64,
+    name: &str,
+    slug: Option<&str>,
+    description: &str,
+    parent: Option<u64>,
+    expected_rev: Option<i64>,
+) -> Result<TermRef, ApiError> {
+    let built = Request::put(&format!("/admin/api/terms/{id}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .json(&UpdateTermBody {
+            name,
+            slug,
+            description,
+            parent,
+            expected_rev,
+        });
+    let req = built.map_err(|e| ApiError::Message(e.to_string()))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    resp.json::<TermRef>()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))
+}
+
+/// `DELETE /admin/api/terms/{id}` — delete a term (`ManageTerms`); children are
+/// re-homed to its parent. The success response is `204 No Content` — this must NOT
+/// attempt to parse a JSON body (SF13). On failure the server's `{ error }` message
+/// (409 naming the re-home slug collision) is surfaced verbatim; a 401 routes back
+/// to login.
+pub async fn delete_term(id: u64) -> Result<(), ApiError> {
+    let resp = Request::delete(&format!("/admin/api/terms/{id}"))
+        .credentials(RequestCredentials::SameOrigin)
+        .send()
+        .await
+        .map_err(|e| ApiError::Message(e.to_string()))?;
+    if !resp.ok() {
+        return Err(classify(resp).await);
+    }
+    Ok(())
 }
 
 // ── pages ────────────────────────────────────────────────────────────────────────
@@ -741,9 +1047,11 @@ pub struct MenuLocationRow {
     pub declared: bool,
 }
 
-/// One pickable target from `GET /admin/api/menus/link-candidates` — a PUBLISHED Post or
-/// Page, with the href it will resolve to. (`Default` only to satisfy the rinch `#[component]`
-/// macro — `CandidateRow` takes it as a prop.)
+/// One pickable target from `GET /admin/api/menus/link-candidates` — a PUBLISHED Post,
+/// Page, or Term, with the href it will resolve to. (`Default` only to satisfy the
+/// rinch `#[component]` macro — `CandidateRow` takes it as a prop.) `taxonomy` /
+/// `depth` are populated ONLY for `kind == "term"` (S4: they split a term candidate
+/// list into per-taxonomy picker tabs and drive its indent) — `None` for Pages/Posts.
 #[derive(Clone, PartialEq, Default, Deserialize)]
 pub struct LinkCandidate {
     #[serde(default)]
@@ -753,10 +1061,18 @@ pub struct LinkCandidate {
     pub title: String,
     #[serde(default)]
     pub href: String,
+    /// The owning taxonomy's KEY, term candidates only.
+    #[serde(default)]
+    pub taxonomy: Option<String>,
+    /// Ancestor depth (root = 0), term candidates only.
+    #[serde(default)]
+    pub depth: Option<u32>,
 }
 
 /// `GET /admin/api/menus/link-candidates` response: Pages in full, Posts as a bounded,
-/// searchable slice (`posts_truncated` when more exist).
+/// searchable slice (`posts_truncated` when more exist), Terms in full (taxonomy-
+/// key-sorted, then hierarchy/depth order WITHIN each taxonomy — never re-sort this
+/// list, `depth` only means what it says in that order).
 #[derive(Default, Clone, Deserialize)]
 pub struct LinkCandidates {
     #[serde(default)]
@@ -765,6 +1081,8 @@ pub struct LinkCandidates {
     pub posts: Vec<LinkCandidate>,
     #[serde(default)]
     pub posts_truncated: bool,
+    #[serde(default)]
+    pub terms: Vec<LinkCandidate>,
 }
 
 #[derive(Serialize)]
@@ -976,6 +1294,26 @@ async fn error_message(resp: Response) -> String {
     }
 }
 
+// ── request-shaping helpers ─────────────────────────────────────────────────────
+
+/// The `SaveRequest`/`CreateRequest::terms` value to SEND (SF1 "dirty-send"): `None`
+/// when `current` is UNCHANGED from `snapshot` (order-independent — a taxonomy panel
+/// re-tick in a different order is not a change), `Some(current)` otherwise. An
+/// untouched taxonomy panel must therefore never clear or touch a post's category/tag
+/// membership on a body-only save, and every such save stays off the server's
+/// process-global `taxonomy_lock` (`ferropress-http`'s `posts.rs`). `Some(vec![])` is
+/// returned — deliberately, not folded into `None` — exactly when `current` is empty
+/// but `snapshot` was not: that is the explicit "clear everything" signal, distinct
+/// from "the panel was never touched". `new_terms` is unaffected by this helper: it
+/// stays additive and race-safe even when `terms` itself is sent as `None`.
+pub fn dirty_terms(current: &[u64], snapshot: &[u64]) -> Option<Vec<u64>> {
+    let mut c = current.to_vec();
+    let mut s = snapshot.to_vec();
+    c.sort_unstable();
+    s.sort_unstable();
+    if c == s { None } else { Some(current.to_vec()) }
+}
+
 // ── display helpers ──────────────────────────────────────────────────────────────
 
 /// The author-facing statuses, in ladder order: `(api value, label)`. Excludes
@@ -1028,5 +1366,36 @@ pub fn fmt_relative(ms: Option<i64>) -> String {
         } else {
             format!("{days}d ago")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dirty_terms;
+
+    #[test]
+    fn dirty_terms_unchanged_sends_none_regardless_of_order() {
+        assert_eq!(dirty_terms(&[1, 2, 3], &[3, 2, 1]), None);
+        assert_eq!(dirty_terms(&[], &[]), None);
+        assert_eq!(dirty_terms(&[5], &[5]), None);
+    }
+
+    #[test]
+    fn dirty_terms_changed_sends_the_current_selection_verbatim() {
+        // Sent unsorted/as-is — the server doesn't care about order, and the
+        // client's own selection order (e.g. checklist DFS order) is preserved.
+        assert_eq!(dirty_terms(&[2, 1], &[1]), Some(vec![2, 1]));
+    }
+
+    #[test]
+    fn dirty_terms_clearing_everything_is_some_empty_not_none() {
+        // The deliberate "clear" signal must survive dirty-send — collapsing it to
+        // `None` would silently leave the old membership in place.
+        assert_eq!(dirty_terms(&[], &[1, 2]), Some(vec![]));
+    }
+
+    #[test]
+    fn dirty_terms_newly_assigning_from_empty() {
+        assert_eq!(dirty_terms(&[1, 2], &[]), Some(vec![1, 2]));
     }
 }

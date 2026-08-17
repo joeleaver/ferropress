@@ -1992,9 +1992,16 @@ fn prepared_doc(
 
 /// Persist the prepared document: CREATE (`POST`) when there is no id yet, else
 /// UPDATE (`PUT`) in place. Returns the effective post id (freshly assigned on
-/// create). The one create-vs-update decision, shared by [`save_post`] and
-/// [`preview_post`]; the stale-session guard + `current_id` writeback stay with the
-/// callers, which differ in what they do on success (toast vs. steer the tab).
+/// create) AND the post's AUTHORITATIVE terms after the server's reconcile (SF4) —
+/// no assignment panel reads the latter yet (Inc-3 S1; the panels + the B6
+/// merge-not-overwrite reseed land in S2), but every save/preview already goes
+/// through the real wire shape so S2 only has to START READING this, not restructure
+/// the plumbing again. `terms`/`new_terms` are sent as `None` here — S1 introduces no
+/// taxonomy UI, so there is nothing yet for [`api::dirty_terms`] to compare against;
+/// `None` is also exactly the pre-Inc-3 behavior (leave membership untouched). The
+/// one create-vs-update decision, shared by [`save_post`] and [`preview_post`]; the
+/// stale-session guard + `current_id` writeback stay with the callers, which differ
+/// in what they do on success (toast vs. steer the tab).
 async fn persist_post(
     existing: Option<u64>,
     title: String,
@@ -2002,7 +2009,7 @@ async fn persist_post(
     status: String,
     block_tree: serde_json::Value,
     featured: Option<u64>,
-) -> Result<u64, api::ApiError> {
+) -> Result<(u64, Vec<api::TermRefDto>), api::ApiError> {
     match existing {
         Some(id) => api::save_post(
             id,
@@ -2012,20 +2019,23 @@ async fn persist_post(
                 status,
                 block_tree,
                 featured_media: featured,
+                terms: None,
+                new_terms: None,
             },
         )
         .await
-        .map(|()| id),
-        None => {
-            api::create_post(&api::CreateRequest {
-                title,
-                slug,
-                status,
-                block_tree,
-                featured_media: featured,
-            })
-            .await
-        }
+        .map(|resp| (resp.id, resp.terms)),
+        None => api::create_post(&api::CreateRequest {
+            title,
+            slug,
+            status,
+            block_tree,
+            featured_media: featured,
+            terms: None,
+            new_terms: None,
+        })
+        .await
+        .map(|resp| (resp.id, resp.terms)),
     }
 }
 
@@ -2131,7 +2141,7 @@ fn save_post(
         let stale = editor_session.get() != save_gen;
         saving.set(false);
         match result {
-            Ok(id) => {
+            Ok((id, _terms)) => {
                 if stale {
                     return;
                 }
@@ -2297,7 +2307,7 @@ fn preview_post(
         let stale = editor_session.get() != save_gen;
         saving.set(false);
         match result {
-            Ok(id) => {
+            Ok((id, _terms)) => {
                 if stale {
                     // The editor switched documents mid-flight: the save landed, but
                     // steering the tab into what is now a different post would mislead.
