@@ -5925,6 +5925,86 @@ async fn external_theme_surfaces_injected_chip_identity() {
     }
 }
 
+/// An external theme must smoke-render the SAME full set of canonical context shapes
+/// `ThemeRegistry::load_dir`'s own "registered ⇒ renderable" boot probe does (see
+/// `themes::load_theme`) — single/page-wide, a paginated home galley, an empty home galley, a
+/// paginated archive, and an empty archive. The other `external_theme_*` tests above already
+/// cover most of these with DEEPER structural assertions; this one exists purely for BREADTH,
+/// so a theme that renders cleanly at `cargo test` time here is proven to also pass Ferropress's
+/// own boot-time smoke test on every shape it would actually be probed against — no error is
+/// the only bar (each shape's specific content is somebody else's job to assert on: the
+/// structural tests above, or the consuming theme's OWN parity tests).
+#[tokio::test]
+async fn external_theme_smoke_renders_every_canonical_shape() {
+    for (id, engine) in external_theme_engines() {
+        let mut single_ctx = contract_probe_base_ctx();
+        single_ctx["is_home"] = serde_json::json!(false);
+        single_ctx["title"] = serde_json::json!("Sample Post");
+        single_ctx["dateline"] = serde_json::json!("January 1, 2026");
+        single_ctx["kicker"] = serde_json::json!("Notes");
+        single_ctx["author"] = serde_json::json!("A. Writer");
+        single_ctx["author_initials"] = serde_json::json!("AW");
+        single_ctx["featured_image"] = serde_json::Value::Null;
+        single_ctx["body"] = serde_json::json!("<p>Sample body.</p>");
+        single_ctx["terms"] = serde_json::json!([]);
+        engine
+            .render(crate::templates::SINGLE_TEMPLATE, &single_ctx)
+            .unwrap_or_else(|e| panic!("{id}: single.html must smoke-render: {e}"));
+        engine
+            .render(crate::templates::PAGE_WIDE_TEMPLATE, &single_ctx)
+            .unwrap_or_else(|e| panic!("{id}: page-wide.html must smoke-render: {e}"));
+
+        let mut home_full = contract_probe_base_ctx();
+        home_full["is_home"] = serde_json::json!(true);
+        home_full["archive"] = serde_json::Value::Null;
+        home_full["posts"] = serde_json::json!([
+            {"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}
+        ]);
+        home_full["pager"] =
+            serde_json::json!({"older": "/page/2", "newer": null, "page": 1, "total_pages": 2});
+        engine
+            .render(crate::templates::HOME_TEMPLATE, &home_full)
+            .unwrap_or_else(|e| {
+                panic!("{id}: home.html (paginated galley) must smoke-render: {e}")
+            });
+
+        let mut home_empty = contract_probe_base_ctx();
+        home_empty["is_home"] = serde_json::json!(true);
+        home_empty["archive"] = serde_json::Value::Null;
+        home_empty["pager"] = serde_json::Value::Null;
+        home_empty["posts"] = serde_json::json!([]);
+        engine
+            .render(crate::templates::HOME_TEMPLATE, &home_empty)
+            .unwrap_or_else(|e| panic!("{id}: home.html (empty galley) must smoke-render: {e}"));
+
+        let mut archive_full = contract_probe_base_ctx();
+        archive_full["is_home"] = serde_json::json!(false);
+        archive_full["pager"] = serde_json::json!({
+            "older": "/archive-probe/page/2", "newer": null, "page": 1, "total_pages": 3
+        });
+        archive_full["posts"] = serde_json::json!([
+            {"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}
+        ]);
+        archive_full["archive"] =
+            serde_json::json!({"name": "Sample Term", "description": "A sample.", "total": 30});
+        engine
+            .render(crate::templates::HOME_TEMPLATE, &archive_full)
+            .unwrap_or_else(|e| {
+                panic!("{id}: home.html (paginated archive) must smoke-render: {e}")
+            });
+
+        let mut archive_empty = contract_probe_base_ctx();
+        archive_empty["is_home"] = serde_json::json!(false);
+        archive_empty["pager"] = serde_json::Value::Null;
+        archive_empty["posts"] = serde_json::json!([]);
+        archive_empty["archive"] =
+            serde_json::json!({"name": "Sample Term", "description": null, "total": 0});
+        engine
+            .render(crate::templates::HOME_TEMPLATE, &archive_empty)
+            .unwrap_or_else(|e| panic!("{id}: home.html (empty archive) must smoke-render: {e}"));
+    }
+}
+
 /// The endless-scroll script lives in the SHARED base chrome (present on every page, matching
 /// where the APG disclosure-nav controller already lives), so a single-post permalink page —
 /// which has no pager at all — still ships the script text, but the DOM hooks it depends on

@@ -16,11 +16,11 @@
 //!     the server serves at `/_fp/islands`).
 //!   * `build-admin` — the same, for the excluded `ferropress-admin` admin-SPA
 //!     `cdylib` → `crates/ferropress-admin/dist/` (served at `/_fp/admin`).
-//!   * `theme-contract-check` — run ferropress-serve's GENERIC external-theme contract
+//!   * `theme-contract-check [DIR]` — run ferropress-serve's GENERIC external-theme contract
 //!     checker (`cargo test -p ferropress-serve --lib external_theme`) against a real theme
-//!     project's dir, via `FERROPRESS_EXTERNAL_THEME_DIR`. Core carries no dependency on, or
-//!     knowledge of, any particular consumer theme — this is for a theme author to run
-//!     against their OWN project (locally, or in their own CI).
+//!     project's dir, given as an argument or via `FERROPRESS_EXTERNAL_THEME_DIR`. Core
+//!     carries no dependency on, or knowledge of, any particular consumer theme — this is for
+//!     a theme author to run against their OWN project (locally, or in their own CI).
 //!   * `no-consumer-names-lint` — self-enforcing guard: fails if any tracked file in this
 //!     repo mentions a banned consumer-project name (see [`BANNED_CONSUMER_NAMES`]). Core is
 //!     a published, general-purpose CMS; a private consumer project's name must never leak
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
         Some("build-islands") => build_islands(),
         Some("build-admin") => build_admin(),
         Some("build-plugins") => build_plugins(),
-        Some("theme-contract-check") => run_theme_contract_check(),
+        Some("theme-contract-check") => run_theme_contract_check(args.next()),
         Some("no-consumer-names-lint") => no_consumer_names_lint(),
         Some(other) => bail!(
             "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, \
@@ -385,20 +385,27 @@ fn dep_graph_lint() -> Result<()> {
 /// nothing here for CI to reach — so this target exists for a THEME AUTHOR to run locally
 /// (or wire into THEIR OWN CI) against their own theme dir before relying on the shared
 /// render contract. The tests themselves skip cleanly (never fail) when
-/// `FERROPRESS_EXTERNAL_THEME_DIR` is unset; this target requires it explicitly and errors
-/// clearly if it doesn't resolve to a real directory — a human explicitly running
-/// `theme-contract-check` wants a real answer, not a quiet no-op.
-fn run_theme_contract_check() -> Result<()> {
+/// `FERROPRESS_EXTERNAL_THEME_DIR` is unset; this target requires ONE of the two explicitly
+/// (a positional arg, or the env var) and errors clearly if neither resolves to a real
+/// directory — a human explicitly running `theme-contract-check` wants a real answer, not a
+/// quiet no-op.
+fn run_theme_contract_check(dir_arg: Option<String>) -> Result<()> {
     let root = repo_root()?;
-    let dir = std::env::var_os("FERROPRESS_EXTERNAL_THEME_DIR").map(PathBuf::from).ok_or_else(|| {
-        anyhow::anyhow!(
-            "FERROPRESS_EXTERNAL_THEME_DIR is not set. Point it at your theme project's \
-             themes/ dir (one subfolder per theme, each a theme.toml + the four canonical \
-             templates) and re-run, e.g.:\n  \
-             FERROPRESS_EXTERNAL_THEME_DIR=/path/to/your-theme-project/theme \\\n  \
-             cargo run --manifest-path xtask/Cargo.toml -- theme-contract-check"
-        )
-    })?;
+    let dir = dir_arg
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("FERROPRESS_EXTERNAL_THEME_DIR").map(PathBuf::from))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no theme dir given. Pass it as an argument, or set \
+                 FERROPRESS_EXTERNAL_THEME_DIR, pointing at your theme project's themes/ dir \
+                 (one subfolder per theme, each a theme.toml + the four canonical templates), \
+                 e.g.:\n  \
+                 cargo run --manifest-path xtask/Cargo.toml -- theme-contract-check \
+                 /path/to/your-theme-project/theme\nor:\n  \
+                 FERROPRESS_EXTERNAL_THEME_DIR=/path/to/your-theme-project/theme \\\n  \
+                 cargo run --manifest-path xtask/Cargo.toml -- theme-contract-check"
+            )
+        })?;
     if !dir.is_dir() {
         bail!(
             "FERROPRESS_EXTERNAL_THEME_DIR ({}) is not a directory",
