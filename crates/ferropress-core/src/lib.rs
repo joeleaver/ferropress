@@ -52,5 +52,5 @@ pub use role::{Capability, Role};
 pub use seo::{Robots, Seo};
 pub use status::{CommentStatus, Status};
 pub use store::RhypeStore;
-pub use url::is_safe_href;
+pub use url::{is_safe_href, slugify};
 pub use value::{FieldMap, Object, ObjectId, TypeName, Value};

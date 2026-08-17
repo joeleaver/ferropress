@@ -1,4 +1,5 @@
-//! URL-safety helpers for author-supplied hyperlinks.
+//! URL-related text helpers: safety-checking author-supplied hyperlinks, and
+//! deriving URL-safe slugs from arbitrary text.
 //!
 //! The renderer turns an [`InlineRun`](crate::InlineRun)'s `href` into an
 //! `<a href>`, and the admin editor lets an author type an arbitrary link URL. A
@@ -11,6 +12,16 @@
 //! This mirrors the stricter `author_url` guard on comments (`ferropress-http`),
 //! which only permits absolute `http(s)`; content links additionally allow
 //! `mailto:` and relative/anchor URLs so authors can link within the site.
+//!
+//! [`slugify`] is unrelated to safety (its output is always a plain
+//! lowercase-alphanumeric-and-dash string, never a scheme) but lives here as the
+//! other URL-shaped text transform every consumer needs a SINGLE, lockstep copy
+//! of: `ferropress-http`'s admin surfaces (menu names, media filenames, term
+//! names) and, from Inc 3 on, the wasm admin-SPA client (matching the server's
+//! own reuse-by-slug decision for inline tag creation — see `posts.rs`'s
+//! `apply_terms`/`resolve_term_slug`) both call this SAME function, so a client
+//! guess ("will this become a new tag or reuse an existing one?") can never
+//! diverge from what the server actually decides.
 
 /// Whether `href` is safe to emit as an `<a href>` target.
 ///
@@ -63,9 +74,38 @@ fn scheme_of(url: &str) -> Option<String> {
     None
 }
 
+/// Derive a URL-safe single-segment slug from arbitrary text: lowercase ASCII
+/// alphanumerics are kept, every other run collapses to a single `-`, and leading/
+/// trailing dashes are trimmed. `None` when nothing survives (e.g. an all-symbol
+/// input, or an all-non-ASCII input like "日本語").
+///
+/// The LOCKSTEP pair every "does this text match an existing slug?" decision must
+/// share: `ferropress-http`'s admin surfaces (media filenames, menu names, term
+/// names — including the inline tag-creation reuse-by-slug decision,
+/// `posts.rs`'s `apply_terms`) and the wasm admin-SPA client (matching a typed
+/// tag name against the loaded vocabulary BEFORE save, so the "will be created"
+/// chip is never a lie the server's own slug match then contradicts). Never
+/// re-implement this — import it.
+pub fn slugify(text: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash {
+                slug.push('-');
+                pending_dash = false;
+            }
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() {
+            pending_dash = true;
+        }
+    }
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_safe_href;
+    use super::{is_safe_href, slugify};
 
     #[test]
     fn allows_http_https_and_mailto_any_case() {
@@ -129,6 +169,41 @@ mod tests {
         // text rather than a link. `tel:`/`ftp:` can be added later if wanted.
         for url in ["tel:+15551234", "ftp://example.com/f", "sms:12345"] {
             assert!(!is_safe_href(url), "{url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn slugify_lowercases_and_collapses_separators() {
+        // The fixture set `ferropress-http`'s pre-move copy was exercised against
+        // (menu names, media filenames, term names) — same inputs, same outputs,
+        // proving the moved function is a byte-for-byte behavioral match, not a
+        // reimplementation.
+        assert_eq!(slugify("Sci-Fi").as_deref(), Some("sci-fi"));
+        assert_eq!(slugify("Sci Fi").as_deref(), Some("sci-fi"));
+        assert_eq!(
+            slugify("  Leading and trailing  ").as_deref(),
+            Some("leading-and-trailing")
+        );
+        assert_eq!(
+            slugify("Multiple---Dashes").as_deref(),
+            Some("multiple-dashes")
+        );
+        assert_eq!(
+            slugify("Under_Score & Punct!").as_deref(),
+            Some("under-score-punct")
+        );
+        assert_eq!(slugify("already-a-slug").as_deref(), Some("already-a-slug"));
+        assert_eq!(slugify("2024").as_deref(), Some("2024"));
+        assert_eq!(
+            slugify("Ada Lovelace's Notes").as_deref(),
+            Some("ada-lovelace-s-notes")
+        );
+    }
+
+    #[test]
+    fn slugify_none_when_nothing_survives() {
+        for text in ["", "   ", "---", "!!!", "日本語", "★★★"] {
+            assert_eq!(slugify(text), None, "{text:?} should slugify to None");
         }
     }
 }

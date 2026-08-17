@@ -446,24 +446,3 @@ pub(crate) async fn reconcile_to_one(
     }
     Ok(())
 }
-
-/// Derive a URL-safe single-segment slug from arbitrary text: lowercase ASCII
-/// alphanumerics are kept, every other run collapses to a single `-`, and leading/
-/// trailing dashes are trimmed. `None` when nothing survives (e.g. an all-symbol
-/// input). Shared by media filenames and menu names.
-pub(crate) fn slugify(text: &str) -> Option<String> {
-    let mut slug = String::new();
-    let mut pending_dash = false;
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
-            if pending_dash {
-                slug.push('-');
-                pending_dash = false;
-            }
-            slug.push(ch.to_ascii_lowercase());
-        } else if !slug.is_empty() {
-            pending_dash = true;
-        }
-    }
-    if slug.is_empty() { None } else { Some(slug) }
-}

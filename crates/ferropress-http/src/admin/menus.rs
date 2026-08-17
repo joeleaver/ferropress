@@ -34,7 +34,9 @@ use ferropress_core::query::{Compare, Edge, FilterSpec};
 use ferropress_core::role::Capability;
 use ferropress_core::status::Status;
 use ferropress_core::value::{FieldMap, Object, ObjectId, TypeName, Value};
-use ferropress_core::{MENU_ITEM_TYPE, MENU_LOCATION_TYPE, MENU_TYPE, PAGE_TYPE, POST_TYPE};
+use ferropress_core::{
+    MENU_ITEM_TYPE, MENU_LOCATION_TYPE, MENU_TYPE, PAGE_TYPE, POST_TYPE, TAXONOMY_TYPE,
+};
 
 use super::{AdminError, AdminJson, AuthedUser, i32_field, str_field};
 use crate::AppState;
@@ -262,7 +264,13 @@ async fn load_menu_detail(state: &AppState, id: u64) -> Result<MenuDetail, Admin
 /// title regardless of publish state, so the editor names a draft target) and its public
 /// href (`Some` only when it currently resolves publicly). Two batched `get_many`s (all
 /// referenced Post ids, all referenced Page ids); `Custom` items carry no sidecar (the
-/// URL is in the target already), `Term` shows a placeholder until taxonomies land.
+/// URL is in the target already). `Term` is resolved live from [`AppState::taxonomies`]
+/// (no store round-trip — the same in-memory snapshot the public serve path reads); its
+/// title and href come from the SAME two accessors [`ferropress_serve::TaxonomySet`]
+/// exposes elsewhere (`term`/`archive_href`), so an admin-shown term name/href can never
+/// drift from what a live nav render shows. A term id the current snapshot can't resolve
+/// (deleted, or the narrow post-rename/pre-evict window) falls back to a "deleted"
+/// placeholder, mirroring the Post/Page arms exactly — never an error.
 async fn resolve_item_displays(
     state: &AppState,
     items: &mut [MenuItemNode],
@@ -278,6 +286,7 @@ async fn resolve_item_displays(
     }
     let posts = fetch_display_map(state, POST_TYPE, &post_ids).await?;
     let pages = fetch_display_map(state, PAGE_TYPE, &page_ids).await?;
+    let taxonomies = state.taxonomies.current();
 
     for n in items.iter_mut() {
         n.resolved = match &n.target {
@@ -293,9 +302,15 @@ async fn resolve_item_displays(
                     href: None,
                 }))
             }
-            LinkTarget::Term { id } => Some(ResolvedTarget {
-                title: format!("Term #{id}"),
-                href: None,
+            LinkTarget::Term { id } => Some(match taxonomies.term(*id) {
+                Some(entry) => ResolvedTarget {
+                    title: entry.name.clone(),
+                    href: taxonomies.archive_href(*id),
+                },
+                None => ResolvedTarget {
+                    title: format!("Term #{id} (deleted)"),
+                    href: None,
+                },
             }),
             // A Custom item's URL is its target; no sidecar needed.
             LinkTarget::Custom { .. } => None,
@@ -638,26 +653,37 @@ pub struct LinkCandidateQuery {
     pub limit: Option<usize>,
 }
 
-/// One pickable menu target: a PUBLISHED Post or Page, with the href a
-/// [`LinkTarget::Post`]/[`LinkTarget::Page`] pointing at it will resolve to. (The
-/// stored target is only the id; `href` is display sugar so the picker can show what
-/// it links to.)
+/// One pickable menu target: a PUBLISHED Post/Page, or a live taxonomy Term, with the
+/// href a [`LinkTarget::Post`]/[`LinkTarget::Page`]/[`LinkTarget::Term`] pointing at it
+/// will resolve to. (The stored target is only the id; `href` is display sugar so the
+/// picker can show what it links to — for a term this is its ONLY source: the client
+/// must never re-derive a term's archive path itself.) `taxonomy`/`depth` are `Some`
+/// ONLY for `kind: "term"` (the owning taxonomy's key, so the client can split one flat
+/// term list into per-taxonomy tabs; the term's ancestor depth within it, 0 = root, so
+/// the picker can indent the same way the Terms admin list does) — both absent (and
+/// omitted from the wire) for a page/post row, which has neither concept.
 #[derive(Serialize)]
 pub struct LinkCandidate {
     pub kind: &'static str,
     pub id: u64,
     pub title: String,
     pub href: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
 }
 
 /// `GET /admin/api/menus/link-candidates` response: Pages in full (few, hierarchical),
-/// Posts as a bounded slice (unbounded in a real blog), with a truncation flag so the
-/// UI can prompt a narrower search.
+/// Posts as a bounded slice (unbounded in a real blog), Terms in full (small, and the
+/// hierarchy matters for choosing — mirrors Pages), with a truncation flag so the UI
+/// can prompt a narrower search.
 #[derive(Serialize)]
 pub struct LinkCandidatesResponse {
     pub pages: Vec<LinkCandidate>,
     pub posts: Vec<LinkCandidate>,
     pub posts_truncated: bool,
+    pub terms: Vec<LinkCandidate>,
 }
 
 /// `GET /admin/api/menus/link-candidates` — the PUBLISHED Post + Page targets for the
@@ -692,10 +718,14 @@ pub async fn link_candidates(
     let posts_truncated = posts.len() > limit;
     posts.truncate(limit);
 
+    // Terms: every live term across every taxonomy (few, like Pages — return them all).
+    let terms = collect_term_candidates(&state, needle.as_deref()).await?;
+
     Ok(Json(LinkCandidatesResponse {
         pages,
         posts,
         posts_truncated,
+        terms,
     }))
 }
 
@@ -739,7 +769,69 @@ async fn collect_candidates(
             id: obj.id.0,
             title,
             href,
+            taxonomy: None,
+            depth: None,
         });
+    }
+    Ok(out)
+}
+
+/// Every LIVE term across every taxonomy, flat-with-depth PER taxonomy — the SAME
+/// DFS/name-asc ordering + depth [`super::terms::flatten_tree`] gives the Terms admin
+/// list, so the picker's indentation agrees with it. `needle`-filtered on name or href
+/// (matching Pages/Posts). `href` is resolved from the LIVE [`AppState::taxonomies`]
+/// snapshot — the ONE source [`resolve_item_displays`] also reads, so a picked term's
+/// link can never drift from what a saved menu item later shows. A term the snapshot
+/// can't yet resolve (the narrow window between a create and the taxonomy handle's
+/// reload) is skipped rather than offered with a placeholder href — mirroring
+/// `collect_candidates`'s own "no resolvable href → not a candidate" rule for
+/// Pages/Posts, since offering it would only add a dead link.
+///
+/// Deliberately NOT flattened through [`candidate_key`] (case-folded title, then id):
+/// that sort would scramble parent/child adjacency, making the `depth` field actively
+/// misleading (a child sorted above its own parent). Taxonomies are iterated key-sorted
+/// (the same determinism `list_taxonomies` gives — the store scan itself has no
+/// guaranteed order) with each one's own rows in DFS/depth order; `candidate_key`
+/// stays what `pages`/`posts` sort by, matching their own (non-hierarchical) shape.
+async fn collect_term_candidates(
+    state: &AppState,
+    needle: Option<&str>,
+) -> Result<Vec<LinkCandidate>, AdminError> {
+    let taxonomies = state.taxonomies.current();
+    let mut tax_objs = state.store.scan(&TypeName::from(TAXONOMY_TYPE)).await?;
+    tax_objs.sort_by(|a, b| {
+        str_field(a, "key")
+            .unwrap_or_default()
+            .cmp(&str_field(b, "key").unwrap_or_default())
+    });
+
+    let mut out = Vec::new();
+    for tax_obj in &tax_objs {
+        let key = str_field(tax_obj, "key").unwrap_or_default();
+        if key.is_empty() {
+            continue;
+        }
+        let rows = super::terms::load_term_rows(state, tax_obj.id).await?;
+        for (id, depth) in super::terms::flatten_tree(&rows) {
+            let Some(href) = taxonomies.archive_href(id) else {
+                continue;
+            };
+            let row = &rows[&id];
+            if let Some(n) = needle
+                && !row.name.to_lowercase().contains(n)
+                && !href.to_lowercase().contains(n)
+            {
+                continue;
+            }
+            out.push(LinkCandidate {
+                kind: "term",
+                id,
+                title: row.name.clone(),
+                href,
+                taxonomy: Some(key.clone()),
+                depth: Some(depth as u32),
+            });
+        }
     }
     Ok(out)
 }
@@ -1320,7 +1412,7 @@ fn target_from_field(obj: &Object) -> Option<LinkTarget> {
 fn resolve_slug(explicit: Option<&str>, name: &str) -> Result<String, AdminError> {
     match explicit.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => super::content_ops::validate_slug(s),
-        None => super::slugify(name).ok_or_else(|| {
+        None => ferropress_core::slugify(name).ok_or_else(|| {
             AdminError::BadRequest(
                 "could not derive a slug from the name; please provide a slug".to_owned(),
             )

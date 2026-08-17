@@ -345,7 +345,7 @@ fn slugify_filename(filename: &str) -> Option<String> {
     // Drop any path prefix, then the extension, then slugify the stem.
     let stem = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s);
-    super::slugify(stem)
+    ferropress_core::slugify(stem)
 }
 
 #[cfg(test)]

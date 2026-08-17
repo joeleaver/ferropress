@@ -3020,7 +3020,28 @@ async fn menu_link_candidates_are_published_only_searched_and_bounded() {
     seed_post(&store, "secret-draft", Status::Draft).await;
     create_page(&state, &cookie, "about", None, "published").await;
 
-    // All candidates: the two published posts (never the draft), the page with its path href.
+    // B2(b): two taxonomies, a root + child category (depth-ordered) and a root tag.
+    let cat_id = seed_taxonomy(&store, "category", true, true).await;
+    let tag_id = seed_taxonomy(&store, "tag", false, true).await;
+    let fiction_id = seed_term(&store, cat_id, "fiction", "Fiction", None).await;
+    let space_opera_id = seed_term(
+        &store,
+        cat_id,
+        "space-opera",
+        "Space Opera",
+        Some(fiction_id),
+    )
+    .await;
+    let bronze_tag_id = seed_term(&store, tag_id, "bronze", "Bronze", None).await;
+    let taxonomies = ferropress_serve::TaxonomyHandle::new(
+        ferropress_serve::load_taxonomies(&store)
+            .await
+            .expect("load taxonomies"),
+    );
+    let state = state.with_taxonomies(taxonomies);
+
+    // All candidates: the two published posts (never the draft), the page with its
+    // path href, and every live term across BOTH taxonomies.
     let (s, body) = send(
         &state,
         "GET",
@@ -3032,6 +3053,7 @@ async fn menu_link_candidates_are_published_only_searched_and_bounded() {
     assert_eq!(s, StatusCode::OK, "link-candidates: {body}");
     let posts = body["posts"].as_array().unwrap();
     let pages = body["pages"].as_array().unwrap();
+    let terms = body["terms"].as_array().unwrap();
     let post_slugs: Vec<&str> = posts.iter().map(|p| p["href"].as_str().unwrap()).collect();
     assert!(post_slugs.contains(&"/iron-oxide") && post_slugs.contains(&"/bronze-age"));
     assert!(
@@ -3044,7 +3066,43 @@ async fn menu_link_candidates_are_published_only_searched_and_bounded() {
     assert_eq!(posts[0]["kind"], "post");
     assert_eq!(body["posts_truncated"], false);
 
-    // `q` filters by title/href (case-insensitive): only the bronze post matches.
+    // B2(b): all three terms present, each carrying kind="term", the OWNING
+    // taxonomy's key (so the client can split into Categories/Tags tabs), a
+    // server-derived href (the client never re-derives it), and depth.
+    assert_eq!(terms.len(), 3, "{terms:?}");
+    let fiction_row = terms.iter().find(|t| t["id"] == fiction_id.0).unwrap();
+    assert_eq!(fiction_row["kind"], "term");
+    assert_eq!(fiction_row["taxonomy"], "category");
+    assert_eq!(fiction_row["href"], "/category/fiction");
+    assert_eq!(fiction_row["depth"], 0);
+    let space_opera_row = terms.iter().find(|t| t["id"] == space_opera_id.0).unwrap();
+    assert_eq!(space_opera_row["taxonomy"], "category");
+    assert_eq!(space_opera_row["href"], "/category/fiction/space-opera");
+    assert_eq!(
+        space_opera_row["depth"], 1,
+        "a child term indents under its parent: {space_opera_row}"
+    );
+    let bronze_tag_row = terms.iter().find(|t| t["id"] == bronze_tag_id.0).unwrap();
+    assert_eq!(
+        bronze_tag_row["taxonomy"], "tag",
+        "a DIFFERENT taxonomy key: {bronze_tag_row}"
+    );
+    assert_eq!(bronze_tag_row["href"], "/tag/bronze");
+
+    // Category rows precede the Fiction/Space Opera pair's own DFS order (parent
+    // before child) — the hierarchy is never scrambled by an alphabetical sort.
+    let fiction_pos = terms.iter().position(|t| t["id"] == fiction_id.0).unwrap();
+    let space_opera_pos = terms
+        .iter()
+        .position(|t| t["id"] == space_opera_id.0)
+        .unwrap();
+    assert!(
+        fiction_pos < space_opera_pos,
+        "a parent must be listed before its child: {terms:?}"
+    );
+
+    // `q` filters by title/href (case-insensitive) across posts AND terms: only the
+    // bronze post AND the bronze tag match "BRONZE" — Fiction/Space Opera don't.
     let (s, body) = send(
         &state,
         "GET",
@@ -3057,6 +3115,13 @@ async fn menu_link_candidates_are_published_only_searched_and_bounded() {
     let posts = body["posts"].as_array().unwrap();
     assert_eq!(posts.len(), 1);
     assert_eq!(posts[0]["href"], "/bronze-age");
+    let terms = body["terms"].as_array().unwrap();
+    assert_eq!(
+        terms.len(),
+        1,
+        "only the bronze TAG must match, not Fiction: {terms:?}"
+    );
+    assert_eq!(terms[0]["id"], bronze_tag_id.0);
 
     // `limit` bounds the Post slice and surfaces truncation.
     let (s, body) = send(
@@ -3085,10 +3150,23 @@ async fn menu_item_resolved_sidecar_names_and_links_targets() {
     let (store, state) = boot(dir.path());
     let cookie = admin_cookie(&state, &store).await;
 
-    // A published post, a draft page (title known, but no public href), and a menu
-    // pointing a Post item, a Page item, and a Custom item at them.
+    // A published post, a draft page (title known, but no public href), and a live
+    // term — plus an id no term will ever resolve to (the deleted-term case, B2(a)).
     let post_id = seed_post(&store, "iron-oxide", Status::Published).await;
     let page_id = create_page(&state, &cookie, "hidden", None, "draft").await;
+    let tax_id = seed_taxonomy(&store, "category", true, true).await;
+    let term_id = seed_term(&store, tax_id, "fiction", "Fiction", None).await;
+    let deleted_term_id = term_id.0 + 9999; // never seeded — unresolvable by construction
+
+    // B2(a) reads AppState::taxonomies live, not the store — the handle must be
+    // wired for the term item's sidecar to resolve at all (the default/empty
+    // handle a bare `boot()` gives would make EVERY term "deleted").
+    let taxonomies = ferropress_serve::TaxonomyHandle::new(
+        ferropress_serve::load_taxonomies(&store)
+            .await
+            .expect("load taxonomies"),
+    );
+    let state = state.with_taxonomies(taxonomies);
 
     let (_s, body) = send(
         &state,
@@ -3108,22 +3186,32 @@ async fn menu_item_resolved_sidecar_names_and_links_targets() {
         Some(serde_json::json!({ "items": [
             { "client_id": "p", "label": "", "target": { "kind": "post", "id": post_id.0 } },
             { "client_id": "g", "label": "", "target": { "kind": "page", "id": page_id } },
-            { "client_id": "c", "label": "Elsewhere", "target": { "kind": "custom", "url": "/x" } }
+            { "client_id": "c", "label": "Elsewhere", "target": { "kind": "custom", "url": "/x" } },
+            { "client_id": "t", "label": "", "target": { "kind": "term", "id": term_id.0 } },
+            { "client_id": "d", "label": "", "target": { "kind": "term", "id": deleted_term_id } }
         ]})),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "put items: {detail}");
     let items = detail["items"].as_array().unwrap();
-    let by_label_target = |k: &str| items.iter().find(|i| i["target"]["kind"] == k).unwrap();
+    // The server reassigns `client_id` to the persisted item's own store id on
+    // write-back (not an echo of what was submitted), so items sharing a `target.
+    // kind` (both term rows here) must be told apart by `target.id` instead.
+    let by_target_id = |k: &str, tid: u64| {
+        items
+            .iter()
+            .find(|i| i["target"]["kind"] == k && i["target"]["id"] == tid)
+            .unwrap()
+    };
 
     // Published post: resolved title from the post, href present (matches compose).
-    let post_item = by_label_target("post");
+    let post_item = by_target_id("post", post_id.0);
     assert_eq!(post_item["resolved"]["title"], "Title iron-oxide");
     assert_eq!(post_item["resolved"]["href"], "/iron-oxide");
 
     // Draft page: title still resolves (so the editor names it), but NO href — the
     // editor's signal that it won't render in the live nav.
-    let page_item = by_label_target("page");
+    let page_item = by_target_id("page", page_id);
     assert_eq!(page_item["resolved"]["title"], "Page hidden");
     assert!(
         page_item["resolved"]["href"].is_null(),
@@ -3131,8 +3219,29 @@ async fn menu_item_resolved_sidecar_names_and_links_targets() {
     );
 
     // Custom item: no sidecar (its URL is already the target).
-    let custom_item = by_label_target("custom");
+    let custom_item = items
+        .iter()
+        .find(|i| i["target"]["kind"] == "custom")
+        .unwrap();
     assert!(custom_item["resolved"].is_null());
+
+    // B2(a): a live term resolves its REAL name + its archive href — never the old
+    // "Term #{id}" placeholder, never a store round-trip's worth of guessing.
+    let term_item = by_target_id("term", term_id.0);
+    assert_eq!(term_item["resolved"]["title"], "Fiction");
+    assert_eq!(term_item["resolved"]["href"], "/category/fiction");
+
+    // B2(a): an unresolvable term id mirrors the Post/Page "(deleted)" fallback
+    // exactly — never an error, never the placeholder title, never a stray href.
+    let deleted_item = by_target_id("term", deleted_term_id);
+    assert_eq!(
+        deleted_item["resolved"]["title"],
+        format!("Term #{deleted_term_id} (deleted)")
+    );
+    assert!(
+        deleted_item["resolved"]["href"].is_null(),
+        "an unresolvable term must resolve NO href: {deleted_item}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3343,6 +3452,57 @@ async fn seed_taxonomy(
         .expect("seed taxonomy")
 }
 
+/// Seed a Term row DIRECTLY (bypassing the admin handlers' own validation) linked
+/// to `taxonomy_id` and, optionally, a parent term — for tests that need term
+/// fixtures without exercising `create`'s own guards. `meta` starts empty (rev 0
+/// — a genuinely never-touched term, matching what a migrate-tool-seeded row
+/// looks like before its first admin edit).
+async fn seed_term(
+    store: &Arc<dyn RhypeStore>,
+    taxonomy_id: ObjectId,
+    slug: &str,
+    name: &str,
+    parent: Option<ObjectId>,
+) -> ObjectId {
+    let mut f: FieldMap = HashMap::new();
+    f.insert("slug".to_owned(), Value::String(slug.to_owned()));
+    f.insert("name".to_owned(), Value::String(name.to_owned()));
+    f.insert("description".to_owned(), Value::String(String::new()));
+    f.insert("plaintext".to_owned(), Value::String(name.to_owned()));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let id = store
+        .create(&TypeName::from("Term"), f)
+        .await
+        .expect("seed term");
+    store
+        .link(
+            &Edge {
+                type_name: TypeName::from("Term"),
+                id,
+                field: "taxonomy".to_owned(),
+            },
+            taxonomy_id,
+            HashMap::new(),
+        )
+        .await
+        .expect("link term taxonomy");
+    if let Some(p) = parent {
+        store
+            .link(
+                &Edge {
+                    type_name: TypeName::from("Term"),
+                    id,
+                    field: "parent".to_owned(),
+                },
+                p,
+                HashMap::new(),
+            )
+            .await
+            .expect("link term parent");
+    }
+    id
+}
+
 /// Seed a Page row DIRECTLY (bypassing the admin handlers and their guards) — for
 /// grandfathering/legacy-state tests that need a row the current guards would
 /// refuse to create. Mirrors the create handler's scalar fields.
@@ -3462,7 +3622,7 @@ async fn term_crud_hierarchy_per_sibling_uniqueness_and_promote_on_delete() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let rows = list.as_array().unwrap();
+    let rows = list["terms"].as_array().unwrap();
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0]["name"], "Fiction");
     assert_eq!(rows[0]["depth"], 0);
@@ -3535,7 +3695,7 @@ async fn term_crud_hierarchy_per_sibling_uniqueness_and_promote_on_delete() {
         None,
     )
     .await;
-    let rows = list.as_array().unwrap();
+    let rows = list["terms"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "child survives its parent's deletion");
     assert!(
         rows.iter()
@@ -3587,7 +3747,7 @@ async fn term_delete_reparents_children_to_the_grandparent() {
         None,
     )
     .await;
-    let rows = list.as_array().unwrap();
+    let rows = list["terms"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "{list}");
     let gamma_row = rows
         .iter()
@@ -4465,10 +4625,226 @@ async fn term_list_counts_are_published_only_and_direct() {
 
     let (_, list) = do_json(&state, "GET", "/admin/api/terms?taxonomy=tag", &ed, None).await;
     assert_eq!(
-        list.as_array().unwrap()[0]["count"],
+        list["terms"].as_array().unwrap()[0]["count"],
         1,
         "count is published-only (the draft doesn't leak): {list}"
     );
+}
+
+/// B2(c): `?counts=0` skips the count derivation entirely — a real term that DOES
+/// have a published post keeps its response shape but the count field itself reads
+/// 0, proving the cheap path took over rather than merely happening to compute 0.
+/// (No store-scan-counting instrumentation exists on the real `EmbeddedStore` test
+/// backend — see the `?counts=0` doc comment's own note — so this is the externally
+/// observable half of the contract the task's own fallback sanctions: the response
+/// shape changes with the mode, not just its cost.)
+#[tokio::test]
+async fn term_list_counts_zero_mode_skips_the_derivation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    let ann = seed_user(&store, "ann", "hunter2hunter2", "author").await;
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "tag", false, true).await;
+    let ed = login_cookie(&state, "ed").await;
+    let (_, t) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Counted"})),
+    )
+    .await;
+    let t = t["id"].as_u64().unwrap();
+
+    let post = seed_post(&store, "pub", Status::Published).await;
+    set_author(&store, post, ann).await;
+    let ann_cookie = login_cookie(&state, "ann").await;
+    let mut body = post_save_body("pub", serde_json::json!({"terms": [t]}));
+    body["status"] = serde_json::json!("published");
+    let (st, b) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/posts/{}", post.0),
+        &ann_cookie,
+        Some(body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+
+    // The default (no `counts` param) path: a real, non-zero count.
+    let (_, list) = do_json(&state, "GET", "/admin/api/terms?taxonomy=tag", &ed, None).await;
+    assert_eq!(list["terms"].as_array().unwrap()[0]["count"], 1, "{list}");
+
+    // `?counts=0`: the SAME real assignment, but the response reads 0 — the cheap
+    // path never ran the get_links_many/get_many derivation at all.
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&counts=0",
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(
+        list["terms"].as_array().unwrap()[0]["count"],
+        0,
+        "counts=0 must skip the derivation entirely: {list}"
+    );
+
+    // A non-zero `counts` value is NOT "false" — only the literal `0` opts out
+    // (`Option<u8>`, not `bool`: see `ListTermsQuery::counts`'s own doc comment).
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&counts=1",
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(list["terms"].as_array().unwrap()[0]["count"], 1, "{list}");
+}
+
+/// B2(c): `q` (name-or-slug substring) + an explicit `limit` bound the response and
+/// report `truncated`; an ABSENT `limit` stays unbounded (a regression guard —
+/// unlike the link-candidates picker, this endpoint must never silently hide real
+/// terms past a default cap: the Terms management screen and the category
+/// checklist both rely on seeing everything when they don't ask for a page).
+#[tokio::test]
+async fn term_list_q_limit_and_truncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let tax_id = seed_taxonomy(&store, "tag", false, true).await;
+    seed_term(&store, tax_id, "rust", "Rust", None).await;
+    seed_term(&store, tax_id, "ruby", "Ruby", None).await;
+    seed_term(&store, tax_id, "python", "Python", None).await;
+    let ed = login_cookie(&state, "ed").await;
+
+    // No `q`, no `limit`: everything, unbounded, `truncated: false`.
+    let (st, list) = do_json(&state, "GET", "/admin/api/terms?taxonomy=tag", &ed, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list["terms"].as_array().unwrap().len(), 3, "{list}");
+    assert_eq!(list["truncated"], false);
+
+    // `q` substring-matches name OR slug, case-insensitively: "ru" matches Rust AND
+    // Ruby, not Python.
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&q=RU",
+        &ed,
+        None,
+    )
+    .await;
+    let names: Vec<String> = list["terms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.contains(&"Rust".to_owned()) && names.contains(&"Ruby".to_owned()));
+
+    // An explicit `limit` bounds the (name-asc) result and sets `truncated`.
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&limit=1",
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(list["terms"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["truncated"], true, "{list}");
+
+    // A `limit` at or above the true count never reports truncation.
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&limit=3",
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(list["terms"].as_array().unwrap().len(), 3);
+    assert_eq!(list["truncated"], false);
+}
+
+/// SF12: a TermEditor form's `expected_rev` must match the term's CURRENT rev or
+/// the whole write is refused (409) — the lost-update guard that stops a stale
+/// form from silently reverting a rename/re-parent that happened elsewhere.
+#[tokio::test]
+async fn term_update_refuses_a_stale_expected_rev() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    seed_taxonomy(&store, "tag", false, true).await;
+    let ed = login_cookie(&state, "ed").await;
+
+    let (st, created) = do_json(
+        &state,
+        "POST",
+        "/admin/api/terms",
+        &ed,
+        Some(serde_json::json!({"taxonomy": "tag", "name": "Fiction"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    let id = created["id"].as_u64().unwrap();
+    // A freshly created term's first real rev — touch_term bumps 0 -> 1.
+    assert_eq!(created["rev"], 1, "{created}");
+
+    // The list's own `rev` field agrees with what create echoed (the client's
+    // OTHER seed path for a TermEditor form, opened from a list row).
+    let (_, list) = do_json(&state, "GET", "/admin/api/terms?taxonomy=tag", &ed, None).await;
+    assert_eq!(list["terms"].as_array().unwrap()[0]["rev"], 1, "{list}");
+
+    // A form loaded at rev 1, saved while still at rev 1: succeeds, rev advances.
+    let (st, updated) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/terms/{id}"),
+        &ed,
+        Some(serde_json::json!({"name": "Fiction (renamed)", "expected_rev": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{updated}");
+    assert_eq!(updated["rev"], 2, "{updated}");
+
+    // The SAME stale rev (1) again — as if two forms were opened concurrently and
+    // the first one's save already landed: refused, 409, the term UNCHANGED.
+    let (st, conflict) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/terms/{id}"),
+        &ed,
+        Some(serde_json::json!({"name": "Fiction (stale write)", "expected_rev": 1})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{conflict}");
+    let (_, list) = do_json(&state, "GET", "/admin/api/terms?taxonomy=tag", &ed, None).await;
+    let row = &list["terms"].as_array().unwrap()[0];
+    assert_eq!(
+        row["name"], "Fiction (renamed)",
+        "a stale-rev save must NOT have applied: {list}"
+    );
+    assert_eq!(
+        row["rev"], 2,
+        "a refused write must not advance the rev: {list}"
+    );
+
+    // No `expected_rev` at all: today's last-write-wins behavior, unaffected —
+    // an older/other client that doesn't send it must keep working.
+    let (st, updated) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/terms/{id}"),
+        &ed,
+        Some(serde_json::json!({"name": "Fiction (no precondition)"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{updated}");
+    assert_eq!(updated["rev"], 3, "{updated}");
 }
 
 // ---------------------------------------------------------------------------

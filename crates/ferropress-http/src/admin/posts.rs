@@ -1070,8 +1070,9 @@ async fn apply_terms(
             Some(id) => resolved_new.push(*id),
             None => {
                 let rows = rows_cache.get_mut(&tax.id.0).expect("cached in DECIDE");
-                let id = term_ops::create_term_core(state, tax, rows, name, Some(slug), "", None)
-                    .await?;
+                let (id, rev) =
+                    term_ops::create_term_core(state, tax, rows, name, Some(slug), "", None)
+                        .await?;
                 // Keep the snapshot true for a later create in the SAME taxonomy
                 // (its sibling-uniqueness check must see this one).
                 rows.insert(
@@ -1081,6 +1082,7 @@ async fn apply_terms(
                         name: name.clone(),
                         description: String::new(),
                         parent: None,
+                        rev,
                     },
                 );
                 resolved_new.push(id);

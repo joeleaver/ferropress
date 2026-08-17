@@ -40,8 +40,14 @@
 //! * **Eventless-link touch**: rhypedb `link`/`unlink` emit NO ChangeEvent, and a
 //!   term's `taxonomy`/`parent` are links. A Term CREATE event would reach the (Inc-2)
 //!   live `TaxonomyHandle` BEFORE its taxonomy link commits — leaving the handle
-//!   permanently stale — so every mutation ends with [`touch_term`] (a `meta._rev`
-//!   bump → one settling `Term` Update AFTER all link work), the `touch_menu` idiom.
+//!   permanently stale — so every mutation ends with a `meta._rev` bump ([`touch_term`]
+//!   for create/delete-settle; `update`'s own scalar write inlines the identical bump
+//!   via [`bumped_meta`], since it IS already the settling write and a second store
+//!   round-trip would be wasted) — one settling `Term` Update AFTER all link work,
+//!   the `touch_menu` idiom. `_rev` doubles (SF12) as [`TermDto`]/[`TermRef`]'s
+//!   optimistic-concurrency token: [`UpdateTermRequest::expected_rev`] refuses a
+//!   stale TermEditor form's save rather than silently reverting a rename/re-parent
+//!   that happened elsewhere.
 //!
 //! Deriveds: `Term.plaintext` (the `@vectorize` source) is `name + description`,
 //! refreshed on every write. The stored `Term.count` column is intentionally DEAD —
@@ -76,6 +82,12 @@ pub(super) const MAX_TERM_DEPTH: usize = 10;
 /// "the bare base, page 2". `feed` is reserved for future per-archive feeds.
 const RESERVED_TERM_SLUGS: &[&str] = &["page", "feed"];
 
+/// The hard ceiling on an explicit `limit` (a runaway-payload guard), mirrors
+/// `menus.rs`'s `LINK_CANDIDATE_MAX_LIMIT`. Unlike that endpoint, an ABSENT `limit`
+/// here is unbounded by design (see [`list`]'s doc comment) — there is no matching
+/// "default" constant.
+const TERM_LIST_MAX_LIMIT: usize = 200;
+
 // ---- DTOs -------------------------------------------------------------------
 
 /// One taxonomy, for the admin's vocabulary pickers + the term-management screen.
@@ -105,6 +117,18 @@ pub struct TermDto {
     /// admin count column semantics — the archive's rolled-up total is a different,
     /// serve-side number). Derived live, never the dead stored `count` column.
     pub count: usize,
+    /// `meta._rev` (SF12) — a TermEditor form opened from this row should snapshot
+    /// this and echo it back as [`UpdateTermRequest::expected_rev`] on save.
+    pub rev: i64,
+}
+
+/// `GET /admin/api/terms` response: the taxonomy's terms (name-asc/DFS-ordered, capped
+/// at `limit`) plus a truncation flag — mirrors `LinkCandidatesResponse::posts_truncated`
+/// — so the UI can prompt a narrower `q` once volume passes the limit.
+#[derive(Serialize)]
+pub struct ListTermsResponse {
+    pub terms: Vec<TermDto>,
+    pub truncated: bool,
 }
 
 /// The created/updated term echoed back to the client.
@@ -114,13 +138,35 @@ pub struct TermRef {
     pub slug: String,
     pub name: String,
     pub parent: Option<u64>,
+    /// `meta._rev` AFTER this write (SF12) — lets the client refresh its local
+    /// snapshot without a re-fetch, so an immediate second edit still carries a
+    /// live precondition.
+    pub rev: i64,
 }
 
-/// `GET /admin/api/terms` query: which taxonomy's terms to list.
+/// `GET /admin/api/terms` query: which taxonomy's terms to list, plus the CHEAP-mode
+/// knobs the post editor's assignment panels need (they show name/slug/hierarchy only,
+/// never the live count).
 #[derive(Deserialize)]
 pub struct ListTermsQuery {
     /// The taxonomy KEY (`"category"`, `"tag"`).
     pub taxonomy: String,
+    /// `0` skips the live-count derivation entirely (see [`list`]'s doc comment) —
+    /// `Option<u8>`, not `bool`: a plain query string (`serde_urlencoded`) parses a
+    /// Rust `bool` field only from the literal strings `"true"`/`"false"`, not `"0"`/
+    /// `"1"`, so a bool field would silently reject `?counts=0` as a 400 rather than
+    /// take the fast path. Absent, or any non-zero value, keeps counts (today's
+    /// behavior, and the term-management screen's own default).
+    #[serde(default)]
+    pub counts: Option<u8>,
+    /// Case-insensitive substring match on name OR slug (mirrors the link-candidate
+    /// picker's own `needle`, `menus.rs`'s `LinkCandidateQuery`) — funds bounded tag
+    /// suggestions (design ruling Q5/Q8) without dumping the whole vocabulary.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Caps the returned (already name-asc/DFS-ordered) rows; see [`TERM_LIST_MAX_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// `POST /admin/api/terms` body.
@@ -151,6 +197,15 @@ pub struct UpdateTermRequest {
     pub description: String,
     #[serde(default)]
     pub parent: Option<u64>,
+    /// The `rev` (SF12) the client's form was loaded/last-saved at. `Some` and
+    /// stale (≠ the term's CURRENT `meta._rev`, checked atomically under
+    /// `taxonomy_lock`) → 409, the whole write refused, so a stale form can never
+    /// silently revert a rename or re-parent that happened elsewhere. `None` skips
+    /// the check entirely (an older/other client that doesn't send it keeps
+    /// today's last-write-wins behavior) — never a hazard the SERVER introduces,
+    /// only one an opted-in client closes.
+    #[serde(default)]
+    pub expected_rev: Option<i64>,
 }
 
 // ---- handlers ---------------------------------------------------------------
@@ -184,48 +239,88 @@ pub async fn list_taxonomies(
 /// tree (DFS, siblings case-folded-name-asc — Term has no ordinal column, so the
 /// order is pinned here and mirrored by the serve-side TaxonomyHandle), each with its
 /// live DIRECT published-post count. Readable by anyone who can edit content.
+///
+/// `?counts=0` skips the count derivation ENTIRELY — no `get_links_many`, no `get_many`
+/// — for the post editor's assignment panels, which never display it (unlike the Terms
+/// management screen, which does and so omits the query param, defaulting to counted).
+/// `q` (name-or-slug substring) + an EXPLICIT `limit` (capped at
+/// [`TERM_LIST_MAX_LIMIT`] when given; ABSENT `limit` returns the whole matching set,
+/// unbounded — see below) fund bounded tag suggestions without ever dumping the whole
+/// vocabulary (design ruling Q5/Q8); `truncated` mirrors the link-candidates picker's
+/// `posts_truncated` so the UI can prompt a narrower search. `q`/`limit` target the
+/// FLAT (non-hierarchical) case — a matching row's ANCESTORS are not specially kept
+/// visible, so filtering a hierarchical taxonomy can orphan a matched child under an
+/// absent parent row. The pinned client design never sends `q` for the category
+/// checklist (it always shows the full small vocabulary); a future hierarchical search
+/// UI needs the ruling's separate "keep ancestors visible" treatment, client-side, on
+/// top of this.
+///
+/// Unlike the link-candidates picker (Posts are potentially unbounded, so a missing
+/// `limit` there still defaults to a bounded page), an ABSENT `limit` HERE returns
+/// everything — unchanged from this endpoint's pre-existing (pre-B2(c)) behavior. The
+/// Terms management screen and the category checklist both rely on that: a silent
+/// default cap would quietly hide real categories/tags past it. `limit` only bounds
+/// when a caller opts in (the tag-suggestion path).
 pub async fn list(
     State(state): State<AppState>,
     who: AuthedUser,
-    Query(q): Query<ListTermsQuery>,
-) -> Result<Json<Vec<TermDto>>, AdminError> {
+    Query(query): Query<ListTermsQuery>,
+) -> Result<Json<ListTermsResponse>, AdminError> {
     who.require(Capability::EditOwnContent)?;
 
-    let taxonomy = taxonomy_by_key(&state, &q.taxonomy).await?;
+    let taxonomy = taxonomy_by_key(&state, &query.taxonomy).await?;
     let rows = load_term_rows(&state, taxonomy.id).await?;
+    let want_counts = query.counts != Some(0);
 
     // Live DIRECT counts: one batched inverse traversal (Term.objects), then one
     // batched post read to apply the publish gate — a raw link count would count
-    // drafts/trashed (over-counting AND leaking a draft's membership).
-    let ids: Vec<ObjectId> = rows.keys().map(|id| ObjectId(*id)).collect();
-    let links_per = state
-        .store
-        .get_links_many(&TypeName::from(TERM_TYPE), &ids, "objects")
-        .await?;
-    let mut post_ids: Vec<ObjectId> = links_per.iter().flatten().copied().collect();
-    post_ids.sort_unstable();
-    post_ids.dedup();
-    let published: HashSet<ObjectId> = if post_ids.is_empty() {
-        HashSet::new()
-    } else {
-        state
+    // drafts/trashed (over-counting AND leaking a draft's membership). Skipped
+    // ENTIRELY (no store read at all) when the caller doesn't want counts — this is
+    // the near-full published-post scan `?counts=0` exists to avoid.
+    let counts: HashMap<u64, usize> = if want_counts {
+        let ids: Vec<ObjectId> = rows.keys().map(|id| ObjectId(*id)).collect();
+        let links_per = state
             .store
-            .get_many(&TypeName::from(POST_TYPE), &post_ids)
-            .await?
-            .iter()
-            .filter(|o| is_published(o))
-            .map(|o| o.id)
+            .get_links_many(&TypeName::from(TERM_TYPE), &ids, "objects")
+            .await?;
+        let mut post_ids: Vec<ObjectId> = links_per.iter().flatten().copied().collect();
+        post_ids.sort_unstable();
+        post_ids.dedup();
+        let published: HashSet<ObjectId> = if post_ids.is_empty() {
+            HashSet::new()
+        } else {
+            state
+                .store
+                .get_many(&TypeName::from(POST_TYPE), &post_ids)
+                .await?
+                .iter()
+                .filter(|o| is_published(o))
+                .map(|o| o.id)
+                .collect()
+        };
+        ids.iter()
+            .zip(&links_per)
+            .map(|(id, links)| (id.0, links.iter().filter(|p| published.contains(p)).count()))
             .collect()
+    } else {
+        HashMap::new()
     };
-    let counts: HashMap<u64, usize> = ids
-        .iter()
-        .zip(&links_per)
-        .map(|(id, links)| (id.0, links.iter().filter(|p| published.contains(p)).count()))
-        .collect();
+
+    let needle = query
+        .q
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
 
     let mut out = Vec::with_capacity(rows.len());
     for (id, depth) in flatten_tree(&rows) {
         let row = &rows[&id];
+        if let Some(n) = needle.as_deref()
+            && !row.name.to_lowercase().contains(n)
+            && !row.slug.to_lowercase().contains(n)
+        {
+            continue;
+        }
         out.push(TermDto {
             id,
             slug: row.slug.clone(),
@@ -234,9 +329,30 @@ pub async fn list(
             parent: row.parent,
             depth,
             count: counts.get(&id).copied().unwrap_or(0),
+            rev: row.rev,
         });
     }
-    Ok(Json(out))
+
+    // Unlike the link-candidates picker (Posts are potentially unbounded, so a missing
+    // `limit` still defaults to a bounded page), an ABSENT `limit` here means "the
+    // whole vocabulary" and returns everything, unchanged from this endpoint's
+    // pre-existing behavior — the Terms management screen and the category checklist
+    // both rely on that (a silent 50-cap would quietly hide real categories/tags past
+    // it). `limit` is bounding ONLY when the caller opts in (the tag-suggestion path).
+    let truncated = match query.limit {
+        Some(requested) => {
+            let limit = requested.clamp(1, TERM_LIST_MAX_LIMIT);
+            let truncated = out.len() > limit;
+            out.truncate(limit);
+            truncated
+        }
+        None => false,
+    };
+
+    Ok(Json(ListTermsResponse {
+        terms: out,
+        truncated,
+    }))
 }
 
 /// `POST /admin/api/terms` — create a term (`ManageTerms`, Editor+).
@@ -253,7 +369,7 @@ pub async fn create(
     // creates can't both pass (Term.slug is not engine-unique).
     let _guard = state.taxonomy_lock.lock().await;
     let rows = load_term_rows(&state, taxonomy.id).await?;
-    let id = create_term_core(
+    let (id, rev) = create_term_core(
         &state,
         &taxonomy,
         &rows,
@@ -269,6 +385,7 @@ pub async fn create(
         slug: resolve_term_slug(body.slug.as_deref(), &body.name)?,
         name: body.name.trim().to_owned(),
         parent: body.parent,
+        rev,
     }))
 }
 
@@ -293,6 +410,23 @@ pub async fn update(
         .store
         .get(&TypeName::from(TERM_TYPE), ObjectId(id))
         .await?;
+
+    // SF12 lost-update guard: checked ATOMICALLY under `taxonomy_lock` (the same
+    // lock every other integrity check in this handler already runs under), right
+    // after the fresh read and before ANY other work — a stale `expected_rev`
+    // refuses the whole write rather than silently reverting a rename/re-parent
+    // that happened elsewhere since the client's form was loaded. `None` (an
+    // older/other client) skips the check — today's last-write-wins behavior,
+    // never a NEW hazard, only one an opted-in client closes.
+    if let Some(expected) = body.expected_rev {
+        let current_rev = rev_of(&current);
+        if expected != current_rev {
+            return Err(AdminError::Conflict(
+                "this term changed elsewhere — reload and re-apply".to_owned(),
+            ));
+        }
+    }
+
     let taxonomy_id = single_link(&state, TERM_TYPE, ObjectId(id), "taxonomy")
         .await?
         .ok_or_else(|| {
@@ -403,6 +537,12 @@ pub async fn update(
         .await?;
     }
 
+    // SF12: bump meta._rev in the SAME patch (no extra store round-trip — `current`
+    // is already in hand) so THIS write itself advances the precondition token;
+    // without this, `expected_rev` could never actually detect two concurrent
+    // updates racing each other (they'd both read the same starting rev).
+    let (meta, new_rev) = bumped_meta(&current);
+
     let mut patch: FieldMap = FieldMap::new();
     patch.insert("slug".to_owned(), Value::String(slug.clone()));
     patch.insert("name".to_owned(), Value::String(name.clone()));
@@ -414,6 +554,7 @@ pub async fn update(
         "plaintext".to_owned(),
         Value::String(term_plaintext(&name, &body.description)),
     );
+    patch.insert("meta".to_owned(), Value::Json(meta));
     // The scalar write IS the settling event (one real Term Update after the link
     // work — no separate touch needed). If it faults after a successful re-link,
     // revert the link so the term is never stranded at the unvalidated
@@ -447,6 +588,7 @@ pub async fn update(
         slug,
         name,
         parent: body.parent,
+        rev: new_rev,
     }))
 }
 
@@ -606,7 +748,7 @@ pub(super) async fn create_term_core(
     slug: Option<&str>,
     description: &str,
     parent: Option<u64>,
-) -> Result<ObjectId, AdminError> {
+) -> Result<(ObjectId, i64), AdminError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(AdminError::BadRequest("a term needs a name".to_owned()));
@@ -688,10 +830,12 @@ pub(super) async fn create_term_core(
     }
 
     // Settle: the Create event races the eventless taxonomy/parent links above; one
-    // trailing scalar Update guarantees the (Inc-2) handle reload sees them.
-    touch_term(state, id).await?;
+    // trailing scalar Update guarantees the (Inc-2) handle reload sees them. Its
+    // return is this term's first real rev (0 -> 1) — propagated so the create
+    // response can echo it (SF12) without a second store read.
+    let rev = touch_term(state, id).await?;
 
-    Ok(id)
+    Ok((id, rev))
 }
 
 /// Best-effort delete of a just-created term whose link work failed (never leave a
@@ -706,30 +850,52 @@ async fn rollback_term(state: &AppState, id: ObjectId) {
     }
 }
 
-/// Bump `Term.meta._rev` and persist it — one deliberate `Term` Update emitted AFTER
-/// all (eventless) link work, so the serve-side reload always fires on a settled
-/// state. The `touch_menu` idiom; must run under `taxonomy_lock`, last.
-async fn touch_term(state: &AppState, id: ObjectId) -> Result<(), AdminError> {
-    let obj = state.store.get(&TypeName::from(TERM_TYPE), id).await?;
+/// The current `Term.meta._rev` counter (default `0` for a never-touched term) — the
+/// OPTIMISTIC-CONCURRENCY token [`UpdateTermRequest::expected_rev`] checks against
+/// (SF12), and what [`TermDto`]/[`TermRef`] echo so the client can capture it. Reading
+/// this costs nothing extra: every caller already has the `Object` in hand (a `list`
+/// scan row, or `update`'s already-fetched `current`).
+fn rev_of(obj: &Object) -> i64 {
+    match obj.get("meta") {
+        Some(Value::Json(j)) => j
+            .get("_rev")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// The NEXT `meta` JSON value with `_rev` incremented by one from `obj`'s CURRENT
+/// meta (preserving any other meta keys), plus that new rev — the shared bump
+/// [`touch_term`] and `update`'s own settling write both apply, so the counter can
+/// never drift between the two mutation paths that advance it.
+fn bumped_meta(obj: &Object) -> (serde_json::Value, i64) {
     let mut meta = match obj.get("meta") {
         Some(Value::Json(j)) if j.is_object() => j.clone(),
         _ => serde_json::json!({}),
     };
-    let rev = meta
-        .get("_rev")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        + 1;
+    let rev = rev_of(obj) + 1;
     meta.as_object_mut()
         .expect("meta is an object by construction above")
         .insert("_rev".to_owned(), serde_json::Value::from(rev));
+    (meta, rev)
+}
+
+/// Bump `Term.meta._rev` and persist it — one deliberate `Term` Update emitted AFTER
+/// all (eventless) link work, so the serve-side reload always fires on a settled
+/// state. The `touch_menu` idiom; must run under `taxonomy_lock`, last. Returns the
+/// new rev (create's response echoes it; `settle_children`'s delete-path callers
+/// discard it — they only need the settling write to happen).
+async fn touch_term(state: &AppState, id: ObjectId) -> Result<i64, AdminError> {
+    let obj = state.store.get(&TypeName::from(TERM_TYPE), id).await?;
+    let (meta, rev) = bumped_meta(&obj);
     let mut patch = FieldMap::new();
     patch.insert("meta".to_owned(), Value::Json(meta));
     state
         .store
         .update(&TypeName::from(TERM_TYPE), id, patch)
         .await?;
-    Ok(())
+    Ok(rev)
 }
 
 // ---- taxonomy/term lookups + the in-memory guard snapshot -------------------
@@ -760,6 +926,10 @@ pub(super) struct TermRow {
     /// Parent term id — only when the parent is a live member of the SAME taxonomy;
     /// a dangling/cross-taxonomy parent link is defensively treated as a root.
     pub parent: Option<u64>,
+    /// `meta._rev` at scan time (SF12) — surfaced to the client via [`TermDto::rev`]
+    /// so a TermEditor form can snapshot it and echo it back as
+    /// [`UpdateTermRequest::expected_rev`].
+    pub rev: i64,
 }
 
 /// Load every term of `taxonomy_id` into memory: one Term scan + two batched link
@@ -804,6 +974,7 @@ pub(super) async fn load_term_rows(
                 name: str_field(obj, "name").unwrap_or_default(),
                 description: str_field(obj, "description").unwrap_or_default(),
                 parent,
+                rev: rev_of(obj),
             },
         );
     }
@@ -935,8 +1106,9 @@ fn archive_path(taxonomy_key: &str, rows: &HashMap<u64, TermRow>, id: u64) -> St
 /// case-folded name (id tiebreak — the pinned name-asc ordering; Term has no ordinal
 /// column). Orphaned/cyclic rows that no root-walk reaches are appended at depth 0
 /// rather than dropped (the menus assemble_tree/M2 discipline: a listing must never
-/// hide a live row).
-fn flatten_tree(rows: &HashMap<u64, TermRow>) -> Vec<(u64, usize)> {
+/// hide a live row). `pub(super)`: also the ordering [`crate::admin::menus`]'s term
+/// link-candidates use, so the picker's depth-indent agrees with the Terms admin list.
+pub(super) fn flatten_tree(rows: &HashMap<u64, TermRow>) -> Vec<(u64, usize)> {
     let mut children: HashMap<Option<u64>, Vec<u64>> = HashMap::new();
     for (id, row) in rows {
         children.entry(row.parent).or_default().push(*id);
@@ -997,7 +1169,7 @@ pub(super) fn resolve_term_slug(slug: Option<&str>, name: &str) -> Result<String
     match slug.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => validate_term_slug(s),
         None => {
-            let derived = super::slugify(name).ok_or_else(|| {
+            let derived = ferropress_core::slugify(name).ok_or_else(|| {
                 AdminError::BadRequest(format!("cannot derive a slug from the name {name:?}"))
             })?;
             validate_term_slug(&derived)
