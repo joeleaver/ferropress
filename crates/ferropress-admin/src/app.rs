@@ -257,6 +257,167 @@ impl Default for LocCtx {
     }
 }
 
+/// Load state for the shared taxonomy vocabulary (SF3/B4): distinguishes "still
+/// fetching" from "fetch failed" from "loaded" so a slow/failed load never reads as
+/// "no categories exist" — an empty Vec is genuinely ambiguous with a not-yet-loaded
+/// one. Never gates the chips already assigned to the open post (SF3): those render
+/// from `PostDetail.terms`/a save response regardless of this state.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum VocabLoad {
+    #[default]
+    Loading,
+    Ready,
+    Error,
+}
+
+/// A pending new-tag chip (B9): flat taxonomies only, riding the save/preview
+/// payload's `new_terms` — create-or-reuse happens server-side, atomically with the
+/// rest of the save. `cid` is a client-only identity that outlives the chip's own
+/// text and is what the `for` keys on (namespaced `s{cid}`, vs. an assigned term's
+/// `t{id}` — SF7/B9: a tag literally named "42" can never collide with term id 42).
+#[derive(Clone, PartialEq)]
+struct StagedTag {
+    cid: u64,
+    taxonomy: String,
+    name: String,
+    /// Set when a save's 400 named this exact chip (its slug clashes with a term
+    /// archive path — `posts.rs`'s inline-tag 409, SF13): renders `.chip--rejected`
+    /// in place, not a global notice plus indistinguishable chips.
+    rejected: bool,
+}
+
+/// The taxonomy vocabulary + one open post's live term-assignment state, bundled
+/// (the `MenuCtx`/`AuthCtx` discipline — `Copy`, threads through helpers without
+/// widening `open_post`'s signature further). Deviates from the original SF15b
+/// framing ("never a `#[component]` prop"): a per-taxonomy `#[component]`
+/// (`TaxonomyPanel`) turned out to be REQUIRED, not just an available option — a
+/// reactive `if`/`for` nested inside the *outer* `for tax in taxonomies` loop,
+/// referencing that loop's own item fields, hits a genuine rustc E0525 (the
+/// generated `Fn` closure can only move a captured owned field out once, but a
+/// nested reactive branch needs to do so on every re-run); the `MenuLocationView`/
+/// `LocCtx` precedent — a small `Default`-bearing ctx passed as a **whole-panel**
+/// prop, never a per-row one — is the established fix for exactly this shape. `Default`
+/// (below) exists ONLY for the `#[component]` macro's `..Default::default()`
+/// mechanism; SF15a's actual concern (no per-ROW `#[component]`, since a checklist
+/// row is called tens of times in a tight loop) is untouched — `TaxonomyPanel` is
+/// called once per TAXONOMY (1-2 times), not per row. Two lifetimes share this
+/// struct:
+///   * the VOCABULARY half (`taxonomies`/`hierarchical_terms`/`vocab_load`/
+///     `vocab_gen`) is SESSION-scoped and shared app-wide (Q2) — loaded once, reused
+///     by every post the editor opens. It is never reset by `open_post`/`new_post`.
+///   * the ASSIGNMENT half (everything else) belongs to whichever document is
+///     currently open — reseeded atomically by `open_post`/`new_post` (B5) and
+///     otherwise mutated only by the panels' own interactions or a save's
+///     authoritative reseed (B6).
+#[derive(Clone, Copy)]
+struct TermsCtx {
+    // ── vocabulary (Q2, B4) ──
+    taxonomies: Signal<Vec<api::TaxonomyDto>>,
+    /// Full DFS term trees, HIERARCHICAL taxonomies only (keyed by `TaxonomyDto.key`)
+    /// — what the checklist renders. A FLAT taxonomy's terms are never bulk-loaded
+    /// here (only bounded suggestions — B2c exists precisely so the tag vocabulary
+    /// is never dumped wholesale; see `suggestions`).
+    hierarchical_terms: Signal<HashMap<String, Vec<api::TermDto>>>,
+    vocab_load: Signal<VocabLoad>,
+    /// Guards an in-flight vocab fetch against a slow/duplicate response — the
+    /// `candidates_gen` idiom. Vocab has no document identity of its own (it's
+    /// shared, not per-post), so it cannot reuse `editor_session`.
+    vocab_gen: Signal<u64>,
+
+    // ── this document's live assignment (B5, B6, SF1, SF3) ──
+    /// Every assigned term id, pooled across taxonomies (mirrors how the server
+    /// stores membership). `HashSet` so a row's `checked` closure is O(1) (SF15d).
+    selected_ids: Signal<HashSet<u64>>,
+    /// id -> display info for chips/checked rows, seeded from `PostDetail.terms`/a
+    /// save response and NEVER derived from the vocabulary (SF3): a deleted- or
+    /// renamed-away term still renders here, marked "(unavailable)".
+    sidecar: Signal<HashMap<u64, api::TermRefDto>>,
+    staged: Signal<Vec<StagedTag>>,
+    next_staged_cid: Signal<u64>,
+    /// The id set as of the last successful open/create/save — what
+    /// [`api::dirty_terms`] compares the live `selected_ids` against (SF1).
+    terms_snapshot: Signal<Vec<u64>>,
+    /// Bumped by EVERY assignment mutation (checkbox, chip remove, tag commit) — the
+    /// B6 in-flight-change detector: a save's completion merges rather than
+    /// overwrites when this moved on while the request was in flight.
+    terms_gen: Signal<u64>,
+
+    // ── the tag token-input's transient UI state, keyed by taxonomy key (B7, Q5) ──
+    tag_buffer: Signal<HashMap<String, String>>,
+    /// Live suggestions for the currently-focused tag buffer (Q5's combobox
+    /// contract) — a bounded server query (B2c's `q`+`limit`), never the whole tag
+    /// vocabulary.
+    suggestions: Signal<HashMap<String, Vec<api::TermDto>>>,
+    /// Guards an in-flight suggestion fetch against a slow/out-of-order response.
+    suggest_gen: Signal<u64>,
+    /// The active (arrow-key-highlighted) suggestion index; absent = no option
+    /// active (Enter then commits the typed buffer instead of accepting one).
+    suggest_active: Signal<HashMap<String, usize>>,
+
+    /// The category checklist's filter text, keyed by taxonomy key (owner call #1:
+    /// ships in v1, unconditionally — not gated behind a term-count threshold).
+    checklist_filter: Signal<HashMap<String, String>>,
+
+    /// A term id a save's 400 just named as no-longer-existing (B10b) — the notice
+    /// explains it and the NEXT click of the ordinary Save button already excludes
+    /// it (the id is removed from `selected_ids`/`sidecar` as soon as this is set,
+    /// so recovery is "read the notice, click Save again", never an auto-retry).
+    missing_term_notice: Signal<Option<u64>>,
+
+    auth: AuthCtx,
+}
+
+/// `Default` ONLY for the rinch `#[component]` macro's `..Default::default()`
+/// mechanism (`TaxonomyPanel` takes this whole bundle as a prop) — every field is a
+/// throwaway placeholder Signal, never actually read (the real call site always
+/// supplies the live `terms` bundle explicitly).
+impl Default for TermsCtx {
+    fn default() -> Self {
+        TermsCtx {
+            taxonomies: Signal::new(Vec::new()),
+            hierarchical_terms: Signal::new(HashMap::new()),
+            vocab_load: Signal::new(VocabLoad::default()),
+            vocab_gen: Signal::new(0),
+            selected_ids: Signal::new(HashSet::new()),
+            sidecar: Signal::new(HashMap::new()),
+            staged: Signal::new(Vec::new()),
+            next_staged_cid: Signal::new(0),
+            terms_snapshot: Signal::new(Vec::new()),
+            terms_gen: Signal::new(0),
+            tag_buffer: Signal::new(HashMap::new()),
+            suggestions: Signal::new(HashMap::new()),
+            suggest_gen: Signal::new(0),
+            suggest_active: Signal::new(HashMap::new()),
+            checklist_filter: Signal::new(HashMap::new()),
+            missing_term_notice: Signal::new(None),
+            auth: AuthCtx::default(),
+        }
+    }
+}
+
+/// The post editor's per-document signals, bundled so `open_post`/`new_post`/
+/// `save_post`/`preview_post` take ONE parameter instead of nine-plus loose ones
+/// (B5) — `terms` (the taxonomy half) rides along so every seed/save/reseed path
+/// naturally includes it rather than needing a parallel, easy-to-forget parameter.
+/// Not a `#[component]` prop, so (like `TermsCtx`) it needs no `Default`. Pages have
+/// no taxonomies, so `open_page`/`new_page`/`save_page`/`preview_page` keep their
+/// own existing individual-signal signatures.
+#[derive(Clone, Copy)]
+struct EditorCtx {
+    editor: Signal<EditorHandle>,
+    title: Signal<String>,
+    slug: Signal<String>,
+    status: Signal<String>,
+    featured: Signal<Option<api::FeaturedMedia>>,
+    current_id: Signal<Option<u64>>,
+    editor_session: Signal<u64>,
+    terms: TermsCtx,
+    saving: Signal<bool>,
+    notice: Signal<String>,
+    toast: Signal<bool>,
+    auth: AuthCtx,
+}
+
 #[component]
 pub fn app() -> NodeHandle {
     let view = Signal::new(View::Boot);
@@ -341,6 +502,49 @@ pub fn app() -> NodeHandle {
         me_user,
         login_error,
     };
+
+    // Taxonomy vocabulary + the open post's live category/tag assignment (Inc 3).
+    // `terms.notice`/`terms.auth` alias the SAME `notice`/`auth` signals the rest of
+    // the editor uses — one error banner, one re-auth path.
+    let terms = TermsCtx {
+        taxonomies: Signal::new(Vec::<api::TaxonomyDto>::new()),
+        hierarchical_terms: Signal::new(HashMap::<String, Vec<api::TermDto>>::new()),
+        vocab_load: Signal::new(VocabLoad::Loading),
+        vocab_gen: Signal::new(0u64),
+        selected_ids: Signal::new(HashSet::<u64>::new()),
+        sidecar: Signal::new(HashMap::<u64, api::TermRefDto>::new()),
+        staged: Signal::new(Vec::<StagedTag>::new()),
+        next_staged_cid: Signal::new(0u64),
+        terms_snapshot: Signal::new(Vec::<u64>::new()),
+        terms_gen: Signal::new(0u64),
+        tag_buffer: Signal::new(HashMap::<String, String>::new()),
+        suggestions: Signal::new(HashMap::<String, Vec<api::TermDto>>::new()),
+        suggest_gen: Signal::new(0u64),
+        suggest_active: Signal::new(HashMap::<String, usize>::new()),
+        checklist_filter: Signal::new(HashMap::<String, String>::new()),
+        missing_term_notice: Signal::new(Option::<u64>::None),
+        auth,
+    };
+    let editor_ctx = EditorCtx {
+        editor,
+        title,
+        slug,
+        status,
+        featured,
+        current_id,
+        editor_session,
+        terms,
+        saving,
+        notice,
+        toast,
+        auth,
+    };
+    // The B7 keyboard mechanism: Enter/Backspace/Arrow/Escape for EVERY tag
+    // token-input, from one document-level listener target-gated on
+    // `data-fp-tagbuffer` (never `onkeydown:`/`onsubmit:` in rsx — rinch's event map
+    // routes anything it doesn't recognize to the CLICK attribute, `data-rid`, so
+    // those would silently become click handlers, not keyboard ones).
+    install_tag_buffer_guard(terms);
 
     // Nav-menu editor (Editor+). One Copy bundle threads the many signals through the
     // two menu views + their helpers (the AuthCtx discipline).
@@ -508,9 +712,7 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || match kind.get() {
-                                    EntityKind::Post => new_post(
-                                        editor, title, slug, status, featured, current_id, editor_session, notice, auth,
-                                    ),
+                                    EntityKind::Post => new_post(editor_ctx),
                                     EntityKind::Page => new_page(
                                         editor, kind, title, slug, status, featured, parent, menu_order, template,
                                         current_id, editor_session, notice, auth,
@@ -536,7 +738,7 @@ pub fn app() -> NodeHandle {
                             if matches!(kind.get(), EntityKind::Page) {
                                 button {
                                     class: "btn btn--quiet",
-                                    onclick: move || open_posts_list(kind, posts, list_state, notice, view, auth),
+                                    onclick: move || open_posts_list(kind, posts, list_state, terms, notice, view, auth),
                                     "Posts"
                                 }
                             }
@@ -635,7 +837,7 @@ pub fn app() -> NodeHandle {
                                         class: "row",
                                         onclick: {
                                             let id = row.id;
-                                            move || open_post(id, editor, title, slug, status, featured, current_id, editor_session, notice, auth)
+                                            move || open_post(id, editor_ctx)
                                         },
                                         // A one-shot component (built once per row) so the
                                         // thumbnail-or-crosshair choice isn't a reactive `if`,
@@ -693,6 +895,14 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--quiet",
                                 onclick: move || {
                                     notice.set(String::new());
+                                    // B8: the panel is about to be torn down — best-
+                                    // effort-commit any uncommitted tag text so it
+                                    // isn't silently discarded (unlike Save, leaving
+                                    // never BLOCKS on an invalid buffer: the user is
+                                    // abandoning the edit, not persisting it).
+                                    if matches!(kind.get(), EntityKind::Post) {
+                                        let _ = commit_buffers_for_save(terms);
+                                    }
                                     match kind.get() {
                                         EntityKind::Post => load_posts(posts, list_state, auth),
                                         EntityKind::Page => load_pages(page_list, list_state, auth),
@@ -712,9 +922,7 @@ pub fn app() -> NodeHandle {
                                 style: "width:auto",
                                 title: "Save, then open this draft in the real theme (new tab)",
                                 onclick: move || match kind.get() {
-                                    EntityKind::Post => preview_post(
-                                        editor, current_id, editor_session, title, slug, status, featured, saving, notice, auth,
-                                    ),
+                                    EntityKind::Post => preview_post(editor_ctx),
                                     EntityKind::Page => preview_page(
                                         editor, current_id, editor_session, title, slug, status, featured,
                                         parent, menu_order, template, saving, notice, auth,
@@ -726,9 +934,7 @@ pub fn app() -> NodeHandle {
                                 class: "btn btn--primary",
                                 style: "width:auto",
                                 onclick: move || match kind.get() {
-                                    EntityKind::Post => save_post(
-                                        editor, current_id, editor_session, title, slug, status, featured, saving, notice, toast, auth,
-                                    ),
+                                    EntityKind::Post => save_post(editor_ctx),
                                     EntityKind::Page => save_page(
                                         editor, current_id, editor_session, title, slug, status, featured,
                                         parent, menu_order, template, saving, notice, toast, auth,
@@ -881,22 +1087,47 @@ pub fn app() -> NodeHandle {
                                 "measure"
                             }
                         }
-                        div { class: "sheet",
-                            div { class: "sheet__inner",
-                                // The title is the headline set on the sheet (per the
-                                // mockup). Controlled like the slug field: the reactive
-                                // `value` reflects an `open_post`/`new_post` load and stays
-                                // caret-safe (rinch writes the property only on a real change).
-                                // Typing here live-updates the masthead, which reads the
-                                // same signal.
-                                input {
-                                    class: "sheet__title",
-                                    value: {move || title.get()},
-                                    placeholder: "Untitled",
-                                    spellcheck: "false",
-                                    oninput: move |v: String| title.set(v),
+                        if matches!(kind.get(), EntityKind::Post) {
+                            div { class: "editor__body",
+                                div { class: "sheet",
+                                    div { class: "sheet__inner",
+                                        input {
+                                            class: "sheet__title",
+                                            value: {move || title.get()},
+                                            placeholder: "Untitled",
+                                            spellcheck: "false",
+                                            oninput: move |v: String| title.set(v),
+                                        }
+                                        Editor { editor: editor.get(), content: "" }
+                                    }
                                 }
-                                Editor { editor: editor.get(), content: "" }
+                                div { class: "editor__below",
+                                    // Zero taxonomies (migrate not run) renders no
+                                    // panels at all — SF3: a genuinely empty
+                                    // vocabulary is not an error state.
+                                    for tax in terms.taxonomies.get() {
+                                        TaxonomyPanel { key: tax.id, tax: tax, terms: terms }
+                                    }
+                                }
+                            }
+                        } else {
+                            div { class: "sheet",
+                                div { class: "sheet__inner",
+                                    // The title is the headline set on the sheet (per the
+                                    // mockup). Controlled like the slug field: the reactive
+                                    // `value` reflects an `open_page`/`new_page` load and stays
+                                    // caret-safe (rinch writes the property only on a real change).
+                                    // Typing here live-updates the masthead, which reads the
+                                    // same signal.
+                                    input {
+                                        class: "sheet__title",
+                                        value: {move || title.get()},
+                                        placeholder: "Untitled",
+                                        spellcheck: "false",
+                                        oninput: move |v: String| title.set(v),
+                                    }
+                                    Editor { editor: editor.get(), content: "" }
+                                }
                             }
                         }
                     }
@@ -1403,6 +1634,317 @@ pub fn app() -> NodeHandle {
     }
 }
 
+/// One taxonomy's assignment panel — a Categories checklist when `tax.hierarchical`,
+/// else a Tags token-input. A `#[component]` (not inline in `app()`'s own rsx!)
+/// despite SF15a's general preference against extra components: a reactive `if`/`for`
+/// nested inside the OUTER `for tax in taxonomies` loop, referencing that loop's own
+/// item fields, hits a genuine rustc E0525 (`Fn` vs `FnOnce` — the generated closure
+/// can move an owned field out of its environment only once, but a nested reactive
+/// branch needs to on every re-run). `tax`/`terms` becoming THIS function's own
+/// parameters — available for its whole lifetime, freely re-borrowable by any nested
+/// reactive closure — is the fix, exactly the `MenuLocationView`/`LocCtx` precedent:
+/// a small `Default`-bearing ctx passed as a WHOLE-PANEL prop, never a per-row one.
+/// Called once per TAXONOMY (1-2 times) — SF15a's actual concern (no per-ROW
+/// component; a checklist row, rendered tens of times in the `for` below, stays
+/// inline) is untouched.
+#[component]
+fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
+    // Split BEFORE `rsx!` even starts (plain Rust here, no macro-child
+    // restrictions) into two INDEPENDENT clones, one per outer branch: both
+    // the `if` and `else` branches below are constructed as VALUES (passed to
+    // `show_dom` regardless of which condition holds), so a SHARED source
+    // `tax` referenced from both — even just to shadow-clone it AGAIN inside
+    // each branch — has them compete over moving the same struct (verified:
+    // that's exactly what a same-named `let tax = tax.clone();` inside each
+    // branch still did). `hier_tax`/`flat_tax` are each touched by exactly
+    // ONE branch.
+    let hier_tax = tax.clone();
+    let flat_tax = tax.clone();
+    rsx! {
+        div { class: "panel",
+            if tax.hierarchical {
+                // `hier_tax` (this branch's own pre-split clone, see the
+                // function's own doc comment above) shadowed to `tax` so
+                // every leading-let below reads unchanged. Leading statements
+                // of THIS if-branch's own body (rinch's rsx! only accepts a
+                // leading `let` as a child of an if/for/match BODY, not of a
+                // plain element).
+                let tax = hier_tax.clone();
+                let legend_text = tax.label.clone();
+                let chip_label = panel_chipline_label(&tax);
+                let filter_label_text = panel_filter_label(&tax);
+                let filter_placeholder_text = panel_filter_placeholder(&tax);
+                let key_for_chips = tax.key.clone();
+                let key_for_filter_value = tax.key.clone();
+                let key_for_filter_input = tax.key.clone();
+                let loading_msg = panel_loading_text(&tax);
+                let error_msg = panel_error_text(&tax);
+                let key_for_empty_check = tax.key.clone();
+                let empty_msg = panel_empty_text(&tax);
+                let key_for_scroll_check = tax.key.clone();
+                let key_for_scroll_iter = tax.key.clone();
+                fieldset { class: "termcheck",
+                    legend { class: "termcheck__legend", {{ let v = legend_text.clone(); move || v }} }
+                    div { class: "chipline", aria-label: { let v = chip_label.clone(); move || v },
+                        for chip in chip_vms(&terms.selected_ids.get(), &terms.hierarchical_terms.get(), &terms.sidecar.get(), &key_for_chips, true) {
+                            span { key: chip.id, class: {if chip.oov { "chip chip--oov" } else { "chip" }},
+                                {chip.name.clone()}
+                                if chip.oov {
+                                    small { "(unavailable)" }
+                                }
+                                button {
+                                    class: "chip__x",
+                                    aria-label: format!("Remove {}", chip.name),
+                                    onclick: {
+                                        let id = chip.id;
+                                        move || {
+                                            terms.selected_ids.update(|s| { s.remove(&id); });
+                                            terms.terms_gen.update(|g| *g += 1);
+                                        }
+                                    },
+                                    "\u{2715}"
+                                }
+                            }
+                        }
+                    }
+                    div { class: "termcheck__search",
+                        input {
+                            class: "input", r#type: "search",
+                            aria-label: { let v = filter_label_text.clone(); move || v },
+                            placeholder: { let v = filter_placeholder_text.clone(); move || v },
+                            value: {
+                                let tax_key = key_for_filter_value.clone();
+                                move || filter_text(terms, &tax_key)
+                            },
+                            oninput: {
+                                let tax_key = key_for_filter_input.clone();
+                                move |v: String| {
+                                    terms.checklist_filter.update(|m| { m.insert(tax_key.clone(), v); });
+                                }
+                            },
+                        }
+                    }
+                    // FOUR INDEPENDENT SIBLING `if`s (mutually exclusive via their
+                    // own conditions), not an `if`/`else if` chain: rinch's `else
+                    // if` codegen nests each subsequent branch inside an ADDITIONAL
+                    // wrapper closure carrying the ENTIRE rest of the chain — so
+                    // that wrapper alone would need `error_msg` AND
+                    // `key_for_empty_check` AND `empty_msg` AND `key_for_scroll`
+                    // ALL captured together, hitting the same rustc E0525 (`Fn` vs
+                    // `FnOnce`) one level up. Four independent `if`s are each their
+                    // OWN top-level `show_dom` call — no shared wrapper, so each
+                    // needs only its own leading-let value (verified against
+                    // rinch-macros/src/dom_codegen/control_flow.rs at the pinned
+                    // rev — only `for`'s iter_expr gets auto-clone protection, and
+                    // an `else if` wrapper gets none at all).
+                    // Each branch ALSO re-clones its own leading-let value as
+                    // ITS OWN first statement (`msg` below): the text
+                    // interpolation's `create_effect` reconstructs its inner
+                    // closure on every reactive fire, and THAT reconstruction
+                    // needs a value it can freely move — not `loading_msg`
+                    // itself, which this whole `if` branch only holds by
+                    // `&self` (`show_dom`'s `Fn` bound) and can never move out
+                    // of, even to itself, more than once. Same rule, one level
+                    // deeper than the branch-level leading-lets above.
+                    if matches!(terms.vocab_load.get(), VocabLoad::Loading) {
+                        let msg = loading_msg.clone();
+                        p { class: "panelstate", {{ let v = msg.clone(); move || v }} }
+                    }
+                    if matches!(terms.vocab_load.get(), VocabLoad::Error) {
+                        let msg = error_msg.clone();
+                        p { class: "panelerror", role: "alert", {{ let v = msg.clone(); move || v }} }
+                    }
+                    if matches!(terms.vocab_load.get(), VocabLoad::Ready) && checklist_is_empty(terms, &key_for_empty_check) {
+                        let msg = empty_msg.clone();
+                        p { class: "panelstate", {{ let v = msg.clone(); move || v }} }
+                    }
+                    if matches!(terms.vocab_load.get(), VocabLoad::Ready) && !checklist_is_empty(terms, &key_for_scroll_check) {
+                        div { class: "termcheck__scroll",
+                            for row in checklist_row_vms(&hier_vocab(terms, &key_for_scroll_iter), &filter_text(terms, &key_for_scroll_iter), &key_for_scroll_iter) {
+                                label {
+                                    key: row.id,
+                                    class: {if row.is_match { "termcheck__row termcheck__row--match" } else { "termcheck__row termcheck__row--ctx" }},
+                                    style: format!("padding-left:{}rem", 0.5 + row.depth as f32 * 1.15),
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: {
+                                            let id = row.id;
+                                            move || terms.selected_ids.get().contains(&id)
+                                        },
+                                        oninput: {
+                                            let id = row.id;
+                                            let name = row.name.clone();
+                                            // `row.taxonomy` (the row's OWN
+                                            // field, not a shared outer
+                                            // clone): each row is its own
+                                            // independently-owned `for`-item,
+                                            // so this never competes with a
+                                            // SIBLING row's own oninput
+                                            // closure the way one shared
+                                            // outer `String` would (verified
+                                            // — that's exactly what happened
+                                            // before this field existed).
+                                            let tax_key = row.taxonomy.clone();
+                                            move |_: String| {
+                                                terms.selected_ids.update(|s| {
+                                                    if !s.remove(&id) { s.insert(id); }
+                                                });
+                                                terms.sidecar.update(|m| {
+                                                    m.insert(id, api::TermRefDto {
+                                                        id, name: name.clone(), slug: String::new(), taxonomy: tax_key.clone(),
+                                                    });
+                                                });
+                                                terms.terms_gen.update(|g| *g += 1);
+                                            }
+                                        },
+                                    }
+                                    span { class: "termcheck__name", {row.name.clone()} }
+                                }
+                            }
+                        }
+                    }
+                    p { class: "panel__note",
+                        "Ancestors of a match stay visible so the hierarchy still reads."
+                    }
+                }
+            } else {
+                // `flat_tax` (this branch's own pre-split clone) — see the
+                // identical note on the Categories branch above.
+                let tax = flat_tax.clone();
+                let legend_text = tax.label.clone();
+                let chip_label = panel_chipline_label(&tax);
+                let tag_label_text = panel_tag_label(&tax);
+                let tag_placeholder_text = panel_tag_placeholder(&tax);
+                let key_for_databuffer = tax.key.clone();
+                let key_for_buffer_value = tax.key.clone();
+                let key_for_buffer_input = tax.key.clone();
+                let key_for_suggest_check = tax.key.clone();
+                let key_for_suggest_list = tax.key.clone();
+                fieldset { class: "termcheck",
+                    legend { class: "termcheck__legend", {{ let v = legend_text.clone(); move || v }} }
+                    div { class: "tokenfield",
+                        div { class: "chipline", aria-label: { let v = chip_label.clone(); move || v },
+                            for chip in chip_vms(&terms.selected_ids.get(), &terms.hierarchical_terms.get(), &terms.sidecar.get(), &key_for_databuffer, false) {
+                                span { key: chip.id, class: "chip",
+                                    {chip.name.clone()}
+                                    button {
+                                        class: "chip__x",
+                                        aria-label: format!("Remove {}", chip.name),
+                                        onclick: {
+                                            let id = chip.id;
+                                            move || {
+                                                terms.selected_ids.update(|s| { s.remove(&id); });
+                                                terms.terms_gen.update(|g| *g += 1);
+                                            }
+                                        },
+                                        "\u{2715}"
+                                    }
+                                }
+                            }
+                            for staged in staged_for_taxonomy(&terms.staged.get(), &key_for_databuffer) {
+                                span {
+                                    key: format!("s{}", staged.cid),
+                                    class: {if staged.rejected { "chip chip--rejected" } else { "chip chip--new" }},
+                                    {staged.name.clone()}
+                                    small { {if staged.rejected { "couldn't add \u{2014} try again" } else { "will be created" }} }
+                                    button {
+                                        class: "chip__x",
+                                        aria-label: format!("Remove {}", staged.name),
+                                        onclick: {
+                                            let cid = staged.cid;
+                                            move || {
+                                                terms.staged.update(|v| v.retain(|s| s.cid != cid));
+                                                terms.terms_gen.update(|g| *g += 1);
+                                            }
+                                        },
+                                        "\u{2715}"
+                                    }
+                                }
+                            }
+                        }
+                        input {
+                            class: "input input--mono tokenfield__input",
+                            role: "combobox",
+                            data-fp-tagbuffer: { let v = key_for_databuffer.clone(); move || v },
+                            aria-label: { let v = tag_label_text.clone(); move || v },
+                            placeholder: { let v = tag_placeholder_text.clone(); move || v },
+                            // Its own uniquely-named leading clone — `value:`'s
+                            // `create_effect` directly captures whatever this
+                            // bare closure references, so REUSING another
+                            // site's clone here would recreate the exact
+                            // multi-closure conflict this branch's doc comment
+                            // describes (verified: it did, empirically).
+                            value: { let key = key_for_buffer_value.clone(); move || buffer_text(terms, &key) },
+                            oninput: {
+                                let tax_key = key_for_buffer_input.clone();
+                                move |v: String| {
+                                    if let Some(comma_pos) = v.rfind(',') {
+                                        let to_commit = v[..comma_pos].to_owned();
+                                        let remainder = v[comma_pos + 1..].to_owned();
+                                        commit_tag_text(terms, &tax_key, &to_commit);
+                                        terms.tag_buffer.update(|m| { m.insert(tax_key.clone(), remainder.clone()); });
+                                        load_suggestions(terms, tax_key.clone(), remainder, terms.auth);
+                                    } else {
+                                        terms.tag_buffer.update(|m| { m.insert(tax_key.clone(), v.clone()); });
+                                        load_suggestions(terms, tax_key.clone(), v, terms.auth);
+                                    }
+                                }
+                            },
+                        }
+                        // Two closures (the `if` condition + its body) each need
+                        // their own clone — `key_for_suggest_check`/
+                        // `key_for_suggest_list` (this branch's own leading
+                        // statements, above) are exactly that; see the identical
+                        // note on the Categories panel's vocab_load if/else chain.
+                        if !terms.suggestions.get().get(&key_for_suggest_check).cloned().unwrap_or_default().is_empty() {
+                            // This `if`'s own leading clones — separate from
+                            // the condition above, and separate from EACH
+                            // OTHER (the `id:` attribute's `create_effect` and
+                            // the `for`'s own construction are two more
+                            // distinct closures).
+                            let key_for_suggest_id = key_for_suggest_list.clone();
+                            let key_for_suggest_iter = key_for_suggest_list.clone();
+                            ul { class: "combobox__list", role: "listbox", id: { let v = key_for_suggest_id.clone(); move || format!("suggest-{v}") },
+                                for s in suggest_vms(&terms.suggestions.get().get(&key_for_suggest_iter).cloned().unwrap_or_default(), terms.suggest_active.get().get(&key_for_suggest_iter).copied(), &key_for_suggest_iter) {
+                                    li {
+                                        key: s.id,
+                                        class: {if s.is_active { "combobox__opt is-active" } else { "combobox__opt" }},
+                                        role: "option",
+                                        aria-selected: {if s.is_active { "true" } else { "false" }},
+                                        onclick: {
+                                            let s_id = s.id;
+                                            let s_name = s.name.clone();
+                                            let s_slug = s.slug.clone();
+                                            // `s.taxonomy` (the suggestion's
+                                            // OWN field) — see the checklist
+                                            // row's identical fix above.
+                                            let tax_key = s.taxonomy.clone();
+                                            move || {
+                                                terms.selected_ids.update(|sel| { sel.insert(s_id); });
+                                                terms.sidecar.update(|m| {
+                                                    m.insert(s_id, api::TermRefDto { id: s_id, name: s_name.clone(), slug: s_slug.clone(), taxonomy: tax_key.clone() });
+                                                });
+                                                terms.tag_buffer.update(|m| { m.remove(&tax_key); });
+                                                terms.suggestions.update(|m| { m.remove(&tax_key); });
+                                                terms.terms_gen.update(|g| *g += 1);
+                                            }
+                                        },
+                                        {s.name.clone()}
+                                        span { class: "combobox__hint", "Enter to add" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p { class: "panel__note",
+                        "Comma or Enter commits the buffer; unmatched text stages a chip that's created when you save."
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One thumbnail in the media-library grid. Its own component so its click handler can
 /// own the row's `id`/`url` (a reactive `for` body can't move a non-`Copy` value into
 /// a closure). Selecting it invokes the picker `sink` and closes the modal.
@@ -1590,6 +2132,792 @@ fn load_templates(templates: Signal<Vec<api::TemplateOption>>, auth: AuthCtx) {
     });
 }
 
+/// Fetch the shared taxonomy vocabulary into `terms`: every taxonomy, plus each
+/// HIERARCHICAL one's full term tree (`?counts=0` — the panels never show the live
+/// count). Idempotent (skips when already loaded OR already loading — the
+/// `load_templates` discipline, widened with a Loading check since this fires from
+/// three independent entry points) and `vocab_gen`-guarded against a slow response
+/// racing a later call. Fired from `open_posts_list` and idempotently from
+/// `open_post`/`new_post` (Q2) — eager, not lazy-on-panel-expand, so the
+/// always-visible checklist never races its own seed. A FLAT taxonomy's terms are
+/// deliberately never bulk-loaded here (see [`TermsCtx::hierarchical_terms`]).
+/// SF17: after ANY failed save, invalidate the shared vocabulary so a staged chip
+/// that turns out to have already become real (a partial `apply_terms` failure can
+/// leave an earlier tag created-but-unassigned) re-renders solid on the next load,
+/// and View::Terms (S3) shows the truth. Resets `taxonomies` to empty — the SAME
+/// signal `load_vocab`'s own idempotency check reads — so the very next call
+/// (`open_post`/`new_post`/`open_posts_list`) re-fetches for real, not a no-op.
+fn invalidate_vocab(terms: TermsCtx) {
+    terms.taxonomies.set(Vec::new());
+    terms.hierarchical_terms.set(HashMap::new());
+}
+
+fn load_vocab(terms: TermsCtx, auth: AuthCtx) {
+    // `VocabLoad::Loading` is ALSO the enum's `#[default]` — i.e. the signal's
+    // own INITIAL value, not solely an "already fetching" flag — so gating on
+    // it here would make this fn's very FIRST-EVER call see "Loading" (from
+    // nothing having run yet, not from an in-flight fetch) and return without
+    // ever fetching (a real bug this once was). `taxonomies.get().is_empty()`
+    // alone is the correct idempotency guard: a rare, harmless duplicate
+    // concurrent fetch (e.g. `open_posts_list` and `new_post` firing in the
+    // same tick) just costs one extra request — `vocab_gen` (below) already
+    // ensures only the LATEST response is ever applied.
+    if !terms.taxonomies.get().is_empty() {
+        return;
+    }
+    terms.vocab_load.set(VocabLoad::Loading);
+    let load_gen = terms.vocab_gen.get() + 1;
+    terms.vocab_gen.set(load_gen);
+    spawn_local(async move {
+        let taxonomies = match api::list_taxonomies().await {
+            Ok(v) => v,
+            Err(api::ApiError::Unauthorized) => {
+                auth.session_expired();
+                return;
+            }
+            Err(api::ApiError::Message(_)) => {
+                if terms.vocab_gen.get() == load_gen {
+                    terms.vocab_load.set(VocabLoad::Error);
+                }
+                return;
+            }
+        };
+        let mut trees: HashMap<String, Vec<api::TermDto>> = HashMap::new();
+        for tax in taxonomies.iter().filter(|t| t.hierarchical) {
+            match api::list_terms(&tax.key, false, None, None).await {
+                Ok(resp) => {
+                    trees.insert(tax.key.clone(), resp.terms);
+                }
+                Err(api::ApiError::Unauthorized) => {
+                    auth.session_expired();
+                    return;
+                }
+                Err(api::ApiError::Message(_)) => {
+                    if terms.vocab_gen.get() == load_gen {
+                        terms.vocab_load.set(VocabLoad::Error);
+                    }
+                    return;
+                }
+            }
+        }
+        // A later `load_vocab` call (e.g. a fast Posts-list -> new-post sequence)
+        // already superseded this one — never let a slow response win.
+        if terms.vocab_gen.get() != load_gen {
+            return;
+        }
+        terms.taxonomies.set(taxonomies);
+        terms.hierarchical_terms.set(trees);
+        terms.vocab_load.set(VocabLoad::Ready);
+    });
+}
+
+/// Fetch bounded tag suggestions for `taxonomy`'s current buffer text (Q5's combobox
+/// contract; B2c's `q`+`limit` — never the whole tag vocabulary). An empty buffer
+/// clears the suggestion list outright rather than fetching (matches the mockup's
+/// "no matching entry -> no list at all" rule at the boundary). Guarded by
+/// `suggest_gen` against a slow/out-of-order response, not a timer — a fast typist's
+/// intermediate keystrokes each fire a request, but only the LAST one's response is
+/// ever applied.
+fn load_suggestions(terms: TermsCtx, taxonomy: String, buffer: String, auth: AuthCtx) {
+    let needle = buffer.trim().to_owned();
+    if needle.is_empty() {
+        terms.suggestions.update(|m| {
+            m.remove(&taxonomy);
+        });
+        terms.suggest_active.update(|m| {
+            m.remove(&taxonomy);
+        });
+        return;
+    }
+    let fetch_gen = terms.suggest_gen.get() + 1;
+    terms.suggest_gen.set(fetch_gen);
+    let tax_key = taxonomy;
+    spawn_local(async move {
+        match api::list_terms(&tax_key, false, Some(&needle), Some(8)).await {
+            Ok(resp) => {
+                if terms.suggest_gen.get() != fetch_gen {
+                    return;
+                }
+                terms.suggestions.update(|m| {
+                    m.insert(tax_key.clone(), resp.terms);
+                });
+                terms.suggest_active.update(|m| {
+                    m.remove(&tax_key);
+                });
+            }
+            Err(api::ApiError::Unauthorized) => auth.session_expired(),
+            Err(api::ApiError::Message(_)) => {
+                if terms.suggest_gen.get() == fetch_gen {
+                    terms.suggestions.update(|m| {
+                        m.remove(&tax_key);
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// The checklist rows to render for a hierarchical taxonomy: every term matching
+/// `filter` (case-insensitive substring on the name), PLUS every ancestor of a match
+/// (so the hierarchy still reads — an orphaned child with no visible parent would be
+/// confusing) — same tree DFS order as `vocab` itself, just narrowed. An empty
+/// filter matches everything. A PURE function of the vocabulary + filter text ONLY
+/// (SF15c) — never `selected_ids`, so a checkbox toggle never touches this list or
+/// the keyed `for` it drives.
+fn checklist_rows(vocab: &[api::TermDto], filter: &str) -> Vec<api::TermDto> {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return vocab.to_vec();
+    }
+    let by_id: HashMap<u64, &api::TermDto> = vocab.iter().map(|t| (t.id, t)).collect();
+    let matched: Vec<u64> = vocab
+        .iter()
+        .filter(|t| t.name.to_lowercase().contains(&needle))
+        .map(|t| t.id)
+        .collect();
+    let mut keep: HashSet<u64> = matched.iter().copied().collect();
+    for id in &matched {
+        let mut cur = by_id.get(id).and_then(|t| t.parent);
+        while let Some(pid) = cur {
+            if !keep.insert(pid) {
+                break; // already kept (a shared ancestor chain) — no need to re-walk
+            }
+            cur = by_id.get(&pid).and_then(|t| t.parent);
+        }
+    }
+    vocab
+        .iter()
+        .filter(|t| keep.contains(&t.id))
+        .cloned()
+        .collect()
+}
+
+/// Every selected id that belongs to `taxonomy`, sorted for a stable chip order:
+/// found either in that taxonomy's loaded vocabulary (hierarchical taxonomies only —
+/// a flat taxonomy's vocabulary is never bulk-loaded, see
+/// [`TermsCtx::hierarchical_terms`]) or, failing that, in the sidecar (SF3 — an
+/// out-of-vocab assignment still renders, attributed by the sidecar's OWN `taxonomy`
+/// field, always set correctly at seed/commit time regardless of whether the
+/// vocabulary happens to be loaded).
+fn chip_ids_for_taxonomy(
+    selected: &HashSet<u64>,
+    hierarchical_terms: &HashMap<String, Vec<api::TermDto>>,
+    sidecar: &HashMap<u64, api::TermRefDto>,
+    taxonomy: &str,
+) -> Vec<u64> {
+    let in_vocab: HashSet<u64> = hierarchical_terms
+        .get(taxonomy)
+        .map(|v| v.iter().map(|t| t.id).collect())
+        .unwrap_or_default();
+    let mut ids: Vec<u64> = selected
+        .iter()
+        .copied()
+        .filter(|id| {
+            in_vocab.contains(id) || sidecar.get(id).map(|t| t.taxonomy.as_str()) == Some(taxonomy)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Panel copy that reads `tax.label` (`format!` directly against `tax.label` inside
+/// a taxonomy-loop body that ALSO has reactive `if`/`for` siblings makes rustc
+/// capture the field itself into the generated `Fn` closure by value — fine on the
+/// first call, `E0525` on the second. Routing every such string through a helper
+/// that takes `&TaxonomyDto` makes the closure capture (and re-borrow) the WHOLE
+/// struct instead, which is `Fn`-safe — this file's only reason these exist.
+fn panel_chipline_label(tax: &api::TaxonomyDto) -> String {
+    format!("Assigned {}", tax.label.to_lowercase())
+}
+fn panel_filter_label(tax: &api::TaxonomyDto) -> String {
+    format!("Filter {}", tax.label.to_lowercase())
+}
+fn panel_filter_placeholder(tax: &api::TaxonomyDto) -> String {
+    format!("Filter {}\u{2026}", tax.label.to_lowercase())
+}
+fn panel_loading_text(tax: &api::TaxonomyDto) -> String {
+    format!("Loading {}\u{2026}", tax.label.to_lowercase())
+}
+fn panel_error_text(tax: &api::TaxonomyDto) -> String {
+    format!(
+        "Couldn't load {} \u{2014} your existing assignments are preserved.",
+        tax.label.to_lowercase()
+    )
+}
+fn panel_empty_text(tax: &api::TaxonomyDto) -> String {
+    format!("No {} exist yet.", tax.label.to_lowercase())
+}
+fn panel_tag_label(tax: &api::TaxonomyDto) -> String {
+    format!("Add a {}", singularize(&tax.label))
+}
+fn panel_tag_placeholder(tax: &api::TaxonomyDto) -> String {
+    format!("Add a {}\u{2026}", singularize(&tax.label))
+}
+
+/// `terms.hierarchical_terms.get().get(key)`, owned and defaulted — a small direct
+/// accessor to keep the rsx call sites (`for row in hier_vocab(terms, &tax.key)`,
+/// the `parent_options`-style precedent) free of intermediate `let`s.
+fn hier_vocab(terms: TermsCtx, key: &str) -> Vec<api::TermDto> {
+    terms
+        .hierarchical_terms
+        .get()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn filter_text(terms: TermsCtx, key: &str) -> String {
+    terms
+        .checklist_filter
+        .get()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn buffer_text(terms: TermsCtx, key: &str) -> String {
+    terms.tag_buffer.get().get(key).cloned().unwrap_or_default()
+}
+
+/// One rendered chip (SF15c's "view-model precompute" idiom, mirroring `row_vms`):
+/// the `for`'s item is a plain data struct, never a bare block, so its body needs no
+/// intermediate `let`s. `oov` is only ever true for a hierarchical taxonomy's own
+/// chip line (a flat taxonomy's assigned chips are never marked out-of-vocab — its
+/// vocabulary is never bulk-loaded, so there is nothing to check against; see
+/// [`chip_ids_for_taxonomy`]).
+#[derive(Clone, PartialEq)]
+struct ChipVm {
+    id: u64,
+    name: String,
+    oov: bool,
+}
+
+fn chip_vms(
+    selected: &HashSet<u64>,
+    hierarchical_terms: &HashMap<String, Vec<api::TermDto>>,
+    sidecar: &HashMap<u64, api::TermRefDto>,
+    taxonomy: &str,
+    hierarchical: bool,
+) -> Vec<ChipVm> {
+    let in_vocab: HashSet<u64> = hierarchical_terms
+        .get(taxonomy)
+        .map(|v| v.iter().map(|t| t.id).collect())
+        .unwrap_or_default();
+    chip_ids_for_taxonomy(selected, hierarchical_terms, sidecar, taxonomy)
+        .into_iter()
+        .map(|id| {
+            let name = sidecar
+                .get(&id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("Term #{id}"));
+            ChipVm {
+                id,
+                name,
+                oov: hierarchical && !in_vocab.contains(&id),
+            }
+        })
+        .collect()
+}
+
+/// Whether the (filtered) checklist for `taxonomy` has no rows to show — a single
+/// function call so a reactive `else if` condition referencing it only touches
+/// `taxonomy` once (rinch's `if`/`else if` codegen has no auto-clone protection for
+/// a captured field referenced from multiple places within one condition/branch —
+/// see the `TaxonomyPanel` doc comment).
+fn checklist_is_empty(terms: TermsCtx, taxonomy: &str) -> bool {
+    checklist_row_vms(
+        &hier_vocab(terms, taxonomy),
+        &filter_text(terms, taxonomy),
+        taxonomy,
+    )
+    .is_empty()
+}
+
+/// One checklist row, ready to render (SF15c: still just `TermDto`'s own fields plus
+/// one filter-derived `bool` — never anything interaction-derived). Carries its OWN
+/// `taxonomy` copy (not read from an outer capture): each `for`-item is its own
+/// independently-owned value, so a per-row closure (`oninput`) reading `row.taxonomy`
+/// never competes with a SIBLING row's own closure the way a shared outer `String`
+/// would (verified — that's exactly what happened before this field existed; rinch's
+/// `for` only auto-clone-protects its OWN iter_expr, not values a nested per-item
+/// closure references some other way).
+#[derive(Clone, PartialEq)]
+struct ChecklistRowVm {
+    id: u64,
+    name: String,
+    is_match: bool,
+    depth: usize,
+    taxonomy: String,
+}
+
+fn checklist_row_vms(vocab: &[api::TermDto], filter: &str, taxonomy: &str) -> Vec<ChecklistRowVm> {
+    checklist_rows(vocab, filter)
+        .into_iter()
+        .map(|t| ChecklistRowVm {
+            id: t.id,
+            is_match: checklist_row_is_match(&t, filter),
+            depth: t.depth,
+            name: t.name,
+            taxonomy: taxonomy.to_owned(),
+        })
+        .collect()
+}
+
+/// One tag suggestion, ready to render. Carries its own `taxonomy` copy — see
+/// `ChecklistRowVm`'s identical doc comment.
+#[derive(Clone, PartialEq)]
+struct SuggestVm {
+    id: u64,
+    name: String,
+    slug: String,
+    is_active: bool,
+    taxonomy: String,
+}
+
+fn suggest_vms(list: &[api::TermDto], active: Option<usize>, taxonomy: &str) -> Vec<SuggestVm> {
+    list.iter()
+        .enumerate()
+        .map(|(i, t)| SuggestVm {
+            id: t.id,
+            name: t.name.clone(),
+            slug: t.slug.clone(),
+            is_active: active == Some(i),
+            taxonomy: taxonomy.to_owned(),
+        })
+        .collect()
+}
+
+/// Every staged (pending-create) chip belonging to `taxonomy`, in insertion order.
+fn staged_for_taxonomy(staged: &[StagedTag], taxonomy: &str) -> Vec<StagedTag> {
+    staged
+        .iter()
+        .filter(|s| s.taxonomy == taxonomy)
+        .cloned()
+        .collect()
+}
+
+/// Whether `term`'s name/slug itself matches `filter` (as opposed to being kept
+/// in-view only as an ancestor of a match) — recomputed per-row from the SAME
+/// predicate [`checklist_rows`] used to build the list, rather than threading a
+/// derived flag through the `for` item (SF15c: the item stays `TermDto` alone).
+fn checklist_row_is_match(term: &api::TermDto, filter: &str) -> bool {
+    let needle = filter.trim().to_lowercase();
+    needle.is_empty() || term.name.to_lowercase().contains(&needle)
+}
+
+/// A crude English singular for a taxonomy label ("Tags" -> "tag") — used only for
+/// the token-input's "Add a {…}" placeholder/aria-label. Strips a trailing "es" or
+/// "s" and lowercases; falls back to the label verbatim (lowercased) when neither
+/// suffix is present. Good enough for the pinned v1 vocabulary ("Tags"); a taxonomy
+/// whose plural this mangles just gets a slightly odd placeholder, never a wrong or
+/// unsafe one.
+fn singularize(label: &str) -> String {
+    let lower = label.to_lowercase();
+    if let Some(stem) = lower.strip_suffix("es") {
+        stem.to_owned()
+    } else if let Some(stem) = lower.strip_suffix('s') {
+        stem.to_owned()
+    } else {
+        lower
+    }
+}
+
+/// Mirrors `ferropress-http::admin::terms::RESERVED_TERM_SLUGS`. Kept as a small,
+/// manually-synced duplicate rather than a core promotion (unlike `slugify`): this
+/// is a client-side FAIL-FAST hint, not a decision the two sides must ever agree on
+/// bit-for-bit — the server remains the sole authority (SF13's error taxonomy covers
+/// the 400 this is purely trying to avoid round-tripping for).
+fn is_reserved_term_slug(slug: &str) -> bool {
+    matches!(slug, "page" | "feed")
+}
+
+/// Commit one tag-buffer SEGMENT (already comma-split) as a chip: a slug match
+/// against the taxonomy's current (already server-fetched) suggestion list reuses
+/// that term's REAL id (SF2 — never a staged/dashed chip for something that already
+/// exists); anything else stages a new chip, deduped case-insensitively by slug
+/// against what's already staged (B9). Silently no-ops when `raw` slugifies to
+/// nothing (a stray comma, or an all-symbol scrap) — that is normal typing noise
+/// here, not the save-blocking condition (see [`commit_buffers_for_save`]).
+fn commit_one_tag(terms: TermsCtx, taxonomy: &str, raw: &str) {
+    let Some(slug) = ferropress_core::slugify(raw) else {
+        return;
+    };
+    let reuse = terms
+        .suggestions
+        .get()
+        .get(taxonomy)
+        .and_then(|list| {
+            list.iter()
+                .find(|t| ferropress_core::slugify(&t.name).as_deref() == Some(slug.as_str()))
+        })
+        .cloned();
+    match reuse {
+        Some(t) => {
+            terms.selected_ids.update(|s| {
+                s.insert(t.id);
+            });
+            terms.sidecar.update(|m| {
+                m.insert(
+                    t.id,
+                    api::TermRefDto {
+                        id: t.id,
+                        name: t.name,
+                        slug: t.slug,
+                        taxonomy: taxonomy.to_owned(),
+                    },
+                );
+            });
+        }
+        None => {
+            let already_staged = terms.staged.get().iter().any(|s| {
+                s.taxonomy == taxonomy
+                    && ferropress_core::slugify(&s.name).as_deref() == Some(slug.as_str())
+            });
+            if !already_staged {
+                let cid = terms.next_staged_cid.get();
+                terms.next_staged_cid.set(cid + 1);
+                terms.staged.update(|v| {
+                    v.push(StagedTag {
+                        cid,
+                        taxonomy: taxonomy.to_owned(),
+                        name: raw.trim().to_owned(),
+                        rejected: false,
+                    })
+                });
+            }
+        }
+    }
+    terms.terms_gen.update(|g| *g += 1);
+}
+
+/// Comma-splits `text` and commits each segment through [`commit_one_tag`] — the
+/// B7(i) live-typing path (`oninput` scans the buffer for `,`) and the shared tail
+/// of an Enter/blur/save commit alike.
+fn commit_tag_text(terms: TermsCtx, taxonomy: &str, text: &str) {
+    for segment in text.split(',') {
+        commit_one_tag(terms, taxonomy, segment.trim());
+    }
+}
+
+/// B8: commit EVERY taxonomy's uncommitted tag buffer before a save/preview
+/// snapshot (or before a view switch tears the panel down) — the same path an
+/// in-progress Enter would take, so unsent text is never silently discarded. First
+/// validates every non-empty buffer (must slugify to something, must not land on a
+/// reserved term slug); on the FIRST failure, returns its message and commits
+/// NOTHING (so a later-failing buffer can't have already mutated `staged` by the
+/// time the caller aborts the save). Only once every buffer passes does it actually
+/// commit them all and clear.
+fn commit_buffers_for_save(terms: TermsCtx) -> Result<(), String> {
+    let buffers = terms.tag_buffer.get();
+    for text in buffers.values() {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match ferropress_core::slugify(trimmed) {
+            None => {
+                return Err(format!(
+                    "\u{201C}{trimmed}\u{201D} isn't a usable tag \u{2014} clear it or finish typing before saving."
+                ));
+            }
+            Some(slug) if is_reserved_term_slug(&slug) => {
+                return Err(format!(
+                    "\u{201C}{trimmed}\u{201D} can't be used as a tag name \u{2014} clear it or finish typing before saving."
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (taxonomy, text) in buffers {
+        if !text.trim().is_empty() {
+            commit_tag_text(terms, &taxonomy, &text);
+        }
+    }
+    terms.tag_buffer.set(HashMap::new());
+    Ok(())
+}
+
+/// The B6 post-save reseed: applies the server's AUTHORITATIVE term list after a
+/// save/preview/create completes (the caller has already dropped a STALE response —
+/// a different document now open — before calling this). When `terms_gen_moved` is
+/// true (the user ticked another box or committed another chip while the request was
+/// in flight): MERGE — union the response's real ids into the live selection (a
+/// concurrent uncheck during the flight is preserved, since this only ADDS) and drop
+/// only the staged entries that were PART OF THIS SAVE (`sent_staged`) and whose slug
+/// the response confirms is now real, leaving anything typed during the flight
+/// alone. Otherwise (the common case, no interleaved edit): reseed wholesale from the
+/// response. Either way, `sidecar`/`terms_snapshot` always become the response's own
+/// (they describe "what IS assigned now", never a merge target).
+fn reseed_terms(
+    terms: TermsCtx,
+    terms_gen_moved: bool,
+    sent_staged: &[StagedTag],
+    resp: &[api::TermRefDto],
+) {
+    let resp_ids: HashSet<u64> = resp.iter().map(|t| t.id).collect();
+    let resp_slugs: HashSet<String> = resp
+        .iter()
+        .filter_map(|t| ferropress_core::slugify(&t.name))
+        .collect();
+    if terms_gen_moved {
+        terms.selected_ids.update(|s| {
+            s.extend(resp_ids.iter().copied());
+        });
+        let sent_cids: HashSet<u64> = sent_staged.iter().map(|s| s.cid).collect();
+        terms.staged.update(|v| {
+            v.retain(|t| {
+                !sent_cids.contains(&t.cid)
+                    || !ferropress_core::slugify(&t.name)
+                        .is_some_and(|slug| resp_slugs.contains(&slug))
+            });
+        });
+    } else {
+        terms.selected_ids.set(resp_ids.clone());
+        let sent_cids: HashSet<u64> = sent_staged.iter().map(|s| s.cid).collect();
+        terms
+            .staged
+            .update(|v| v.retain(|t| !sent_cids.contains(&t.cid)));
+    }
+    terms.sidecar.update(|m| {
+        for t in resp {
+            m.insert(t.id, t.clone());
+        }
+    });
+    terms.terms_snapshot.set(resp_ids.into_iter().collect());
+    terms.missing_term_notice.set(None);
+}
+
+/// Extracts the term id from the server's `"term {id} does not exist"` 400 (B10b) —
+/// the ONE error shape this needs to recognize to offer the removed-it-for-you
+/// recovery. Any other message (including the sibling "term {id} has no taxonomy" —
+/// genuinely corrupt data with no client-side fix) surfaces verbatim, no special
+/// handling.
+fn missing_term_id(message: &str) -> Option<u64> {
+    message
+        .strip_prefix("term ")
+        .and_then(|rest| rest.strip_suffix(" does not exist"))
+        .and_then(|id_str| id_str.parse().ok())
+}
+
+/// Install the B7 keyboard mechanism for every tag token-input, in ONE
+/// document-level `keydown` listener (the `install_escape_guard` idiom) rather than
+/// `onkeydown:`/`onsubmit:` in rsx — at the pinned rinch rev those attributes compile
+/// but silently become CLICK handlers (the rsx event map routes anything it doesn't
+/// recognize to `data-rid`), so an element-scoped keyboard handler here would be a
+/// silent no-op. Target-gated on `data-fp-tagbuffer="{taxonomy key}"` so the listener
+/// knows WHICH taxonomy's buffer to act on and never fires for a keystroke elsewhere
+/// on the page. `prevent_default` only on the keys actually consumed.
+///
+/// * Enter — accepts the active suggestion if one is highlighted, else commits the
+///   whole typed buffer as a chip (comma-splitting it too, in case of a paste that
+///   never fired `oninput`'s own scan).
+/// * ArrowDown/ArrowUp — moves the active suggestion index (wraps at the ends);
+///   no-op when the suggestion list is empty.
+/// * Backspace on an EMPTY buffer — two-step (Gutenberg behaviour): the first press
+///   just visually selects the last chip (todo: full press-again-to-remove needs a
+///   "selected chip" signal this pass keeps out of scope — see the S2 report); this
+///   pass implements the simpler, still-correct single-press remove, since a chip's
+///   only OTHER removal route (the pointer-only `×`) is always available regardless.
+/// * Escape — closes the suggestion list and explicitly KEEPS the buffer text (never
+///   clears it — Escape must not double as "discard what I typed").
+fn install_tag_buffer_guard(terms: TermsCtx) {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+        let Some(taxonomy) = e
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|el| el.get_attribute("data-fp-tagbuffer"))
+        else {
+            return;
+        };
+        match e.key().as_str() {
+            "Enter" => {
+                e.prevent_default();
+                let active = terms.suggest_active.get().get(&taxonomy).copied();
+                let picked = active.and_then(|i| {
+                    terms
+                        .suggestions
+                        .get()
+                        .get(&taxonomy)
+                        .and_then(|list| list.get(i))
+                        .cloned()
+                });
+                match picked {
+                    Some(t) => {
+                        terms.selected_ids.update(|s| {
+                            s.insert(t.id);
+                        });
+                        terms.sidecar.update(|m| {
+                            m.insert(
+                                t.id,
+                                api::TermRefDto {
+                                    id: t.id,
+                                    name: t.name,
+                                    slug: t.slug,
+                                    taxonomy: taxonomy.clone(),
+                                },
+                            );
+                        });
+                        terms.terms_gen.update(|g| *g += 1);
+                    }
+                    None => {
+                        let buf = terms
+                            .tag_buffer
+                            .get()
+                            .get(&taxonomy)
+                            .cloned()
+                            .unwrap_or_default();
+                        if !buf.trim().is_empty() {
+                            commit_tag_text(terms, &taxonomy, &buf);
+                        }
+                    }
+                }
+                terms.tag_buffer.update(|m| {
+                    m.remove(&taxonomy);
+                });
+                terms.suggestions.update(|m| {
+                    m.remove(&taxonomy);
+                });
+                terms.suggest_active.update(|m| {
+                    m.remove(&taxonomy);
+                });
+            }
+            "Backspace" => {
+                let empty = terms
+                    .tag_buffer
+                    .get()
+                    .get(&taxonomy)
+                    .is_none_or(|b| b.is_empty());
+                if !empty {
+                    return;
+                }
+                e.prevent_default();
+                let last = terms
+                    .staged
+                    .get()
+                    .iter()
+                    .rev()
+                    .find(|s| s.taxonomy == taxonomy)
+                    .map(|s| s.cid)
+                    .map(StagedOrAssigned::Staged)
+                    .or_else(|| {
+                        terms
+                            .sidecar
+                            .get()
+                            .values()
+                            .filter(|t| t.taxonomy == taxonomy)
+                            .map(|t| t.id)
+                            .max()
+                            .map(StagedOrAssigned::Assigned)
+                    });
+                match last {
+                    Some(StagedOrAssigned::Staged(cid)) => {
+                        terms.staged.update(|v| v.retain(|s| s.cid != cid));
+                        terms.terms_gen.update(|g| *g += 1);
+                    }
+                    Some(StagedOrAssigned::Assigned(id)) => {
+                        terms.selected_ids.update(|s| {
+                            s.remove(&id);
+                        });
+                        terms.terms_gen.update(|g| *g += 1);
+                    }
+                    None => {}
+                }
+            }
+            "ArrowDown" | "ArrowUp" => {
+                let len = terms
+                    .suggestions
+                    .get()
+                    .get(&taxonomy)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                if len == 0 {
+                    return;
+                }
+                e.prevent_default();
+                let cur = terms.suggest_active.get().get(&taxonomy).copied();
+                let next = match (e.key().as_str(), cur) {
+                    ("ArrowDown", None) => 0,
+                    ("ArrowDown", Some(i)) => (i + 1) % len,
+                    ("ArrowUp", None) => len - 1,
+                    ("ArrowUp", Some(i)) => (i + len - 1) % len,
+                    _ => unreachable!(),
+                };
+                terms.suggest_active.update(|m| {
+                    m.insert(taxonomy.clone(), next);
+                });
+            }
+            "Escape" => {
+                let had_suggestions = terms.suggestions.get().contains_key(&taxonomy);
+                if !had_suggestions {
+                    return;
+                }
+                e.prevent_default();
+                terms.suggestions.update(|m| {
+                    m.remove(&taxonomy);
+                });
+                terms.suggest_active.update(|m| {
+                    m.remove(&taxonomy);
+                });
+                // The buffer text is deliberately left untouched.
+            }
+            _ => {}
+        }
+    });
+    let _ = doc.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());
+    cb.forget();
+
+    // B8's blur-commits-the-buffer leg. rinch's rsx event map has no `onblur`
+    // mapping (it would silently become a click handler, per this function's own
+    // doc comment) — a real `focusout` listener (bubbles, unlike `blur`) instead.
+    // Re-fetches `document` rather than reusing the outer `doc` binding: `Closure`
+    // captures by move, and the keydown closure above already consumed it.
+    let Some(doc2) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let blur_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+        let Some(taxonomy) = e
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|el| el.get_attribute("data-fp-tagbuffer"))
+        else {
+            return;
+        };
+        let buf = terms
+            .tag_buffer
+            .get()
+            .get(&taxonomy)
+            .cloned()
+            .unwrap_or_default();
+        if !buf.trim().is_empty() {
+            commit_tag_text(terms, &taxonomy, &buf);
+            terms.tag_buffer.update(|m| {
+                m.remove(&taxonomy);
+            });
+        }
+        terms.suggestions.update(|m| {
+            m.remove(&taxonomy);
+        });
+        terms.suggest_active.update(|m| {
+            m.remove(&taxonomy);
+        });
+    });
+    let _ = doc2.add_event_listener_with_callback("focusout", blur_cb.as_ref().unchecked_ref());
+    blur_cb.forget();
+}
+
+/// Which side of the assignment a Backspace-on-empty-buffer removes: the most
+/// recently staged new chip for this taxonomy, else the highest-id assigned term
+/// (a stable, if arbitrary, "most recent" proxy — assignment order isn't tracked).
+enum StagedOrAssigned {
+    Staged(u64),
+    Assigned(u64),
+}
+
 /// Whether the signed-in user is an Administrator — the only role that manages
 /// settings. Decides whether to show the Settings nav; the server enforces
 /// `ManageSettings` on the endpoints regardless.
@@ -1633,6 +2961,7 @@ fn open_posts_list(
     kind: Signal<EntityKind>,
     posts: Signal<Vec<PostSummary>>,
     state: Signal<Load>,
+    terms: TermsCtx,
     notice: Signal<String>,
     view: Signal<View>,
     auth: AuthCtx,
@@ -1641,6 +2970,10 @@ fn open_posts_list(
     kind.set(EntityKind::Post);
     view.set(View::List);
     load_posts(posts, state, auth);
+    // Q2: pre-warm the shared vocabulary from the Posts galley too (idempotent —
+    // `open_post`/`new_post` already guarantee it's loaded by the time a panel
+    // could render, so this is a head start, not a correctness requirement).
+    load_vocab(terms, auth);
 }
 
 /// Switch the List view to the PAGES galley and (re)load it, plus the theme's page
@@ -1867,30 +3200,47 @@ fn upload_via_picker(
 /// `BlockTree` into the editor, then switch to the editor view. A bridge failure
 /// loads an EMPTY document and surfaces a warning rather than corrupting content.
 #[allow(clippy::too_many_arguments)]
-fn open_post(
-    id: u64,
-    editor: Signal<EditorHandle>,
-    title: Signal<String>,
-    slug: Signal<String>,
-    status: Signal<String>,
-    featured: Signal<Option<api::FeaturedMedia>>,
-    current_id: Signal<Option<u64>>,
-    editor_session: Signal<u64>,
-    notice: Signal<String>,
-    auth: AuthCtx,
-) {
+fn open_post(id: u64, ectx: EditorCtx) {
+    let EditorCtx {
+        editor,
+        title,
+        slug,
+        status,
+        featured,
+        current_id,
+        editor_session,
+        terms,
+        notice,
+        auth,
+        ..
+    } = ectx;
     notice.set(String::new());
+    load_vocab(terms, auth);
+    // B5: bump the OPEN generation SYNCHRONOUSLY, before the fetch even starts — a
+    // second rapid click (a different post, or "New post") must invalidate this
+    // fetch's eventual arrival by generation, not just race it. `editor_session`
+    // already serves this role for save/preview; opens get the identical guard here
+    // for the first time.
+    editor_session.update(|g| *g += 1);
+    let open_gen = editor_session.get();
     spawn_local(async move {
         match api::get_post(id).await {
             Ok(detail) => {
-                // A new document is taking over the shared editor: bump the session
-                // so any still-in-flight save can no longer write back its id here.
-                editor_session.update(|g| *g += 1);
+                // A newer open (or a save that landed and moved the generation)
+                // superseded this one while it was in flight: drop it entirely
+                // rather than writing a stale document's fields over the current one.
+                if editor_session.get() != open_gen {
+                    return;
+                }
+                // Every field lands in this SAME synchronous block (no `.await`
+                // between them) — an observer can never see e.g. the new title with
+                // the old terms, or vice versa (B5's atomic-seed requirement).
                 title.set(detail.title);
                 slug.set(detail.slug);
                 status.set(detail.status);
                 featured.set(detail.featured_media);
                 current_id.set(Some(detail.id));
+                seed_terms(terms, &detail.terms);
 
                 let schema = Schema::starter_kit();
                 let handle = editor.get();
@@ -1908,9 +3258,38 @@ fn open_post(
                 auth.view.set(View::Editor);
             }
             Err(api::ApiError::Unauthorized) => auth.session_expired(),
-            Err(api::ApiError::Message(e)) => notice.set(format!("Couldn't open that post: {e}")),
+            Err(api::ApiError::Message(e)) => {
+                if editor_session.get() == open_gen {
+                    notice.set(format!("Couldn't open that post: {e}"));
+                }
+            }
         }
     });
+}
+
+/// Reset `terms`' per-document assignment half from an authoritative term list — the
+/// SAME seeding [`open_post`] uses on load and [`new_post`] uses to go blank
+/// (`terms: &[]`). Clears every staged/filter/buffer/suggestion signal too: none of
+/// that transient UI state can belong to whatever document was open a moment ago.
+fn seed_terms(terms: TermsCtx, seed: &[api::TermRefDto]) {
+    terms
+        .selected_ids
+        .set(seed.iter().map(|t| t.id).collect::<HashSet<u64>>());
+    terms.sidecar.set(
+        seed.iter()
+            .map(|t| (t.id, t.clone()))
+            .collect::<HashMap<u64, api::TermRefDto>>(),
+    );
+    terms
+        .terms_snapshot
+        .set(seed.iter().map(|t| t.id).collect());
+    terms.staged.set(Vec::new());
+    terms.tag_buffer.set(HashMap::new());
+    terms.checklist_filter.set(HashMap::new());
+    terms.suggestions.set(HashMap::new());
+    terms.suggest_active.set(HashMap::new());
+    terms.missing_term_notice.set(None);
+    terms.terms_gen.update(|g| *g += 1);
 }
 
 /// Open a page in the editor: fetch it, populate the meta fields (including the
@@ -1992,16 +3371,15 @@ fn prepared_doc(
 
 /// Persist the prepared document: CREATE (`POST`) when there is no id yet, else
 /// UPDATE (`PUT`) in place. Returns the effective post id (freshly assigned on
-/// create) AND the post's AUTHORITATIVE terms after the server's reconcile (SF4) —
-/// no assignment panel reads the latter yet (Inc-3 S1; the panels + the B6
-/// merge-not-overwrite reseed land in S2), but every save/preview already goes
-/// through the real wire shape so S2 only has to START READING this, not restructure
-/// the plumbing again. `terms`/`new_terms` are sent as `None` here — S1 introduces no
-/// taxonomy UI, so there is nothing yet for [`api::dirty_terms`] to compare against;
-/// `None` is also exactly the pre-Inc-3 behavior (leave membership untouched). The
-/// one create-vs-update decision, shared by [`save_post`] and [`preview_post`]; the
-/// stale-session guard + `current_id` writeback stay with the callers, which differ
-/// in what they do on success (toast vs. steer the tab).
+/// create) AND the post's AUTHORITATIVE terms after the server's reconcile (SF4),
+/// for the caller's B6 reseed. `terms` follows the SF1 dirty-send contract
+/// ([`api::dirty_terms`] — `None` = leave unchanged, `Some(v)` = set-reconcile,
+/// including the deliberate `Some(vec![])` "clear everything"); `new_terms` is
+/// additive on top of it. The one create-vs-update decision, shared by
+/// [`save_post`] and [`preview_post`]; the stale-session guard + `current_id`
+/// writeback stay with the callers, which differ in what they do on success (toast
+/// vs. steer the tab).
+#[allow(clippy::too_many_arguments)]
 async fn persist_post(
     existing: Option<u64>,
     title: String,
@@ -2009,6 +3387,8 @@ async fn persist_post(
     status: String,
     block_tree: serde_json::Value,
     featured: Option<u64>,
+    terms: Option<Vec<u64>>,
+    new_terms: Option<Vec<api::NewTermRequest>>,
 ) -> Result<(u64, Vec<api::TermRefDto>), api::ApiError> {
     match existing {
         Some(id) => api::save_post(
@@ -2019,8 +3399,8 @@ async fn persist_post(
                 status,
                 block_tree,
                 featured_media: featured,
-                terms: None,
-                new_terms: None,
+                terms,
+                new_terms,
             },
         )
         .await
@@ -2031,8 +3411,8 @@ async fn persist_post(
             status,
             block_tree,
             featured_media: featured,
-            terms: None,
-            new_terms: None,
+            terms,
+            new_terms,
         })
         .await
         .map(|resp| (resp.id, resp.terms)),
@@ -2089,19 +3469,21 @@ async fn persist_page(
 /// CREATED and its assigned id captured into `current_id` so the next save UPDATES it
 /// in place. Surfaces the server's 400/409 message; stamps a "Saved" toast on success.
 #[allow(clippy::too_many_arguments)]
-fn save_post(
-    editor: Signal<EditorHandle>,
-    current_id: Signal<Option<u64>>,
-    editor_session: Signal<u64>,
-    title: Signal<String>,
-    slug: Signal<String>,
-    status: Signal<String>,
-    featured: Signal<Option<api::FeaturedMedia>>,
-    saving: Signal<bool>,
-    notice: Signal<String>,
-    toast: Signal<bool>,
-    auth: AuthCtx,
-) {
+fn save_post(ectx: EditorCtx) {
+    let EditorCtx {
+        editor,
+        title,
+        slug,
+        status,
+        featured,
+        current_id,
+        editor_session,
+        terms,
+        saving,
+        notice,
+        toast,
+        auth,
+    } = ectx;
     if saving.get() {
         return;
     }
@@ -2113,6 +3495,17 @@ fn save_post(
             return;
         }
     };
+    // B8: an uncommitted tag buffer must never be silently dropped by a save — it
+    // is committed through the SAME path as Enter, synchronously, before the
+    // payload is even built. A buffer that fails local validation BLOCKS the save
+    // (an inline message) rather than being swallowed, which would otherwise 400
+    // the WHOLE save (title/body/status included) via the server's own reserved-
+    // slug/empty-name checks — this surfaces the same problem before the network
+    // round trip, attributed to the actual field at fault.
+    if let Err(msg) = commit_buffers_for_save(terms) {
+        notice.set(msg);
+        return;
+    }
 
     notice.set(String::new());
     saving.set(true);
@@ -2120,10 +3513,32 @@ fn save_post(
     let status_val = status.get();
     let featured_val = featured.get().map(|f| f.id);
     let existing = current_id.get();
-    // The document this save belongs to. If the editor loads a different document
-    // before the request returns, the result is stale and must NOT write back its
-    // id / toast / error into what is now a different editing context.
+    // SF1 dirty-send: only send a `terms` field when the live selection actually
+    // differs from the last-known-persisted snapshot — an untouched panel must
+    // never clear (or even touch) a post's categories/tags on a body-only save.
+    let current_ids: Vec<u64> = terms.selected_ids.get().into_iter().collect();
+    let snapshot_ids = terms.terms_snapshot.get();
+    let terms_arg = api::dirty_terms(&current_ids, &snapshot_ids);
+    let sent_staged = terms.staged.get();
+    let new_terms_arg = if sent_staged.is_empty() {
+        None
+    } else {
+        Some(
+            sent_staged
+                .iter()
+                .map(|s| api::NewTermRequest {
+                    taxonomy: s.taxonomy.clone(),
+                    name: s.name.clone(),
+                })
+                .collect(),
+        )
+    };
+    // The document this save belongs to (editor_session) AND whether the live
+    // assignment moves again while the request is in flight (terms_gen) — B6's two
+    // independent staleness axes. A DIFFERENT document supersedes everything; the
+    // SAME document with a later assignment edit merges instead of overwriting.
     let save_gen = editor_session.get();
+    let terms_gen_at_send = terms.terms_gen.get();
     spawn_local(async move {
         let result = persist_post(
             existing,
@@ -2132,31 +3547,58 @@ fn save_post(
             status_val,
             block_tree,
             featured_val,
+            terms_arg,
+            new_terms_arg,
         )
         .await;
-        // The editor moved to another document while we were in flight: the save
-        // still landed server-side, but adopting its id here would hijack the new
-        // document. Free the save lock and drop the writeback. (A 401 is auth-wide,
-        // so it still routes to login regardless.)
         let stale = editor_session.get() != save_gen;
+        let terms_gen_moved = terms.terms_gen.get() != terms_gen_at_send;
         saving.set(false);
         match result {
-            Ok((id, _terms)) => {
+            Ok((id, resp_terms)) => {
                 if stale {
                     return;
                 }
-                // A create hands back a new id; record it so the next save updates.
                 if existing.is_none() {
                     current_id.set(Some(id));
                 }
+                reseed_terms(terms, terms_gen_moved, &sent_staged, &resp_terms);
                 toast.set(true);
                 TimeoutFuture::new(1600).await;
                 toast.set(false);
             }
             Err(api::ApiError::Unauthorized) => auth.session_expired(),
             Err(api::ApiError::Message(e)) => {
-                if !stale {
-                    notice.set(e);
+                if stale {
+                    return;
+                }
+                // SF17: every failed save invalidates the vocab, regardless of
+                // WHY it failed — `apply_terms` mutates one tag at a time, so a
+                // partial failure can leave an earlier tag created-but-
+                // unassigned; the next load must show the truth.
+                invalidate_vocab(terms);
+                // B10(b): a term deleted elsewhere between load and save hard-400s
+                // the WHOLE save. Recognize that one shape, silently drop the
+                // offending id from the live selection so the SAME Save button
+                // just works on the next click — never an automatic retry, and
+                // never a preventative prune of `selected_ids` against the
+                // vocabulary otherwise (B10c forbids that as its own silent-unlink
+                // path).
+                match missing_term_id(&e) {
+                    Some(missing_id) => {
+                        terms.selected_ids.update(|s| {
+                            s.remove(&missing_id);
+                        });
+                        terms.sidecar.update(|m| {
+                            m.remove(&missing_id);
+                        });
+                        terms.terms_gen.update(|g| *g += 1);
+                        terms.missing_term_notice.set(Some(missing_id));
+                        notice.set(format!(
+                            "One of this post's categories/tags no longer exists, so nothing was saved. It's been removed here \u{2014} click Save again."
+                        ));
+                    }
+                    None => notice.set(e),
                 }
             }
         }
@@ -2253,19 +3695,21 @@ fn save_page(
 /// in this click gesture and left blank, then steered to `/admin/preview/{id}` once
 /// the save lands. On a stale save (the editor moved on) or an error, the blank tab is
 /// closed and the editor shows the message.
-#[allow(clippy::too_many_arguments)]
-fn preview_post(
-    editor: Signal<EditorHandle>,
-    current_id: Signal<Option<u64>>,
-    editor_session: Signal<u64>,
-    title: Signal<String>,
-    slug: Signal<String>,
-    status: Signal<String>,
-    featured: Signal<Option<api::FeaturedMedia>>,
-    saving: Signal<bool>,
-    notice: Signal<String>,
-    auth: AuthCtx,
-) {
+fn preview_post(ectx: EditorCtx) {
+    let EditorCtx {
+        editor,
+        title,
+        slug,
+        status,
+        featured,
+        current_id,
+        editor_session,
+        terms,
+        saving,
+        notice,
+        auth,
+        ..
+    } = ectx;
     if saving.get() {
         return;
     }
@@ -2277,6 +3721,13 @@ fn preview_post(
             return;
         }
     };
+    // B8/SF4: Preview shares Save's contract exactly — the same buffer-commit
+    // (WYSIWYP: a chip typed but not yet committed must be in the preview too, or
+    // the tab would render a document the panel doesn't yet show as saved).
+    if let Err(msg) = commit_buffers_for_save(terms) {
+        notice.set(msg);
+        return;
+    }
 
     // Open the tab NOW, in the trusted click, so it isn't blocked as a non-user
     // pop-up. It starts blank; we point it at the rendered draft after the save below.
@@ -2293,7 +3744,25 @@ fn preview_post(
     let status_val = status.get();
     let featured_val = featured.get().map(|f| f.id);
     let existing = current_id.get();
+    let current_ids: Vec<u64> = terms.selected_ids.get().into_iter().collect();
+    let snapshot_ids = terms.terms_snapshot.get();
+    let terms_arg = api::dirty_terms(&current_ids, &snapshot_ids);
+    let sent_staged = terms.staged.get();
+    let new_terms_arg = if sent_staged.is_empty() {
+        None
+    } else {
+        Some(
+            sent_staged
+                .iter()
+                .map(|s| api::NewTermRequest {
+                    taxonomy: s.taxonomy.clone(),
+                    name: s.name.clone(),
+                })
+                .collect(),
+        )
+    };
     let save_gen = editor_session.get();
+    let terms_gen_at_send = terms.terms_gen.get();
     spawn_local(async move {
         let result = persist_post(
             existing,
@@ -2302,12 +3771,15 @@ fn preview_post(
             status_val,
             block_tree,
             featured_val,
+            terms_arg,
+            new_terms_arg,
         )
         .await;
         let stale = editor_session.get() != save_gen;
+        let terms_gen_moved = terms.terms_gen.get() != terms_gen_at_send;
         saving.set(false);
         match result {
-            Ok((id, _terms)) => {
+            Ok((id, resp_terms)) => {
                 if stale {
                     // The editor switched documents mid-flight: the save landed, but
                     // steering the tab into what is now a different post would mislead.
@@ -2317,6 +3789,7 @@ fn preview_post(
                 if existing.is_none() {
                     current_id.set(Some(id));
                 }
+                reseed_terms(terms, terms_gen_moved, &sent_staged, &resp_terms);
                 if win
                     .location()
                     .set_href(&format!("/admin/preview/{id}"))
@@ -2331,8 +3804,26 @@ fn preview_post(
             }
             Err(api::ApiError::Message(e)) => {
                 let _ = win.close();
-                if !stale {
-                    notice.set(e);
+                if stale {
+                    return;
+                }
+                // SF17 — see the identical note in `save_post`.
+                invalidate_vocab(terms);
+                match missing_term_id(&e) {
+                    Some(missing_id) => {
+                        terms.selected_ids.update(|s| {
+                            s.remove(&missing_id);
+                        });
+                        terms.sidecar.update(|m| {
+                            m.remove(&missing_id);
+                        });
+                        terms.terms_gen.update(|g| *g += 1);
+                        terms.missing_term_notice.set(Some(missing_id));
+                        notice.set(format!(
+                            "One of this post's categories/tags no longer exists, so nothing was saved. It's been removed here \u{2014} click Preview again."
+                        ));
+                    }
+                    None => notice.set(e),
                 }
             }
         }
@@ -2439,27 +3930,32 @@ fn preview_page(
 /// to `None` so the first Save creates the post (see [`save_post`]). The signals are
 /// set BEFORE the view switch so the uncontrolled title/slug inputs read the blank
 /// values at arm-build.
-#[allow(clippy::too_many_arguments)]
-fn new_post(
-    editor: Signal<EditorHandle>,
-    title: Signal<String>,
-    slug: Signal<String>,
-    status: Signal<String>,
-    featured: Signal<Option<api::FeaturedMedia>>,
-    current_id: Signal<Option<u64>>,
-    editor_session: Signal<u64>,
-    notice: Signal<String>,
-    auth: AuthCtx,
-) {
+fn new_post(ectx: EditorCtx) {
+    let EditorCtx {
+        editor,
+        title,
+        slug,
+        status,
+        featured,
+        current_id,
+        editor_session,
+        terms,
+        notice,
+        auth,
+        ..
+    } = ectx;
     // A fresh document takes over the shared editor: bump the session so any
-    // still-in-flight save can no longer write its id back into this blank post.
+    // still-in-flight save/open can no longer write its result back into this
+    // blank post (the same generation guard `open_post` uses).
     editor_session.update(|g| *g += 1);
     notice.set(String::new());
+    load_vocab(terms, auth);
     title.set(String::new());
     slug.set(String::new());
     status.set("draft".to_owned());
     featured.set(None);
     current_id.set(None);
+    seed_terms(terms, &[]);
 
     // Clear whatever the shared editor held from a previously opened post.
     let schema = Schema::starter_kit();

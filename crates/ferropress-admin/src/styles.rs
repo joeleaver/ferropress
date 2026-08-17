@@ -259,6 +259,71 @@ const ADMIN_CSS: &str = r#"
 .sheet__inner { max-width: var(--measure); margin: 0 auto; }
 .editor__error { max-width: calc(var(--measure) + 6rem); margin: 0 auto 1rem; color: var(--minium-deep); font-size: .88rem; text-align: center; }
 
+/* ── TAXONOMY PANELS (Categories/Tags, Post-only) ────────────────────
+   SF5: ONE copy of the panel markup, always in the same DOM position
+   (right after .sheet) — repositioned into a sticky right-hand rail at
+   >=1280px by CSS Grid alone (grid-column/row placement), never a second
+   copy of the markup and never a JS-tracked viewport signal. .editor__body
+   is the sheet+panels' shared grid parent; below 1280px it stays a plain
+   block flow (the panels render in normal DOM order, below the sheet). */
+.editor__body { display: block; }
+.editor__below { max-width: calc(var(--measure) + 6rem); margin: 1.5rem auto 0; }
+@media (min-width: 1280px) {
+  .editor__body {
+    display: grid; grid-template-columns: 1fr 19rem; gap: 1.75rem; align-items: start;
+    max-width: calc(var(--measure) + 6rem + 19rem + 1.75rem); margin: 0 auto;
+  }
+  .editor__body .sheet { grid-column: 1; grid-row: 1; max-width: none; margin: 0; }
+  .editor__body .editor__below {
+    grid-column: 2; grid-row: 1; max-width: none; margin: 0;
+    position: sticky; top: 1rem;
+  }
+}
+
+.chipline { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 .7rem; min-height: 1.9rem; }
+.chip {
+  display: inline-flex; align-items: center; gap: .4rem; padding: .28rem .35rem .28rem .7rem;
+  background: var(--paper-sink); border: 1px solid var(--rule); border-radius: 999px;
+  font-family: var(--ff-ui); font-size: .88rem; color: var(--ink-2); line-height: 1.2; max-width: 100%;
+}
+.chip small { font-family: var(--ff-mono); font-size: .64rem; letter-spacing: .03em; color: var(--steel); white-space: nowrap; }
+.chip--new { border-style: dashed; border-color: #C6B27A; color: var(--ochre); background: transparent; }
+.chip--new small { color: var(--ochre); }
+.chip--oov { border-style: dashed; border-color: var(--steel-2); color: var(--steel); background: transparent; }
+.chip--oov small { color: var(--steel-2); }
+.chip--rejected { border-color: var(--minium); color: var(--minium-deep); background: #F3E7E2; }
+.chip--rejected small { color: var(--minium-deep); }
+.chip__x {
+  width: 16px; height: 16px; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  border: 0; background: transparent; border-radius: 50%; color: var(--steel); font-size: .82rem; line-height: 1; padding: 0;
+}
+.chip__x:hover { background: var(--paper); color: var(--minium-deep); }
+.chip--rejected .chip__x:hover { background: #EAD2C8; }
+
+.termcheck { border: 0; margin: 0; padding: 0; }
+.termcheck__legend { font-size: .78rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--steel); padding: 0; margin: 0 0 .7rem; }
+.termcheck__search { margin-bottom: .7rem; }
+.termcheck__scroll { max-height: 16rem; overflow-y: auto; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--paper-sink); padding: .35rem; }
+.termcheck__row { display: flex; align-items: center; gap: .55rem; padding: .42rem .5rem; border-radius: 2px; cursor: pointer; font-size: .92rem; color: var(--ink-2); }
+.termcheck__row:hover { background: var(--paper-raise); }
+.termcheck__row input { accent-color: var(--minium); width: 1rem; height: 1rem; margin: 0; flex: none; }
+.termcheck__row:has(input:focus-visible) { outline: 2px solid var(--minium); outline-offset: -2px; background: var(--paper-raise); }
+.termcheck__row--ctx { color: var(--steel); font-style: italic; }
+.termcheck__row--ctx .termcheck__name { font-style: italic; }
+.termcheck__row--match .termcheck__name { font-weight: 500; color: var(--ink); }
+
+.tokenfield { border: 1px solid transparent; border-radius: var(--radius); padding: .25rem; margin: 0 -.25rem; position: relative; }
+.tokenfield:focus-within { outline: 2px solid var(--minium); outline-offset: 1px; }
+.tokenfield__input { max-width: 100%; }
+.combobox__list { list-style: none; margin: .35rem 0 0; padding: .3rem; background: var(--paper-raise); border: 1px solid var(--rule); border-radius: var(--radius); box-shadow: var(--shadow); max-height: 13rem; overflow-y: auto; }
+.combobox__opt { padding: .42rem .6rem; border-radius: 2px; font-size: .9rem; color: var(--ink-2); cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: .6rem; }
+.combobox__opt.is-active { background: var(--minium); color: #FCF6F2; }
+.combobox__opt.is-active .combobox__hint { color: #F3D9CD; }
+.combobox__hint { font-family: var(--ff-mono); font-size: .68rem; letter-spacing: .04em; text-transform: uppercase; color: var(--steel); }
+
+.panelstate { padding: .9rem .2rem; color: var(--steel); font-family: var(--ff-mono); font-size: .8rem; letter-spacing: .03em; }
+.panelerror { padding: .65rem .75rem; margin: 0; color: var(--minium-deep); background: #F3E7E2; border: 1px solid #D8C4BC; border-radius: var(--radius); font-size: .85rem; line-height: 1.5; }
+
 /* The title is the headline on the sheet — a borderless input set in the display
    serif, matching the editor's own h1 so it reads as one continuous proof. */
 .sheet__title {

@@ -357,8 +357,9 @@ pub async fn create_post(body: &CreateRequest) -> Result<PostCreateResponse, Api
 // instead, gated by the post-edit permission, never `ManageTerms`).
 
 /// One taxonomy, for the assignment panels + the term-management screen. Mirrors
-/// `ferropress-http::admin::terms::TaxonomyDto`.
-#[derive(Clone, PartialEq, Deserialize)]
+/// `ferropress-http::admin::terms::TaxonomyDto`. (`Default` only to satisfy the
+/// rinch `#[component]` macro — `TaxonomyPanel` takes it as a prop.)
+#[derive(Clone, PartialEq, Default, Deserialize)]
 pub struct TaxonomyDto {
     pub id: u64,
     /// Stable key (`"category"`, `"tag"`) — the archive URL base + the API handle.

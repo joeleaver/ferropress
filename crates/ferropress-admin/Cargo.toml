@@ -78,6 +78,13 @@ web-sys = { version = "0.3", features = [
     "EventTarget",
     "BeforeUnloadEvent",
     "KeyboardEvent",
+    # Taxonomy tag token-input (Inc 3 S2): rinch's rsx event map has no `onblur`
+    # mapping (an `onblur:` attribute silently becomes a CLICK handler — the same
+    # footgun the design ruling documents for `onkeydown`/`onsubmit`), so the B8
+    # commit-buffer-on-blur guard is a real document-level `focusout` listener
+    # instead (`Event` for `.target()`).
+    "Event",
+    "FocusEvent",
 ] }
 
 # HTTP (fetch) + JSON + a small timer for the save toast.
