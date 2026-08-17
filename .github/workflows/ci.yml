@@ -74,6 +74,17 @@ jobs:
       # (rinch is used only by the EXCLUDED ferropress-islands wasm crate).
       - run: cargo run --manifest-path xtask/Cargo.toml -- dep-graph-lint
 
+  no-consumer-names-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Self-enforcing guard: ferropress core is a published, general-purpose CMS — a
+      # private consumer project's name (or assertions specific to it) must never leak in.
+      # See xtask/src/main.rs's BANNED_CONSUMER_NAMES + CLAUDE.md §4.
+      - run: cargo run --manifest-path xtask/Cargo.toml -- no-consumer-names-lint
+
   # The public-site wasm islands crate (ferropress-islands) is EXCLUDED from the
   # workspace, so the --workspace jobs above never touch it. Lint + build it for
   # wasm32 and run wasm-bindgen so it can't silently rot. The wasm-bindgen CLI

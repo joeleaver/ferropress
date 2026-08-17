@@ -16,12 +16,15 @@
 //!     the server serves at `/_fp/islands`).
 //!   * `build-admin` — the same, for the excluded `ferropress-admin` admin-SPA
 //!     `cdylib` → `crates/ferropress-admin/dist/` (served at `/_fp/admin`).
-//!   * `parity` — run the fellstone-site theme's parity fixtures (`cargo test -p
-//!     ferropress-serve --lib fellstone`) against the REAL sibling theme repo. These do
-//!     NOT run in CI (fellstone-site is a separate, local-only project with no pushed
-//!     remote CI could check out — see [`run_fellstone_parity`]'s doc comment), so this
-//!     is the one place that verifies the two themes haven't drifted. Anyone changing a
-//!     theme file, in EITHER repo, must run this before pushing.
+//!   * `theme-contract-check` — run ferropress-serve's GENERIC external-theme contract
+//!     checker (`cargo test -p ferropress-serve --lib external_theme`) against a real theme
+//!     project's dir, via `FERROPRESS_EXTERNAL_THEME_DIR`. Core carries no dependency on, or
+//!     knowledge of, any particular consumer theme — this is for a theme author to run
+//!     against their OWN project (locally, or in their own CI).
+//!   * `no-consumer-names-lint` — self-enforcing guard: fails if any tracked file in this
+//!     repo mentions a banned consumer-project name (see [`BANNED_CONSUMER_NAMES`]). Core is
+//!     a published, general-purpose CMS; a private consumer project's name must never leak
+//!     into it.
 //!
 //! Run from anywhere:
 //!
@@ -29,7 +32,8 @@
 //! cargo run --manifest-path xtask/Cargo.toml -- dep-graph
 //! cargo run --manifest-path xtask/Cargo.toml -- build-islands
 //! cargo run --manifest-path xtask/Cargo.toml -- build-admin
-//! cargo run --manifest-path xtask/Cargo.toml -- parity
+//! cargo run --manifest-path xtask/Cargo.toml -- theme-contract-check
+//! cargo run --manifest-path xtask/Cargo.toml -- no-consumer-names-lint
 //! ```
 //!
 //! The lint uses `cargo metadata --no-deps` so it is fast and offline — it reads
@@ -69,9 +73,11 @@ fn main() -> Result<()> {
         Some("build-islands") => build_islands(),
         Some("build-admin") => build_admin(),
         Some("build-plugins") => build_plugins(),
-        Some("parity") => run_fellstone_parity(),
+        Some("theme-contract-check") => run_theme_contract_check(),
+        Some("no-consumer-names-lint") => no_consumer_names_lint(),
         Some(other) => bail!(
-            "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, `build-admin`, `build-plugins`, or `parity`)"
+            "unknown xtask subcommand {other:?} (expected `dep-graph`, `build-islands`, \
+             `build-admin`, `build-plugins`, `theme-contract-check`, or `no-consumer-names-lint`)"
         ),
     }
 }
@@ -366,66 +372,125 @@ fn dep_graph_lint() -> Result<()> {
     }
 }
 
-/// Run the fellstone-site theme's parity fixtures against the REAL sibling repo (F11 /
-/// review finding C14).
+/// Run ferropress-serve's GENERIC external-theme contract checker against a real theme
+/// project (`crates/ferropress-serve/src/tests.rs`'s `external_theme_engines()` and its three
+/// `external_theme_*` tests).
 ///
-/// `fellstone-site` is a separate, standalone project (its own git history, no `path =`
-/// dependency, consumed only via `FERROPRESS_THEMES_DIR` at deploy time — see
-/// `CLAUDE.local.md`), and — as of this writing — has no pushed remote: `git remote -v` in
-/// that repo is empty. Ferropress's own CI therefore has NOTHING to check it out from, so
-/// wiring a CI step for it would either silently no-op (defeating the point) or fail every
-/// run (blocking on a repo CI can't reach). Rather than fake either, the four fellstone
-/// parity tests in `ferropress-serve` skip cleanly (never fail) when
-/// `FERROPRESS_FELLSTONE_DIR` is unset — see `crates/ferropress-serve/src/tests.rs`'s
-/// `fellstone_engine()` — and THIS target is the one place that actually runs them, on
-/// purpose, against the real files. It must be run locally (by a human, or a future CI once
-/// the repo has a reachable remote) before pushing ANY change to a theme file in either
-/// repo. Documented in both repos' README/CLAUDE.md; not automatic.
-///
-/// Resolves the theme dir from `FERROPRESS_FELLSTONE_DIR` if set (passed through to the
-/// `cargo test` subprocess unchanged); otherwise tries the conventional sibling checkout
-/// location (`../fellstone-site/theme`, next to this repo's own root, which is where this
-/// project's own machine keeps it) and errors with a clear message if neither exists —
-/// never silently skips (unlike the Rust tests themselves): a human explicitly running
-/// `parity` wants a real answer, not a quiet no-op.
-fn run_fellstone_parity() -> Result<()> {
+/// Ferropress core carries NO knowledge of, or dependency on, any particular consumer theme
+/// project — the checker is entirely env-driven and structural (hook attributes + injected
+/// probe identities), asserting nothing about a consumer's own copy, wording, or class names
+/// (see the `ferropress-no-fellstone-in-core` policy: a consumer must depend on core, never
+/// the reverse, and no consumer project's name or specifics belong in this repo). A private
+/// consumer theme project therefore is NOT checked out by ferropress's own CI — there is
+/// nothing here for CI to reach — so this target exists for a THEME AUTHOR to run locally
+/// (or wire into THEIR OWN CI) against their own theme dir before relying on the shared
+/// render contract. The tests themselves skip cleanly (never fail) when
+/// `FERROPRESS_EXTERNAL_THEME_DIR` is unset; this target requires it explicitly and errors
+/// clearly if it doesn't resolve to a real directory — a human explicitly running
+/// `theme-contract-check` wants a real answer, not a quiet no-op.
+fn run_theme_contract_check() -> Result<()> {
     let root = repo_root()?;
-    let dir = match std::env::var_os("FERROPRESS_FELLSTONE_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => {
-            let sibling = root.parent().map(|p| p.join("fellstone-site/theme"));
-            match sibling.filter(|p| p.is_dir()) {
-                Some(dir) => dir,
-                None => bail!(
-                    "fellstone-site's theme/ dir was not found. Set FERROPRESS_FELLSTONE_DIR to \
-                     its path (e.g. `FERROPRESS_FELLSTONE_DIR=/path/to/fellstone-site/theme \
-                     cargo run --manifest-path xtask/Cargo.toml -- parity`), or check the repo \
-                     out as a sibling of this one (`../fellstone-site`)."
-                ),
-            }
-        }
-    };
+    let dir = std::env::var_os("FERROPRESS_EXTERNAL_THEME_DIR").map(PathBuf::from).ok_or_else(|| {
+        anyhow::anyhow!(
+            "FERROPRESS_EXTERNAL_THEME_DIR is not set. Point it at your theme project's \
+             themes/ dir (one subfolder per theme, each a theme.toml + the four canonical \
+             templates) and re-run, e.g.:\n  \
+             FERROPRESS_EXTERNAL_THEME_DIR=/path/to/your-theme-project/theme \\\n  \
+             cargo run --manifest-path xtask/Cargo.toml -- theme-contract-check"
+        )
+    })?;
     if !dir.is_dir() {
         bail!(
-            "FERROPRESS_FELLSTONE_DIR ({}) is not a directory",
+            "FERROPRESS_EXTERNAL_THEME_DIR ({}) is not a directory",
             dir.display()
         );
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let status = Command::new(&cargo)
-        .args(["test", "-p", "ferropress-serve", "--lib", "fellstone"])
-        .env("FERROPRESS_FELLSTONE_DIR", &dir)
+        .args(["test", "-p", "ferropress-serve", "--lib", "external_theme"])
+        .env("FERROPRESS_EXTERNAL_THEME_DIR", &dir)
         .current_dir(&root)
         .status()
-        .context("failed to run `cargo test` for the fellstone parity fixtures")?;
+        .context("failed to run `cargo test` for the external-theme contract checker")?;
     if !status.success() {
         bail!(
-            "fellstone parity fixtures FAILED against {} — a theme has drifted; see output above",
+            "external-theme contract check FAILED against {} — the theme doesn't (or no \
+             longer does) honor the shared render contract; see output above",
             dir.display()
         );
     }
 
-    println!("parity: OK -> ran against {}", dir.display());
+    println!("theme-contract-check: OK -> ran against {}", dir.display());
     Ok(())
+}
+
+/// Consumer-project names that must never appear in ferropress's own tracked CORE sources
+/// (the `ferropress-no-fellstone-in-core` policy: ferropress is a published, general-purpose
+/// CMS; a private consumer project's name — or assertions specific to it — must never leak
+/// into it, since the dependency direction only ever runs consumer -> core, never the
+/// reverse). Extend this list if another private consumer project's name is ever mentioned in
+/// core by mistake.
+const BANNED_CONSUMER_NAMES: &[&str] = &["fellstone"];
+
+/// Self-enforcing guard for the policy above: grep every tracked file in the repo (via `git
+/// ls-files`, so it automatically respects `.gitignore` and only checks PUBLISHED content)
+/// for a case-insensitive match on any [`BANNED_CONSUMER_NAMES`] entry.
+///
+/// `xtask/` itself is excluded from the scan — this file has to name the banned terms
+/// literally, right here, to define what's banned; a lint that couldn't state its own rule
+/// would be untestable. Everything else in the repo (`crates/`, `CLAUDE.md`, `plugins/`,
+/// docs, …) — the actual product this repo publishes — is scanned.
+fn no_consumer_names_lint() -> Result<()> {
+    let root = repo_root()?;
+    let output = Command::new("git")
+        .args(["ls-files"])
+        .current_dir(&root)
+        .output()
+        .context("failed to run `git ls-files`")?;
+    if !output.status.success() {
+        bail!(
+            "`git ls-files` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let files = String::from_utf8_lossy(&output.stdout);
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for rel_path in files.lines() {
+        if rel_path.starts_with("xtask/") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(root.join(rel_path)) else {
+            continue; // listed-but-unreadable (race, submodule, …) — not this lint's job
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue; // a binary asset — nothing to grep
+        };
+        scanned += 1;
+        let lower = text.to_lowercase();
+        for name in BANNED_CONSUMER_NAMES {
+            if lower.contains(&name.to_lowercase()) {
+                violations.push(format!("{rel_path}: mentions {name:?}"));
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        println!(
+            "no-consumer-names lint: OK ({scanned} tracked file(s) scanned, 0 occurrences of \
+             {BANNED_CONSUMER_NAMES:?})"
+        );
+        Ok(())
+    } else {
+        for v in &violations {
+            eprintln!("  ✗ {v}");
+        }
+        bail!(
+            "no-consumer-names lint failed: {} tracked file(s) mention a banned consumer \
+             project name (see the ferropress-no-fellstone-in-core policy)",
+            violations.len()
+        );
+    }
 }

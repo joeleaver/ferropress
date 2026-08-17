@@ -345,9 +345,10 @@ main { padding: 2.4rem 0 3rem; }
 /* Endless-scroll enhancement (progressive enhancement over the structural /page/{n} pager
    above — that pager is BOTH the no-JS/crawler fallback and this script's fetch source; no
    separate endpoint). Works identically on the home galley and a term archive, since both
-   share this template and its data-fp-* hooks. Byte-identical to the sibling copy in the
-   fellstone theme's base.html — keep them in sync; it is deliberately theme-agnostic (only
-   data-fp-* selectors, no theme classes), so there is nothing here to diverge.
+   share this template and its data-fp-* hooks. Deliberately theme-agnostic (only data-fp-*
+   selectors, no theme classes): a consuming theme that wants the same enhancement can copy
+   this script verbatim into its own base template and keep it in sync from there — nothing
+   here is specific to the built-in theme's own markup or styling.
 
    An IntersectionObserver sentinel placed just above the pager fetches the OLDER page's HTML
    (same-origin, plain GET), lifts its [data-fp-rows] children into THIS page's own list, and

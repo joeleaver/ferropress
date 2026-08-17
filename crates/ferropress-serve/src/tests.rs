@@ -4765,7 +4765,7 @@ async fn archive_description_renders_when_set_and_is_absent_when_empty() {
     let mut patch: HashMap<String, Value> = HashMap::new();
     patch.insert(
         "description".to_owned(),
-        Value::String("Stories set on the rocky coast of Fellstone.".to_owned()),
+        Value::String("Stories set on a rocky northern coastline.".to_owned()),
     );
     store
         .update(
@@ -4806,7 +4806,7 @@ async fn archive_description_renders_when_set_and_is_absent_when_empty() {
     };
     assert!(
         described.contains(
-            "<p class=\"archive-head__desc\">Stories set on the rocky coast of Fellstone.</p>"
+            "<p class=\"archive-head__desc\">Stories set on a rocky northern coastline.</p>"
         ),
         "a set description must render in its own element; was:\n{described}"
     );
@@ -5714,523 +5714,215 @@ async fn pager_hooks_present_in_built_in_theme_markup() {
     );
 }
 
-/// The fellstone-site theme dir every parity fixture below reads through — resolved from the
-/// `FERROPRESS_FELLSTONE_DIR` env var (pointing at fellstone-site's `theme/` folder, the same
-/// layout [`crate::themes::ThemeRegistry::load_dir`] scans) rather than a hardcoded absolute
-/// path, so these tests carry NO dependency on any one machine's checkout layout and SKIP
-/// cleanly — never fail — on a machine without the sibling `fellstone-site` repo. Run them for
-/// real with:
-/// `FERROPRESS_FELLSTONE_DIR=/home/joe/dev/fellstone-site/theme cargo test -p ferropress-serve fellstone`
-fn fellstone_engine() -> Option<ThemeEngine> {
-    let dir = match std::env::var("FERROPRESS_FELLSTONE_DIR") {
+// ---------------------------------------------------------------------------
+// External-theme contract checker — a GENERIC, env-driven structural check any theme
+// project consuming this crate can run against its OWN theme dir to prove it stays
+// compatible with the shared render contract. This crate asserts NOTHING about any
+// particular consuming theme's copy, wording, class names, or scripts — only the
+// structural contract every theme must honor: the data-fp-* hook attributes, and that
+// `terms`/`archive` context fields actually reach the rendered output somewhere. A
+// consuming theme project owns its OWN parity tests for its OWN specific markup/copy/
+// script, run from within that project (see this repo's CLAUDE.md).
+// ---------------------------------------------------------------------------
+
+/// Discover every non-default theme registered from `FERROPRESS_EXTERNAL_THEME_DIR` — the
+/// same themes-directory layout [`crate::themes::ThemeRegistry::load_dir`] scans in
+/// production (one subfolder per theme, each a `theme.toml` + the four canonical templates).
+/// Unset or empty -> an empty `Vec` and an `eprintln!` explaining how to run these checks for
+/// real; every caller below treats that as "nothing to check" and returns cleanly, so this
+/// module never fails on a machine with no external theme project checked out.
+fn external_theme_engines() -> Vec<(String, ThemeEngine)> {
+    let dir = match std::env::var("FERROPRESS_EXTERNAL_THEME_DIR") {
         Ok(dir) => dir,
         Err(_) => {
             eprintln!(
-                "skipping fellstone parity fixture: FERROPRESS_FELLSTONE_DIR is not set \
-                 (point it at fellstone-site's theme/ dir, e.g. \
-                 /home/joe/dev/fellstone-site/theme, to run it for real)"
+                "skipping external-theme contract check: FERROPRESS_EXTERNAL_THEME_DIR is not \
+                 set (point it at a themes/ dir -- one subfolder per theme, each a theme.toml \
+                 + the four canonical templates -- to run this for real against your own theme)"
             );
-            return None;
+            return Vec::new();
         }
     };
     let registry = crate::themes::ThemeRegistry::load_dir(std::path::Path::new(&dir));
-    Some(
-        registry
-            .build("fellstone")
-            .expect("the fellstone theme must build once its dir is found"),
-    )
+    registry
+        .choices()
+        .into_iter()
+        .filter(|c| c.value != ferropress_render_form::DEFAULT_THEME)
+        .map(|c| {
+            let engine = registry
+                .build(&c.value)
+                .expect("a registered external theme must build");
+            (c.value, engine)
+        })
+        .collect()
 }
 
-/// The fellstone-site theme's OWN pager markup carries the same three D3 hooks — a real
-/// smoke-render against its actual template files (not just the built-in theme), the same
-/// "registered ⇒ renderable" discipline `ThemeRegistry::load_dir` enforces at boot. Both a
-/// page with an OLDER link (page 1) and one with a NEWER link (page 2) are checked, so the
-/// `{% else %}` (spent) branches on both sides are exercised at least once too.
-#[tokio::test]
-async fn pager_hooks_present_in_fellstone_theme_markup() {
-    let Some(engine) = fellstone_engine() else {
-        return;
-    };
-    let base_ctx = serde_json::json!({
+/// The base context every contract-checker render below starts from — the shared fields
+/// EVERY theme's `home.html`/`single.html` consumes, none of it specific to any one theme's
+/// copy or styling.
+fn contract_probe_base_ctx() -> serde_json::Value {
+    serde_json::json!({
         "page_title": "Sample", "page_description": null, "canonical": null,
         "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
-        "is_home": true, "preview_status": null, "nav": {},
-        "archive": null,
-        "posts": [{"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}],
-    });
-
-    let mut page1 = base_ctx.clone();
-    page1["pager"] =
-        serde_json::json!({"older": "/page/2", "newer": null, "page": 1, "total_pages": 2});
-    let html1 = engine
-        .render(crate::templates::HOME_TEMPLATE, &page1)
-        .expect("fellstone home.html must render page 1 with a pager");
-    // Trailing `>` distinguishes the real (boolean) HTML attribute from the D3 script's own
-    // `[data-fp-rows]`-style selector mentions (shared chrome, present on every page) — a bare
-    // `contains("data-fp-rows")` would pass vacuously even with no real markup at all.
-    assert!(html1.contains("data-fp-rows>"), "page 1: {html1}");
-    assert!(html1.contains("data-fp-pager>"), "page 1: {html1}");
-    assert!(html1.contains("data-fp-next>"), "page 1: {html1}");
-
-    let mut page2 = base_ctx;
-    page2["pager"] = serde_json::json!({"older": null, "newer": "/", "page": 2, "total_pages": 2});
-    let html2 = engine
-        .render(crate::templates::HOME_TEMPLATE, &page2)
-        .expect("fellstone home.html must render the last page too");
-    assert!(html2.contains("data-fp-pager>"), "page 2: {html2}");
-    // Isolate the rendered pager `<nav>` — the D3 SCRIPT text (shared chrome, present on every
-    // page) also mentions "data-fp-next" as a selector string, so a whole-document check would
-    // be vacuous (the same class of bug the D2 aria_current tests already hit and fixed).
-    let nav_start = html2
-        .find("<nav class=\"pager\"")
-        .expect("the pager nav must render");
-    let nav_end = html2[nav_start..]
-        .find("</nav>")
-        .map(|i| nav_start + i + "</nav>".len())
-        .unwrap();
-    let pager_nav = &html2[nav_start..nav_end];
-    assert!(
-        !pager_nav.contains("data-fp-next"),
-        "the LAST page has no older link, so its pager nav must carry no data-fp-next; nav was: {pager_nav}"
-    );
+        "preview_status": null, "nav": {},
+    })
 }
 
-/// `aria_current` is EXACT-match: on home page 2+, a nav item pointing at the bare `/` is
-/// NOT current (page 2's own path is `/page/2`, not `/`) — the same discipline the archive
-/// nav Term arm and every other target kind already carry.
+/// An external theme's pager markup must carry the three D3 endless-scroll hook attributes
+/// (`data-fp-rows`/`data-fp-pager`/`data-fp-next`) — the structural contract a loader script
+/// (whichever theme ships one) depends on, regardless of that theme's own class names or
+/// wording. Both a page with an OLDER link (page 1) and one without (the last page) are
+/// checked, so the "spent" branch is exercised too.
 #[tokio::test]
-async fn home_page_2_nav_home_item_is_not_current() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, blobs, theme) = boot(tmp.path());
-    for slug in ["p1", "p2", "p3"] {
-        seed_post(&store, slug, Status::Published).await;
-    }
-    let mut settings = SiteSettings::defaults();
-    settings.posts_per_page = 2;
+async fn external_theme_carries_the_pager_hook_contract() {
+    for (id, engine) in external_theme_engines() {
+        let mut page1 = contract_probe_base_ctx();
+        page1["is_home"] = serde_json::json!(true);
+        page1["archive"] = serde_json::Value::Null;
+        page1["posts"] = serde_json::json!([
+            {"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}
+        ]);
+        page1["pager"] =
+            serde_json::json!({"older": "/page/2", "newer": null, "page": 1, "total_pages": 2});
+        let html1 = engine
+            .render(crate::templates::HOME_TEMPLATE, &page1)
+            .unwrap_or_else(|e| panic!("{id}: home.html must render page 1 with a pager: {e}"));
+        // Trailing `>` distinguishes the real (boolean) HTML attribute from a script's own
+        // `[data-fp-rows]`-style selector-string mentions — a bare `contains("data-fp-rows")`
+        // would pass vacuously even with no real markup attribute at all.
+        for hook in ["data-fp-rows>", "data-fp-pager>", "data-fp-next>"] {
+            assert!(
+                html1.contains(hook),
+                "{id}: page 1 must carry {hook:?}; was:\n{html1}"
+            );
+        }
 
-    let menus = crate::MenuSet::from_locations([(
-        "primary".to_owned(),
-        vec![crate::MenuNode {
-            label: "Home".to_owned(),
-            target: ferropress_core::LinkTarget::Custom {
-                url: "/".to_owned(),
-            },
-            new_tab: false,
-            children: vec![],
-        }],
-    )]);
-
-    let html = match serve_path(
-        &store,
-        &blobs,
-        &theme,
-        &NoCustomBlocks,
-        &settings,
-        &AuthorDirectory::default(),
-        &menus,
-        &crate::ContentIndex::default(),
-        &crate::TaxonomySet::default(),
-        "/page/2",
-    )
-    .await
-    {
-        crate::Resolved::Found(h) => h,
-        other => panic!("expected Found, got {other:?}"),
-    };
-    // The base chrome's OWN CSS literally contains the substring "aria-current" (a selector,
-    // `.mastnav a[aria-current="page"]`), so a whole-document `contains` check would be
-    // vacuous — isolate the actual rendered `<a>...Home</a>` link and check THAT.
-    let start = html
-        .find("<a href=\"&#x2f;\"")
-        .expect("the Home nav link must render");
-    let end = html[start..].find("</a>").map(|i| start + i + 4).unwrap();
-    let home_link = &html[start..end];
-    assert!(
-        !home_link.contains("aria-current"),
-        "the Home nav item must NOT be current on page 2 (EXACT-match against /page/2, not /); link was: {home_link}"
-    );
-}
-
-/// The archive twin of [`home_page_2_nav_home_item_is_not_current`]: on an archive's page 2+,
-/// a nav item pointing at the archive's OWN base href is not current either.
-#[tokio::test]
-async fn archive_page_2_nav_item_is_not_current() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, blobs, theme) = boot(tmp.path());
-    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
-    for slug in ["p1", "p2", "p3"] {
-        let id = seed_post(&store, slug, Status::Published).await;
-        link_term(&store, id, fiction_id).await;
-    }
-    let mut settings = SiteSettings::defaults();
-    settings.posts_per_page = 2;
-    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
-
-    let menus = crate::MenuSet::from_locations([(
-        "primary".to_owned(),
-        vec![crate::MenuNode {
-            label: "Fiction".to_owned(),
-            target: ferropress_core::LinkTarget::Term { id: fiction_id.0 },
-            new_tab: false,
-            children: vec![],
-        }],
-    )]);
-
-    let html = match serve_path(
-        &store,
-        &blobs,
-        &theme,
-        &NoCustomBlocks,
-        &settings,
-        &AuthorDirectory::default(),
-        &menus,
-        &crate::ContentIndex::default(),
-        &taxonomies,
-        "/category/fiction/page/2",
-    )
-    .await
-    {
-        crate::Resolved::Found(h) => h,
-        other => panic!("expected Found, got {other:?}"),
-    };
-    // Isolate the rendered link (the chrome's own CSS literally contains "aria-current" in a
-    // selector, so a whole-document check would be vacuous — see the home twin above).
-    let start = html
-        .find("<a href=\"&#x2f;category&#x2f;fiction\"")
-        .expect("the Fiction nav link must render");
-    let end = html[start..].find("</a>").map(|i| start + i + 4).unwrap();
-    let fiction_link = &html[start..end];
-    assert!(
-        !fiction_link.contains("aria-current"),
-        "the Fiction nav item must NOT be current on page 2 (EXACT-match against .../page/2, not the base); link was: {fiction_link}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Slice E: archive-populated+pager parity (built-in + fellstone), closing the
-// boot-probe gap where NO smoke-render context ever set `pager` at all.
-// ---------------------------------------------------------------------------
-
-/// The archive twin of [`pager_hooks_present_in_built_in_theme_markup`]: a real, multi-page
-/// term-archive route carries the same three D3 hooks the home galley does (they share the
-/// exact pager markup in HOME_TEMPLATE) — AND its eyebrow is the archive heading, never the
-/// site-wide "Latest from the galley" line (that would be a real content bug: a category page
-/// mislabeled as the front page).
-#[tokio::test]
-async fn archive_pager_hooks_present_in_built_in_theme_markup() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, blobs, theme) = boot(tmp.path());
-    let fiction_id = seed_term(&store, "category", "fiction", "Fiction").await;
-    for slug in ["p1", "p2", "p3"] {
-        let id = seed_post(&store, slug, Status::Published).await;
-        link_term(&store, id, fiction_id).await;
-    }
-    let mut settings = SiteSettings::defaults();
-    settings.posts_per_page = 2;
-    let taxonomies = crate::load_taxonomies(&store).await.unwrap();
-
-    let html = match serve_path(
-        &store,
-        &blobs,
-        &theme,
-        &NoCustomBlocks,
-        &settings,
-        &AuthorDirectory::default(),
-        &crate::MenuSet::default(),
-        &crate::ContentIndex::default(),
-        &taxonomies,
-        "/category/fiction",
-    )
-    .await
-    {
-        crate::Resolved::Found(h) => h,
-        other => panic!("expected Found, got {other:?}"),
-    };
-
-    // Trailing `>` distinguishes the real (boolean) HTML attribute from the D3 script's own
-    // `[data-fp-rows]`-style selector mentions (shared chrome, present on every page) — a bare
-    // `contains("data-fp-rows")` would pass vacuously even with no real markup at all.
-    assert!(
-        html.contains("data-fp-rows>"),
-        "the post-list container must carry the D3 rows hook; was:\n{html}"
-    );
-    assert!(
-        html.contains("data-fp-pager>"),
-        "the pager nav must carry the D3 pager hook; was:\n{html}"
-    );
-    assert!(
-        html.contains("data-fp-next>"),
-        "the older/next link must carry the D3 fetch-target hook; was:\n{html}"
-    );
-    assert!(
-        html.contains("Fiction"),
-        "the archive heading must render the term's name; was:\n{html}"
-    );
-    assert!(
-        !html.contains("Latest from the galley"),
-        "an archive listing must NEVER show the home galley's eyebrow; was:\n{html}"
-    );
-}
-
-/// The fellstone-site theme's OWN eyebrow parity — a real smoke-render against its actual
-/// template files. Fellstone's home eyebrow reads "Latest posts" (its own wording, distinct
-/// from the built-in's "Latest from the galley"); this must appear on the home shape and
-/// disappear the moment `archive: Some` swaps in the term heading instead — the same
-/// "registered ⇒ renderable" discipline as the theme's other parity fixtures, but for CONTENT
-/// correctness rather than markup hooks.
-#[tokio::test]
-async fn archive_eyebrow_parity_in_fellstone_theme_markup() {
-    let Some(engine) = fellstone_engine() else {
-        return;
-    };
-    let base_ctx = serde_json::json!({
-        "page_title": "Sample", "page_description": null, "canonical": null,
-        "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
-        "is_home": true, "preview_status": null, "nav": {},
-        "posts": [{"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}],
-    });
-
-    // Home shape: no archive, a multi-page pager — "Latest posts" must render.
-    let mut home = base_ctx.clone();
-    home["archive"] = serde_json::Value::Null;
-    home["pager"] =
-        serde_json::json!({"older": "/page/2", "newer": null, "page": 1, "total_pages": 2});
-    let home_html = engine
-        .render(crate::templates::HOME_TEMPLATE, &home)
-        .expect("fellstone home.html must render the home shape");
-    assert!(
-        home_html.contains("Latest posts"),
-        "the home shape must show fellstone's own eyebrow; was:\n{home_html}"
-    );
-
-    // Archive shape, same pager arithmetic: "Latest posts" must be GONE, replaced by the
-    // term heading, and the pager hooks must still be present (the two features are
-    // independent branches of the same template).
-    let mut archive = base_ctx;
-    archive["archive"] = serde_json::json!({
-        "name": "Fiction",
-        "description": "Stories that could have happened, but didn't.",
-        "total": 30
-    });
-    archive["pager"] = serde_json::json!({
-        "older": "/category/fiction/page/2", "newer": null, "page": 1, "total_pages": 3
-    });
-    let archive_html = engine
-        .render(crate::templates::HOME_TEMPLATE, &archive)
-        .expect("fellstone home.html must render the archive shape");
-    assert!(
-        !archive_html.contains("Latest posts"),
-        "'Latest posts' must NOT render atop a term archive; was:\n{archive_html}"
-    );
-    assert!(
-        archive_html.contains("Fiction"),
-        "the archive heading must render the term's name; was:\n{archive_html}"
-    );
-    // Trailing `>` — the real attribute, not the D3 script's own selector-string mention.
-    assert!(
-        archive_html.contains("data-fp-pager>") && archive_html.contains("data-fp-next>"),
-        "the archive shape's pager must still carry the D3 hooks; was:\n{archive_html}"
-    );
-
-    // The empty-archive shape: zero rows, no pager — the archive-specific empty copy, not the
-    // generic "No posts yet." (that branch is exercised by the fellstone home-empty case
-    // elsewhere; this fixture closes the archive-specific half).
-    let mut archive_empty = serde_json::json!({
-        "page_title": "Sample", "page_description": null, "canonical": null,
-        "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
-        "is_home": true, "preview_status": null, "nav": {},
-        "posts": [],
-    });
-    archive_empty["archive"] =
-        serde_json::json!({"name": "Fiction", "description": null, "total": 0});
-    let empty_html = engine
-        .render(crate::templates::HOME_TEMPLATE, &archive_empty)
-        .expect("fellstone home.html must render the empty-archive shape");
-    assert!(
-        empty_html.contains("No posts filed under Fiction yet."),
-        "the empty-archive copy must render; was:\n{empty_html}"
-    );
-    assert!(
-        !empty_html.contains("Latest posts"),
-        "the empty-archive shape must still show the term heading, not the home eyebrow; was:\n{empty_html}"
-    );
-}
-
-/// The fellstone-site theme's OWN term-chip markup — a real smoke-render against its actual
-/// template files, covering the "single-with-chips" shape (`single.html`'s own `.chips` block)
-/// AND a listing row's chips (`home.html`'s per-post `.chips` block, the SAME markup a home
-/// galley row or an archive row renders). Both assert the full `class="chip" href="…">name</a>`
-/// element, not a bare substring — `.chip`/`.chips` are also CSS selector names in fellstone's
-/// own stylesheet (shared chrome, present on every page), so a loose `contains("chip")` check
-/// would be vacuous, the same class of bug the D2 aria_current tests already caught.
-#[tokio::test]
-async fn fellstone_theme_renders_term_chips_on_single_and_listing_rows() {
-    let Some(engine) = fellstone_engine() else {
-        return;
-    };
-    let base_ctx = serde_json::json!({
-        "page_title": "Sample", "page_description": null, "canonical": null,
-        "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
-        "is_home": false, "preview_status": null, "nav": {},
-        "title": "Sample Post", "dateline": "January 1, 2026", "kicker": "Notes",
-        "author": "A. Writer", "author_initials": "AW", "featured_image": null,
-        "body": "<p>Sample body.</p>",
-        "terms": [{"name": "Fiction", "href": "/category/fiction"}],
-    });
-    let single_html = engine
-        .render(crate::templates::SINGLE_TEMPLATE, &base_ctx)
-        .expect("fellstone single.html must render with chips");
-    assert!(
-        single_html.contains("<a class=\"chip\" href=\"&#x2f;category&#x2f;fiction\">Fiction</a>"),
-        "single.html must render the chip as a real element (name + href), not just mention \
-         the word \"chip\" (its own CSS also uses that selector); was:\n{single_html}"
-    );
-
-    let mut home_ctx = serde_json::json!({
-        "page_title": "Sample", "page_description": null, "canonical": null,
-        "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
-        "is_home": true, "preview_status": null, "nav": {},
-        "archive": null, "pager": null,
-    });
-    home_ctx["posts"] = serde_json::json!([{
-        "title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null,
-        "terms": [{"name": "Space Opera", "href": "/tag/space-opera"}]
-    }]);
-    let home_html = engine
-        .render(crate::templates::HOME_TEMPLATE, &home_ctx)
-        .expect("fellstone home.html must render a listing row with chips");
-    assert!(
-        home_html.contains("<a class=\"chip\" href=\"&#x2f;tag&#x2f;space-opera\">Space Opera</a>"),
-        "a listing row's chip must render as a real element; was:\n{home_html}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// D3: the endless-scroll progressive-enhancement script
-// ---------------------------------------------------------------------------
-
-/// The built-in theme's endless-scroll script SHIPS and references the SAME D3 hooks the D2
-/// pager markup carries — a static (non-runtime) check that the script is present and wired
-/// to the right selectors. The actual scroll/fetch/append BEHAVIOR is a browser-only concern,
-/// out of a Rust unit test's reach (verified ad hoc with a real browser instead).
-#[tokio::test]
-async fn endless_scroll_script_present_in_built_in_theme() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, blobs, theme) = boot(tmp.path());
-    for slug in ["p1", "p2", "p3"] {
-        seed_post(&store, slug, Status::Published).await;
-    }
-    let mut settings = SiteSettings::defaults();
-    settings.posts_per_page = 2;
-
-    let html = match serve_path(
-        &store,
-        &blobs,
-        &theme,
-        &NoCustomBlocks,
-        &settings,
-        &AuthorDirectory::default(),
-        &crate::MenuSet::default(),
-        &crate::ContentIndex::default(),
-        &crate::TaxonomySet::default(),
-        "/",
-    )
-    .await
-    {
-        crate::Resolved::Found(h) => h,
-        other => panic!("expected Found, got {other:?}"),
-    };
-
-    for needle in [
-        "IntersectionObserver",
-        "querySelector('[data-fp-rows]')",
-        "querySelector('[data-fp-pager]')",
-        "querySelector('[data-fp-next]')",
-        "history.replaceState",
-        "DOMParser",
-        // F7 (review findings C9/C12): the pager must be hidden via an inline style, never
-        // the `hidden` IDL attribute (a no-op against the theme's own `display: flex` rule).
-        "pagerNav.style.display = 'none'",
-        "pagerNav.style.display = ''",
-        // F8 (review finding C10): a successful append re-checks the sentinel directly rather
-        // than waiting on an IntersectionObserver callback a still-intersecting target will
-        // never receive.
-        "getBoundingClientRect",
-        // F9 (review finding C11): the URL flips at the batch's own first-row boundary, not
-        // when the fetch resolves — a second, one-shot IntersectionObserver.
-        "firstNewRow",
-    ] {
+        let mut page2 = page1.clone();
+        page2["pager"] =
+            serde_json::json!({"older": null, "newer": "/", "page": 2, "total_pages": 2});
+        let html2 = engine
+            .render(crate::templates::HOME_TEMPLATE, &page2)
+            .unwrap_or_else(|e| panic!("{id}: home.html must render the last page too: {e}"));
+        assert!(html2.contains("data-fp-pager>"), "{id}: page 2: {html2}");
         assert!(
-            html.contains(needle),
-            "endless-scroll script must reference {needle:?}; was:\n{html}"
+            !html2.contains("data-fp-next>"),
+            "{id}: the LAST page has no older link, so nothing on it may carry a real \
+             data-fp-next attribute; was:\n{html2}"
         );
     }
-    // The doc comment above the script mentions "pagerNav.hidden = true" in BACKTICKED
-    // PROSE (explaining why the fix was needed) — a bare-substring check would be vacuous
-    // against that, the same class of bug the D2 aria_current tests already caught. The real
-    // (now-removed) buggy assignment always ended in a semicolon immediately, which the prose
-    // mention never does; check for THAT specific, code-only form instead.
-    assert!(
-        !html.contains("pagerNav.hidden = true;") && !html.contains("pagerNav.hidden = false;"),
-        "F7: the pager must never be hidden/shown via the `hidden` IDL attribute again (silent \
-         no-op against the theme's own `display: flex` rule); was:\n{html}"
-    );
 }
 
-/// The fellstone-site theme's OWN endless-scroll script — a real smoke-render against its
-/// actual template files, the same "registered ⇒ renderable" discipline `ThemeRegistry::
-/// load_dir` enforces at boot.
+/// An external theme's archive branch (`archive: Some`) must be a REAL, DISTINCT branch from
+/// the non-archive listing — not just accept the field without using it. Verified
+/// structurally, with no assumption about the theme's own wording: a distinctive probe string
+/// injected as `archive.name` must appear in the archive-shaped render and must NOT appear in
+/// the non-archive render of the identical template — proving the theme actually branches on
+/// `archive` and surfaces its `name` somewhere, without this crate asserting anything about
+/// HOW (what heading text, what class) it does so. The pager hooks (already contract-checked
+/// above) must also survive alongside `archive: Some` — the two branches are independent. The
+/// empty-archive shape (zero rows, no pager) is checked only for a clean render — its
+/// empty-state COPY is entirely the theme's own design, out of scope for this crate.
 #[tokio::test]
-async fn endless_scroll_script_present_in_fellstone_theme() {
-    let Some(engine) = fellstone_engine() else {
-        return;
-    };
-    let ctx = serde_json::json!({
-        "page_title": "Sample", "page_description": null, "canonical": null,
-        "site": {"title": "Sample Site", "tagline": "", "url": "https://example.com", "logo": null, "noindex": false},
-        "is_home": true, "preview_status": null, "nav": {},
-        "archive": null,
-        "pager": {"older": "/page/2", "newer": null, "page": 1, "total_pages": 2},
-        "posts": [{"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}],
-    });
-    let html = engine
-        .render(crate::templates::HOME_TEMPLATE, &ctx)
-        .expect("fellstone home.html must render");
+async fn external_theme_surfaces_the_archive_identity_and_keeps_pager_hooks() {
+    const PROBE_NAME: &str = "Contract-Probe-Archive-Name-x7f2q9";
 
-    for needle in [
-        "IntersectionObserver",
-        "querySelector('[data-fp-rows]')",
-        "querySelector('[data-fp-pager]')",
-        "querySelector('[data-fp-next]')",
-        "history.replaceState",
-        "DOMParser",
-        // F7 (review findings C9/C12): the pager must be hidden via an inline style, never
-        // the `hidden` IDL attribute (a no-op against the theme's own `display: flex` rule).
-        "pagerNav.style.display = 'none'",
-        "pagerNav.style.display = ''",
-        // F8 (review finding C10): a successful append re-checks the sentinel directly rather
-        // than waiting on an IntersectionObserver callback a still-intersecting target will
-        // never receive.
-        "getBoundingClientRect",
-        // F9 (review finding C11): the URL flips at the batch's own first-row boundary, not
-        // when the fetch resolves — a second, one-shot IntersectionObserver.
-        "firstNewRow",
-    ] {
+    for (id, engine) in external_theme_engines() {
+        let mut non_archive = contract_probe_base_ctx();
+        non_archive["is_home"] = serde_json::json!(true);
+        non_archive["archive"] = serde_json::Value::Null;
+        non_archive["pager"] = serde_json::Value::Null;
+        non_archive["posts"] = serde_json::json!([
+            {"title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null, "terms": []}
+        ]);
+        let non_archive_html = engine
+            .render(crate::templates::HOME_TEMPLATE, &non_archive)
+            .unwrap_or_else(|e| panic!("{id}: home.html must render the non-archive shape: {e}"));
         assert!(
-            html.contains(needle),
-            "fellstone's endless-scroll script must reference {needle:?}; was:\n{html}"
+            !non_archive_html.contains(PROBE_NAME),
+            "{id}: a probe string never injected must not appear (sanity check on the fixture \
+             itself); was:\n{non_archive_html}"
+        );
+
+        let mut archive = non_archive.clone();
+        archive["archive"] =
+            serde_json::json!({"name": PROBE_NAME, "description": null, "total": 30});
+        archive["pager"] = serde_json::json!({
+            "older": "/archive-probe/page/2", "newer": null, "page": 1, "total_pages": 3
+        });
+        let archive_html = engine
+            .render(crate::templates::HOME_TEMPLATE, &archive)
+            .unwrap_or_else(|e| panic!("{id}: home.html must render the archive shape: {e}"));
+        assert!(
+            archive_html.contains(PROBE_NAME),
+            "{id}: the injected archive.name must surface SOMEWHERE when archive: Some; \
+             was:\n{archive_html}"
+        );
+        assert!(
+            archive_html.contains("data-fp-pager>") && archive_html.contains("data-fp-next>"),
+            "{id}: the archive shape's pager hooks must survive alongside archive: Some; \
+             was:\n{archive_html}"
+        );
+
+        let mut archive_empty = non_archive;
+        archive_empty["posts"] = serde_json::json!([]);
+        archive_empty["archive"] =
+            serde_json::json!({"name": PROBE_NAME, "description": null, "total": 0});
+        engine
+            .render(crate::templates::HOME_TEMPLATE, &archive_empty)
+            .unwrap_or_else(|e| panic!("{id}: home.html must render the empty-archive shape: {e}"));
+    }
+}
+
+/// An external theme must surface a `terms` chip's `name`/`href` SOMEWHERE in the rendered
+/// output, on both a single-entity page and a listing row — without this crate assuming
+/// anything about the theme's own markup (class names, element type). Verified with
+/// distinctive injected probe values so the check can't accidentally match unrelated theme
+/// chrome (CSS, boilerplate copy). The probe href is deliberately slash-free — MiniJinja
+/// autoescapes `/` to `&#x2f;` on `.html`-named templates, and this check cares only that the
+/// raw value passed through, not about matching a realistic-looking path.
+#[tokio::test]
+async fn external_theme_surfaces_injected_chip_identity() {
+    const PROBE_CHIP_NAME: &str = "Contract-Probe-Chip-Name-k3n8x1";
+    const PROBE_CHIP_HREF: &str = "contract-probe-chip-href-k3n8x1";
+
+    for (id, engine) in external_theme_engines() {
+        let mut single_ctx = contract_probe_base_ctx();
+        single_ctx["is_home"] = serde_json::json!(false);
+        single_ctx["title"] = serde_json::json!("Sample Post");
+        single_ctx["dateline"] = serde_json::json!("January 1, 2026");
+        single_ctx["kicker"] = serde_json::json!("Notes");
+        single_ctx["author"] = serde_json::json!("A. Writer");
+        single_ctx["author_initials"] = serde_json::json!("AW");
+        single_ctx["featured_image"] = serde_json::Value::Null;
+        single_ctx["body"] = serde_json::json!("<p>Sample body.</p>");
+        single_ctx["terms"] =
+            serde_json::json!([{"name": PROBE_CHIP_NAME, "href": PROBE_CHIP_HREF}]);
+        let single_html = engine
+            .render(crate::templates::SINGLE_TEMPLATE, &single_ctx)
+            .unwrap_or_else(|e| panic!("{id}: single.html must render with a term chip: {e}"));
+        assert!(
+            single_html.contains(PROBE_CHIP_NAME) && single_html.contains(PROBE_CHIP_HREF),
+            "{id}: single.html must surface the chip's injected name AND href somewhere; \
+             was:\n{single_html}"
+        );
+
+        let mut home_ctx = contract_probe_base_ctx();
+        home_ctx["is_home"] = serde_json::json!(true);
+        home_ctx["archive"] = serde_json::Value::Null;
+        home_ctx["pager"] = serde_json::Value::Null;
+        home_ctx["posts"] = serde_json::json!([{
+            "title": "A Post", "url": "/a-post", "excerpt": "", "dateline": null, "author": null,
+            "terms": [{"name": PROBE_CHIP_NAME, "href": PROBE_CHIP_HREF}]
+        }]);
+        let home_html = engine
+            .render(crate::templates::HOME_TEMPLATE, &home_ctx)
+            .unwrap_or_else(|e| panic!("{id}: home.html must render a listing row's chip: {e}"));
+        assert!(
+            home_html.contains(PROBE_CHIP_NAME) && home_html.contains(PROBE_CHIP_HREF),
+            "{id}: a listing row's chip must surface its injected name AND href somewhere; \
+             was:\n{home_html}"
         );
     }
-    // The doc comment above the script mentions "pagerNav.hidden = true" in BACKTICKED
-    // PROSE (explaining why the fix was needed) — a bare-substring check would be vacuous
-    // against that, the same class of bug the D2 aria_current tests already caught. The real
-    // (now-removed) buggy assignment always ended in a semicolon immediately, which the prose
-    // mention never does; check for THAT specific, code-only form instead.
-    assert!(
-        !html.contains("pagerNav.hidden = true;") && !html.contains("pagerNav.hidden = false;"),
-        "F7: the pager must never be hidden/shown via the `hidden` IDL attribute again (silent \
-         no-op against the theme's own `display: flex` rule); was:\n{html}"
-    );
 }
 
 /// The endless-scroll script lives in the SHARED base chrome (present on every page, matching

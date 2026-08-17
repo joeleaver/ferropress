@@ -3802,7 +3802,7 @@ async fn post_terms_validation_rejects_foreign_ids_and_enforces_the_multiple_cap
         "POST",
         "/admin/api/terms",
         &ed,
-        Some(serde_json::json!({"taxonomy": "series", "name": "Fellstone"})),
+        Some(serde_json::json!({"taxonomy": "series", "name": "Riverbend"})),
     )
     .await;
     let (_, s2) = do_json(

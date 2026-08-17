@@ -37,19 +37,27 @@ Whenever writing or editing rinch code (`rsx!`, `Signal`, `#[component]`, rinch 
 the **`rinch:rinch`** skill. Don't hand-write rinch from memory — let the skill guide correct use of
 the macro, reactive signals, props, and state management.
 
-## 4. Changing a shared theme mechanism (built-in + fellstone-site)? Run the parity check
+## 4. Core ships no consumer-specific anything — themes included
 
-Some markup/script is deliberately **byte-identical** between the built-in theme
-(`crates/ferropress-serve/src/templates.rs`) and the `fellstone-site` sibling project's own theme
-(the endless-scroll script is the current example). `crates/ferropress-serve/src/tests.rs` carries
-parity fixtures that load fellstone-site's REAL theme files and assert they still match — but they
-do **not** run in CI (`fellstone-site` has no pushed remote as of this writing, so CI has nothing to
-check it out from; see the fixtures' own doc comments and `xtask/src/main.rs`'s `run_fellstone_parity`
-for the full reasoning). Run them yourself before pushing any change to a shared theme mechanism:
+Ferropress core is a published, general-purpose CMS; the dependency direction only ever runs
+consumer project → core, never the reverse. Core must never carry a specific consumer theme
+project's name, its assertions on that project's own copy/wording, or any other consumer-specific
+content. (Enforced: `xtask -- no-consumer-names-lint`, wired into CI, fails the build if a tracked
+file mentions a banned consumer-project name.)
+
+What core DOES ship is a **generic, env-driven external-theme contract checker** —
+`crates/ferropress-serve/src/tests.rs`'s `external_theme_engines()` and its `external_theme_*`
+tests — structural checks only (the `data-fp-*` hook attributes; that `terms`/`archive` context
+fields reach the render somewhere via injected probe values), asserting nothing about any theme's
+own copy, class names, or scripts. A theme author (in their OWN project, not this one) points it at
+their theme dir to verify they still honor the shared render contract:
 
 ```sh
-cargo run --manifest-path xtask/Cargo.toml -- parity
+FERROPRESS_EXTERNAL_THEME_DIR=/path/to/your-theme-project/theme \
+cargo run --manifest-path xtask/Cargo.toml -- theme-contract-check
 ```
 
-This auto-discovers `fellstone-site` at the conventional sibling location (`../fellstone-site`) or
-via `FERROPRESS_FELLSTONE_DIR` if it lives elsewhere.
+A consumer theme project's OWN specific assertions (its eyebrow copy, empty-state text, chip
+class names, script byte-parity against the built-in theme, or anything else specific to that
+project's own markup) belong entirely in that project, run from there — never in this repo.
+Ferropress's own CI never checks out a consumer theme project.
