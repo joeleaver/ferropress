@@ -2610,6 +2610,57 @@ fn load_suggestions(terms: TermsCtx, taxonomy: String, buffer: String, auth: Aut
                 if terms.suggest_gen.get() != fetch_gen {
                     return;
                 }
+                // A comma-commit can race this SAME fetch and stage a chip
+                // for a term that, per THIS response, already exists — the
+                // server's own reuse-vs-create decision (`apply_terms`'s
+                // DECIDE step, re-read fresh under `taxonomy_lock` at save
+                // time) already reuses it regardless, so this is cosmetic,
+                // never data-lossy; but a chip lying "will be created" about
+                // a term that already exists is worth correcting the
+                // instant we learn better, not just at reseed-after-save.
+                // Mirrors `commit_one_tag`'s own match rule exactly: BOTH
+                // sides re-slugified from their name, never `t.slug` read
+                // directly.
+                let staged_now = terms.staged.get();
+                for t in &resp.terms {
+                    let Some(t_slug) = ferropress_core::slugify(&t.name) else {
+                        continue;
+                    };
+                    let matched = staged_now.iter().any(|s| {
+                        s.taxonomy == tax_key
+                            && ferropress_core::slugify(&s.name).as_deref() == Some(t_slug.as_str())
+                    });
+                    if !matched {
+                        continue;
+                    }
+                    let promoted_id = t.id;
+                    let promoted_name = t.name.clone();
+                    let promoted_slug = t.slug.clone();
+                    let tax_for_sidecar = tax_key.clone();
+                    let t_slug_for_retain = t_slug.clone();
+                    terms.staged.update(|v| {
+                        v.retain(|s| {
+                            !(s.taxonomy == tax_key
+                                && ferropress_core::slugify(&s.name).as_deref()
+                                    == Some(t_slug_for_retain.as_str()))
+                        });
+                    });
+                    terms.selected_ids.update(|s| {
+                        s.insert(promoted_id);
+                    });
+                    terms.sidecar.update(|m| {
+                        m.insert(
+                            promoted_id,
+                            api::TermRefDto {
+                                id: promoted_id,
+                                name: promoted_name,
+                                slug: promoted_slug,
+                                taxonomy: tax_for_sidecar,
+                            },
+                        );
+                    });
+                    terms.terms_gen.update(|g| *g += 1);
+                }
                 terms.suggestions.update(|m| {
                     m.insert(tax_key.clone(), resp.terms);
                 });
