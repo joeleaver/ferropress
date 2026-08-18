@@ -4770,6 +4770,68 @@ async fn term_list_q_limit_and_truncated() {
     assert_eq!(list["truncated"], false);
 }
 
+/// SF2 "slug-truth": `q` also matches a QUERY's OWN slugified form against the
+/// stored slug, not just a plain lowercased substring — so a case/space variant
+/// of an existing term's name still resolves it. Caught live: the admin tag
+/// combobox's suggestion fetch for "Sea Glass" (a space) returned nothing for
+/// the stored "sea-glass" (a hyphen) before this fix, even though "Sea-Glass"
+/// (a hyphen) already matched via the plain substring check alone.
+#[tokio::test]
+async fn term_list_q_matches_a_slugified_space_or_case_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let tax_id = seed_taxonomy(&store, "tag", false, true).await;
+    seed_term(&store, tax_id, "sea-glass", "sea-glass", None).await;
+    let ed = login_cookie(&state, "ed").await;
+
+    // A SPACE where the stored slug has a hyphen: no plain substring match
+    // exists (a space never appears in a stored slug), only the slugified
+    // comparison finds it.
+    let (st, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&q=Sea%20Glass",
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let names: Vec<String> = list["terms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, vec!["sea-glass".to_owned()], "{list}");
+
+    // A pure case variant already worked via the plain lowercased substring
+    // check — stays true with the slug check ALSO present (not exclusive-or).
+    let (_, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&q=SEA-GLASS",
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(list["terms"].as_array().unwrap().len(), 1, "{list}");
+
+    // A query that slugifies to nothing (all symbols) must not panic — it
+    // just means the slug half of the check never fires, and the plain
+    // substring check (also empty here) legitimately finds nothing.
+    let (st, list) = do_json(
+        &state,
+        "GET",
+        "/admin/api/terms?taxonomy=tag&q=%21%21%21",
+        &ed,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list["terms"].as_array().unwrap().len(), 0, "{list}");
+}
+
 /// SF12: a TermEditor form's `expected_rev` must match the term's CURRENT rev or
 /// the whole write is refused (409) — the lost-update guard that stops a stale
 /// form from silently reverting a rename/re-parent that happened elsewhere.

@@ -82,6 +82,13 @@ struct AuthCtx {
     view: Signal<View>,
     me_user: Signal<Option<UserDto>>,
     login_error: Signal<String>,
+    /// SF17: the SAME signal handles `TermsCtx::taxonomies`/`hierarchical_terms`
+    /// hold — cleared on session end so a re-login always re-fetches (never a
+    /// stale vocabulary from a prior session). Not the WHOLE `TermsCtx` (a
+    /// circular type — `TermsCtx` itself carries an `AuthCtx`), just the two
+    /// fields this needs.
+    vocab_taxonomies: Signal<Vec<api::TaxonomyDto>>,
+    vocab_hierarchical_terms: Signal<HashMap<String, Vec<api::TermDto>>>,
 }
 
 impl AuthCtx {
@@ -92,6 +99,18 @@ impl AuthCtx {
         self.login_error
             .set("Your session ended \u{2014} please sign in again.".to_owned());
         self.view.set(View::Login);
+        self.clear_vocab();
+    }
+
+    /// SF17: drop the shared taxonomy vocabulary — shared by `session_expired`
+    /// (an implicit 401) and the explicit "Sign out" click, the two session-end
+    /// paths. `load_vocab`'s own idempotency guard (`taxonomies.is_empty()`) is
+    /// what makes this take effect: the NEXT sign-in's first post/posts-list
+    /// visit re-fetches for real instead of silently reusing whatever the PRIOR
+    /// session last saw.
+    fn clear_vocab(self) {
+        self.vocab_taxonomies.set(Vec::new());
+        self.vocab_hierarchical_terms.set(HashMap::new());
     }
 }
 
@@ -234,6 +253,8 @@ impl Default for AuthCtx {
             view: Signal::new(View::Boot),
             me_user: Signal::new(None),
             login_error: Signal::new(String::new()),
+            vocab_taxonomies: Signal::new(Vec::new()),
+            vocab_hierarchical_terms: Signal::new(HashMap::new()),
         }
     }
 }
@@ -550,19 +571,31 @@ pub fn app() -> NodeHandle {
     let plugins_list = Signal::new(Vec::<api::PluginDescriptor>::new());
     let plugins_state = Signal::new(Load::Loading);
 
+    // The shared taxonomy vocabulary signals — hoisted above `auth` (SF17) so
+    // `AuthCtx::session_expired` can clear them directly: a stale vocabulary
+    // surviving a 401/logout would otherwise sit there non-empty, and
+    // `load_vocab`'s idempotency guard (`taxonomies.is_empty()`) means it
+    // would never re-fetch after the NEXT sign-in — a re-login could see
+    // another era's categories/tags. `TermsCtx` below reuses these SAME
+    // signal handles (never a second, competing copy).
+    let vocab_taxonomies = Signal::new(Vec::<api::TaxonomyDto>::new());
+    let vocab_hierarchical_terms = Signal::new(HashMap::<String, Vec<api::TermDto>>::new());
+
     // The re-auth routing bundle, shared by every guarded request.
     let auth = AuthCtx {
         view,
         me_user,
         login_error,
+        vocab_taxonomies,
+        vocab_hierarchical_terms,
     };
 
     // Taxonomy vocabulary + the open post's live category/tag assignment (Inc 3).
     // `terms.notice`/`terms.auth` alias the SAME `notice`/`auth` signals the rest of
     // the editor uses — one error banner, one re-auth path.
     let terms = TermsCtx {
-        taxonomies: Signal::new(Vec::<api::TaxonomyDto>::new()),
-        hierarchical_terms: Signal::new(HashMap::<String, Vec<api::TermDto>>::new()),
+        taxonomies: vocab_taxonomies,
+        hierarchical_terms: vocab_hierarchical_terms,
         vocab_load: Signal::new(VocabLoad::Loading),
         vocab_gen: Signal::new(0u64),
         selected_ids: Signal::new(HashSet::<u64>::new()),
@@ -874,6 +907,9 @@ pub fn app() -> NodeHandle {
                                             Ok(()) => {
                                                 me_user.set(None);
                                                 view.set(View::Login);
+                                                // SF17: the other session-end
+                                                // vocab-clear path.
+                                                auth.clear_vocab();
                                             }
                                             Err(_) => notice.set(
                                                 "Couldn't sign out \u{2014} check your connection and try again."
@@ -2131,6 +2167,12 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                 let key_for_buffer_input = tax.key.clone();
                 let key_for_suggest_check = tax.key.clone();
                 let key_for_suggest_list = tax.key.clone();
+                // SF16/#11 a11y: the combobox pattern's own three ARIA
+                // attributes — each its own leading clone (the same rule as
+                // every other reactive site on this element).
+                let key_for_expanded = tax.key.clone();
+                let key_for_controls = tax.key.clone();
+                let key_for_activedescendant = tax.key.clone();
                 fieldset { class: "termcheck",
                     legend { class: "termcheck__legend", {{ let v = legend_text.clone(); move || v }} }
                     div { class: "tokenfield",
@@ -2179,6 +2221,24 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                             data-fp-tagbuffer: { let v = key_for_databuffer.clone(); move || v },
                             aria-label: { let v = tag_label_text.clone(); move || v },
                             placeholder: { let v = tag_placeholder_text.clone(); move || v },
+                            aria-expanded: {
+                                let key = key_for_expanded.clone();
+                                move || {
+                                    let open = terms.suggestions.get().get(&key).is_some_and(|v| !v.is_empty());
+                                    if open { "true".to_owned() } else { "false".to_owned() }
+                                }
+                            },
+                            aria-controls: { let key = key_for_controls.clone(); move || suggest_listbox_id(&key) },
+                            aria-activedescendant: {
+                                let key = key_for_activedescendant.clone();
+                                move || {
+                                    let active = terms.suggest_active.get().get(&key).copied();
+                                    active
+                                        .and_then(|i| terms.suggestions.get().get(&key).and_then(|list| list.get(i).map(|t| t.id)))
+                                        .map(suggest_option_id)
+                                        .unwrap_or_default()
+                                }
+                            },
                             // Its own uniquely-named leading clone — `value:`'s
                             // `create_effect` directly captures whatever this
                             // bare closure references, so REUSING another
@@ -2215,10 +2275,11 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                             // distinct closures).
                             let key_for_suggest_id = key_for_suggest_list.clone();
                             let key_for_suggest_iter = key_for_suggest_list.clone();
-                            ul { class: "combobox__list", role: "listbox", id: { let v = key_for_suggest_id.clone(); move || format!("suggest-{v}") },
+                            ul { class: "combobox__list", role: "listbox", id: { let v = key_for_suggest_id.clone(); move || suggest_listbox_id(&v) },
                                 for s in suggest_vms(&terms.suggestions.get().get(&key_for_suggest_iter).cloned().unwrap_or_default(), terms.suggest_active.get().get(&key_for_suggest_iter).copied(), &key_for_suggest_iter) {
                                     li {
                                         key: s.id,
+                                        id: suggest_option_id(s.id),
                                         class: {if s.is_active { "combobox__opt is-active" } else { "combobox__opt" }},
                                         role: "option",
                                         aria-selected: {if s.is_active { "true" } else { "false" }},
@@ -2665,6 +2726,20 @@ fn panel_tag_placeholder(tax: &api::TaxonomyDto) -> String {
     format!("Add a {}\u{2026}", singularize(&tax.label))
 }
 
+/// The tag-suggestion listbox's id, keyed by taxonomy — shared by the
+/// listbox's own `id:` and the combobox `<input>`'s `aria-controls` (#11).
+fn suggest_listbox_id(taxonomy_key: &str) -> String {
+    format!("suggest-{taxonomy_key}")
+}
+
+/// One suggestion option's id — shared by the `<li role="option">`'s own
+/// `id:` and the combobox `<input>`'s `aria-activedescendant` (#11), so a
+/// screen reader announces which option is virtually focused as arrow keys
+/// move `suggest_active` without moving the DOM focus off the input.
+fn suggest_option_id(term_id: u64) -> String {
+    format!("suggest-opt-{term_id}")
+}
+
 /// `terms.hierarchical_terms.get().get(key)`, owned and defaulted — a small direct
 /// accessor to keep the rsx call sites (`for row in hier_vocab(terms, &tax.key)`,
 /// the `parent_options`-style precedent) free of intermediate `let`s.
@@ -3012,6 +3087,74 @@ fn missing_term_id(message: &str) -> Option<u64> {
         .strip_prefix("term ")
         .and_then(|rest| rest.strip_suffix(" does not exist"))
         .and_then(|id_str| id_str.parse().ok())
+}
+
+/// SF13: the inline-tag archive-path 409 (`ferropress-http::admin::posts::plan_terms`,
+/// `the archive path "{taxonomy}/{slug}" is already used by a post or page`) names
+/// the offending SLUG — extract it so the failure can be mapped back to ONE staged
+/// chip and marked rejected in place, distinct from `missing_term_id`'s "term N does
+/// not exist" shape (a different failure entirely: this one names a slug, that one
+/// an id).
+fn rejected_tag_slug(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("the archive path \"")?;
+    let path = rest.split('"').next()?;
+    path.rsplit_once('/').map(|(_, slug)| slug.to_owned())
+}
+
+// SF13/#12: this 409's live trigger needs a page WHOSE OWN materialized path
+// happens to collide with a NOT-YET-EXISTING tag's archive path — real but
+// awkward to stage end-to-end (a nested page under a "tag"-slugged parent,
+// then an inline-tag save naming exactly that child's slug). The parser
+// itself is a pure function, covered directly here per the design ruling's
+// stated fallback ("cover the code path with a unit test... say so
+// explicitly") — `mark_rejected_staged_tag`'s own body is a single `Vec`
+// iteration + slug compare, verified by reading rather than by a live 409.
+#[cfg(test)]
+mod tests {
+    use super::rejected_tag_slug;
+
+    #[test]
+    fn rejected_tag_slug_extracts_the_slug_from_the_real_server_message() {
+        let msg = "the archive path \"tag/sea-glass\" is already used by a post or page";
+        assert_eq!(rejected_tag_slug(msg).as_deref(), Some("sea-glass"));
+    }
+
+    #[test]
+    fn rejected_tag_slug_handles_a_hierarchical_taxonomy_key_too() {
+        // Not the tags-only inline path in practice, but the parser itself
+        // doesn't assume a specific taxonomy key — only the trailing
+        // slash-segment.
+        let msg = "the archive path \"category/sea-stories\" is already used by a post or page";
+        assert_eq!(rejected_tag_slug(msg).as_deref(), Some("sea-stories"));
+    }
+
+    #[test]
+    fn rejected_tag_slug_is_none_for_an_unrelated_message() {
+        assert_eq!(rejected_tag_slug("term 5 does not exist"), None);
+        assert_eq!(
+            rejected_tag_slug("a sibling term with the slug \"x\" already exists"),
+            None
+        );
+        assert_eq!(rejected_tag_slug(""), None);
+    }
+}
+
+/// Apply `rejected_tag_slug`'s result: mark the ONE staged chip whose slugified name
+/// matches as rejected (SF13 — "never a global message plus N indistinguishable
+/// chips"), leaving every other staged chip untouched so a retry doesn't have to
+/// re-type them. A no-op when the message doesn't name this shape of failure, or
+/// names a slug no currently-staged chip produces (already resolved/removed).
+fn mark_rejected_staged_tag(terms: TermsCtx, message: &str) {
+    let Some(slug) = rejected_tag_slug(message) else {
+        return;
+    };
+    terms.staged.update(|v| {
+        for s in v.iter_mut() {
+            if ferropress_core::slugify(&s.name).as_deref() == Some(slug.as_str()) {
+                s.rejected = true;
+            }
+        }
+    });
 }
 
 /// Install the B7 keyboard mechanism for every tag token-input, in ONE
@@ -3890,8 +4033,17 @@ fn save_post(ectx: EditorCtx) {
                 // SF17: every failed save invalidates the vocab, regardless of
                 // WHY it failed — `apply_terms` mutates one tag at a time, so a
                 // partial failure can leave an earlier tag created-but-
-                // unassigned; the next load must show the truth.
+                // unassigned; the next load must show the truth. `taxonomies`
+                // is the SAME signal `TaxonomyPanel`'s own `for tax in
+                // terms.taxonomies.get()` renders from (Q2's one-cache
+                // design) — clearing it with nothing to refill it made the
+                // WHOLE Categories/Tags UI vanish for the rest of the editing
+                // session (caught live: it never came back even after a
+                // successful retry save). `load_vocab` is the one function
+                // that refills `taxonomies` and `hierarchical_terms`
+                // together, so fire it right back up.
                 invalidate_vocab(terms);
+                load_vocab(terms, auth);
                 // B10(b): a term deleted elsewhere between load and save hard-400s
                 // the WHOLE save. Recognize that one shape, silently drop the
                 // offending id from the live selection so the SAME Save button
@@ -3914,7 +4066,14 @@ fn save_post(ectx: EditorCtx) {
                                 .to_string(),
                         );
                     }
-                    None => notice.set(e),
+                    // SF13: distinct from the missing-id shape above — this
+                    // one names a SLUG (an inline tag whose archive path
+                    // collided), so it maps back to the ONE offending staged
+                    // chip instead of a global message next to every chip.
+                    None => {
+                        mark_rejected_staged_tag(terms, &e);
+                        notice.set(e);
+                    }
                 }
             }
         }
@@ -4125,6 +4284,7 @@ fn preview_post(ectx: EditorCtx) {
                 }
                 // SF17 — see the identical note in `save_post`.
                 invalidate_vocab(terms);
+                load_vocab(terms, auth);
                 match missing_term_id(&e) {
                     Some(missing_id) => {
                         terms.selected_ids.update(|s| {
@@ -4140,7 +4300,10 @@ fn preview_post(ectx: EditorCtx) {
                                 .to_string(),
                         );
                     }
-                    None => notice.set(e),
+                    None => {
+                        mark_rejected_staged_tag(terms, &e);
+                        notice.set(e);
+                    }
                 }
             }
         }
@@ -5177,6 +5340,24 @@ fn delete_term_clicked(tv: TermsViewCtx) {
             Ok(()) => {
                 tv.saving.set(false);
                 tv.dirty.set(false);
+                // B10(a): purge the deleted id from the SHARED assignment
+                // state — `terms.selected_ids`/`sidecar` is the SAME
+                // `TermsCtx` the post editor's own checklist/chips read
+                // (there is one app-wide `terms`, not a per-view copy), so a
+                // post left open with this term checked before navigating
+                // here must come back with it UNCHECKED, not merely absent
+                // from a reloaded vocabulary — otherwise the next Save
+                // still sends the now-nonexistent id and hard-400s (the
+                // exact failure `missing_term_id`'s B10(b) path recovers
+                // from reactively; this is the SAME cleanup, done proactively
+                // since we already know the id here).
+                tv.terms.selected_ids.update(|s| {
+                    s.remove(&id);
+                });
+                tv.terms.sidecar.update(|m| {
+                    m.remove(&id);
+                });
+                tv.terms.terms_gen.update(|g| *g += 1);
                 // See the identical comment in `save_term` — `invalidate_vocab`
                 // blanks the SAME `taxonomies` cache this view's own chrome
                 // reads, so refill it right away via `load_vocab`.

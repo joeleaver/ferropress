@@ -311,15 +311,26 @@ pub async fn list(
         .as_deref()
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty());
+    // SF2 "slug-truth": also compare the query's OWN slugified form against
+    // the stored slug, so a case/space variant of an existing term's name
+    // ("Sea Glass" typed against the stored "sea-glass") still resolves as
+    // the SAME term — a plain lowercased substring check alone never matches
+    // a space against the stored hyphen. `slugify` returning `None` (an
+    // all-symbol query) just means this half of the check never fires.
+    let needle_slug = query.q.as_deref().and_then(ferropress_core::slugify);
 
     let mut out = Vec::with_capacity(rows.len());
     for (id, depth) in flatten_tree(&rows) {
         let row = &rows[&id];
-        if let Some(n) = needle.as_deref()
-            && !row.name.to_lowercase().contains(n)
-            && !row.slug.to_lowercase().contains(n)
-        {
-            continue;
+        if let Some(n) = needle.as_deref() {
+            let plain_match =
+                row.name.to_lowercase().contains(n) || row.slug.to_lowercase().contains(n);
+            let slug_match = needle_slug
+                .as_deref()
+                .is_some_and(|ns| row.slug.contains(ns));
+            if !plain_match && !slug_match {
+                continue;
+            }
         }
         out.push(TermDto {
             id,
