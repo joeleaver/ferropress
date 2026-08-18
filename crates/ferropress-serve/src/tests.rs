@@ -5744,7 +5744,7 @@ fn external_theme_engines() -> Vec<(String, ThemeEngine)> {
         }
     };
     let registry = crate::themes::ThemeRegistry::load_dir(std::path::Path::new(&dir));
-    registry
+    let found: Vec<(String, ThemeEngine)> = registry
         .choices()
         .into_iter()
         .filter(|c| c.value != ferropress_render_form::DEFAULT_THEME)
@@ -5754,7 +5754,54 @@ fn external_theme_engines() -> Vec<(String, ThemeEngine)> {
                 .expect("a registered external theme must build");
             (c.value, engine)
         })
-        .collect()
+        .collect();
+    assert_external_themes_found(&dir, found.len());
+    found
+}
+
+/// Review C7's guard, pulled out as a pure function purely so it's directly,
+/// race-freely unit-testable (the real caller above touches the process-global
+/// `FERROPRESS_EXTERNAL_THEME_DIR` env var and a real `ThemeRegistry`, neither
+/// of which a test should mutate/exercise just to pin down this one invariant).
+///
+/// `load_dir` is deliberately INFALLIBLE — a misconfigured `dir` (wrong path,
+/// an empty directory, a theme folder given directly instead of its PARENT)
+/// silently falls back to registering only the built-in theme, which the
+/// caller's `!= DEFAULT_THEME` filter then removes, leaving `count == 0`.
+/// That's INDISTINGUISHABLE, at that point, from the intentionally-skipped
+/// "env var unset" branch — except here the caller explicitly SET the env
+/// var, so they clearly meant for real themes to be checked. Silently
+/// returning empty made every one of the four `external_theme_*` tests
+/// iterate zero times and report as PASSING, having asserted nothing at all —
+/// `xtask theme-contract-check` would print "OK" over a directory that was
+/// never actually rendered against the shared contract. Fail loudly instead.
+fn assert_external_themes_found(dir: &str, count: usize) {
+    assert!(
+        count > 0,
+        "FERROPRESS_EXTERNAL_THEME_DIR={dir} registered ZERO non-default themes -- \
+         this almost always means the path is wrong (point it at the PARENT directory \
+         that contains one subfolder per theme, each with its own theme.toml -- not a \
+         single theme's own folder) or that directory has no theme.toml anywhere under \
+         it. Silently continuing here would make every external_theme_* contract test \
+         vacuously pass without rendering anything."
+    );
+}
+
+#[test]
+fn external_themes_found_rejects_a_set_but_empty_directory() {
+    let result =
+        std::panic::catch_unwind(|| assert_external_themes_found("/some/misconfigured/dir", 0));
+    assert!(
+        result.is_err(),
+        "a SET FERROPRESS_EXTERNAL_THEME_DIR that yields zero themes must panic loudly, \
+         never silently pass through as \"nothing to check\""
+    );
+}
+
+#[test]
+fn external_themes_found_accepts_a_populated_directory() {
+    // Must NOT panic — this is the ordinary, well-configured case.
+    assert_external_themes_found("/some/well-formed/themes/dir", 3);
 }
 
 /// The base context every contract-checker render below starts from — the shared fields
