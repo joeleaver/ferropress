@@ -23,6 +23,6 @@ ferropress-render-form = { path = "../ferropress-render-form" }
 # rinch — UPSTREAM, pinned git rev. MUST equal ferropress-admin / ferropress-editor-bridge
 # (NodeHandle identity across the cross-crate component call). Same feature set the admin
 # uses so the facade resolves identically.
-rinch = { git = "https://github.com/joeleaver/rinch.git", rev = "2ea76250409feb3953b9d5fbb77f9ad78367c6b4", default-features = false, features = ["components", "theme"] }
+rinch = { git = "https://github.com/joeleaver/rinch.git", rev = "5add79bd418549666c6be1db5bc08d15d69db40b", default-features = false, features = ["components", "theme"] }
 
 serde_json = "1"
