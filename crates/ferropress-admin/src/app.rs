@@ -317,7 +317,7 @@ impl Default for LocCtx {
 /// "no categories exist" — an empty Vec is genuinely ambiguous with a not-yet-loaded
 /// one. Never gates the chips already assigned to the open post (SF3): those render
 /// from `PostDetail.terms`/a save response regardless of this state.
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 enum VocabLoad {
     #[default]
     Loading,
@@ -408,16 +408,51 @@ struct TermsCtx {
     /// The active (arrow-key-highlighted) suggestion index; absent = no option
     /// active (Enter then commits the typed buffer instead of accepting one).
     suggest_active: Signal<HashMap<String, usize>>,
+    /// C12's fix: the chip a first Backspace-on-empty-buffer press SELECTED for
+    /// removal, keyed by taxonomy — B7's mandated two-step (Gutenberg
+    /// behaviour), since the chip's `×` button is pointer-only and this is
+    /// otherwise the ONLY keyboard route to removing one. A second consecutive
+    /// Backspace (still empty buffer, still the SAME chip) removes it; any
+    /// OTHER key, or the buffer gaining text, clears the selection instead of
+    /// removing anything.
+    backspace_selected: Signal<HashMap<String, StagedOrAssigned>>,
 
     /// The category checklist's filter text, keyed by taxonomy key (owner call #1:
     /// ships in v1, unconditionally — not gated behind a term-count threshold).
+    /// C17: this is the DEBOUNCED value the actual row-filtering
+    /// (`filter_text`/`checklist_row_vms`/`checklist_is_empty`) reads —
+    /// `checklist_filter_raw` below is what the search box itself is
+    /// controlled from, so the box's own displayed text is never delayed,
+    /// only the (potentially ~100-term) keyed re-render it drives.
     checklist_filter: Signal<HashMap<String, String>>,
+    /// C17's immediate buffer — every keystroke writes here synchronously;
+    /// `checklist_filter` only catches up after a debounce pause (owner's
+    /// explicit requirement, Q8's rationale: a per-keystroke full
+    /// re-derive+reconcile of the checklist scales directly with vocabulary
+    /// size).
+    checklist_filter_raw: Signal<HashMap<String, String>>,
+    /// C17's per-taxonomy debounce generation — a rapid second keystroke
+    /// (within the debounce window) invalidates the FIRST keystroke's still-
+    /// pending propagation into `checklist_filter`, the `suggest_gen`/
+    /// `vocab_gen` idiom applied to a timer instead of a network response.
+    checklist_filter_gen: Signal<HashMap<String, u64>>,
 
     /// A term id a save's 400 just named as no-longer-existing (B10b) — the notice
     /// explains it and the NEXT click of the ordinary Save button already excludes
     /// it (the id is removed from `selected_ids`/`sidecar` as soon as this is set,
     /// so recovery is "read the notice, click Save again", never an auto-retry).
     missing_term_notice: Signal<Option<u64>>,
+
+    /// C15/B7/Q5: the shared taxonomy-panel live region's current text (an
+    /// `aria-live="polite"` `.sr-only` div, rendered ONCE per post editor —
+    /// see `editor__below`). Every chip mutation (checkbox toggle, chip `×`
+    /// removal, a suggestion accepted, a new tag staged, the C12 two-step
+    /// Backspace) sets this so assistive tech hears the outcome; a purely
+    /// visual confirmation was the ONE thing every one of these actions
+    /// lacked before this fix (a repo-wide check found zero `aria-live`
+    /// attributes anywhere in the admin, only the unrelated, 1.6s-delayed
+    /// "Saved" toast's `role="status"`).
+    live_announce: Signal<String>,
 
     auth: AuthCtx,
 }
@@ -443,8 +478,12 @@ impl Default for TermsCtx {
             suggestions: Signal::new(HashMap::new()),
             suggest_gen: Signal::new(0),
             suggest_active: Signal::new(HashMap::new()),
+            backspace_selected: Signal::new(HashMap::new()),
             checklist_filter: Signal::new(HashMap::new()),
+            checklist_filter_raw: Signal::new(HashMap::new()),
+            checklist_filter_gen: Signal::new(HashMap::new()),
             missing_term_notice: Signal::new(None),
+            live_announce: Signal::new(String::new()),
             auth: AuthCtx::default(),
         }
     }
@@ -468,6 +507,13 @@ struct TermsViewCtx {
     active_taxonomy: Signal<String>,
     list: Signal<Vec<api::TermDto>>,
     list_state: Signal<Load>,
+    /// C5's fix: a monotonic generation for `load_term_list` — the
+    /// `candidates_gen`/`vocab_gen` idiom. Without it, two term-list fetches
+    /// (a fast tab switch firing request B before request A resolves) can be
+    /// in flight together, and whichever RESOLVES LAST wins regardless of
+    /// which taxonomy tab is actually active by then — silently mislabeling
+    /// `tv.list` under the WRONG heading.
+    term_list_gen: Signal<u64>,
 
     // View::TermEditor — the create/edit form. `edit_id: None` = create.
     edit_id: Signal<Option<u64>>,
@@ -637,8 +683,12 @@ pub fn app() -> NodeHandle {
         suggestions: Signal::new(HashMap::<String, Vec<api::TermDto>>::new()),
         suggest_gen: Signal::new(0u64),
         suggest_active: Signal::new(HashMap::<String, usize>::new()),
+        backspace_selected: Signal::new(HashMap::<String, StagedOrAssigned>::new()),
         checklist_filter: Signal::new(HashMap::<String, String>::new()),
+        checklist_filter_raw: Signal::new(HashMap::<String, String>::new()),
+        checklist_filter_gen: Signal::new(HashMap::<String, u64>::new()),
         missing_term_notice: Signal::new(Option::<u64>::None),
+        live_announce: Signal::new(String::new()),
         auth,
     };
     let editor_ctx = EditorCtx {
@@ -662,6 +712,7 @@ pub fn app() -> NodeHandle {
         active_taxonomy: Signal::new(String::new()),
         list: Signal::new(Vec::<api::TermDto>::new()),
         list_state: Signal::new(Load::Loading),
+        term_list_gen: Signal::new(0),
         edit_id: Signal::new(Option::<u64>::None),
         edit_taxonomy: Signal::new(String::new()),
         edit_name: Signal::new(String::new()),
@@ -1217,7 +1268,14 @@ pub fn app() -> NodeHandle {
                             }
                         }
                         if !notice.get().is_empty() {
-                            div { class: "editor__error", {move || notice.get()} }
+                            // C13: matches the role="alert" already given to
+                            // View::Terms/TermEditor/TaxonomyPanel's own
+                            // notices (SF13) — this was the one surface left
+                            // behind, despite carrying two of SF13's OWN named
+                            // taxonomy error states (B10b's "category/tag no
+                            // longer exists" and the inline-tag archive-path
+                            // 409) plus B8's buffer-validation message.
+                            div { class: "editor__error", role: "alert", {move || notice.get()} }
                         }
                         div { class: "toolbar", role: "toolbar",
                             button { class: "tool tool--i", title: "Bold", onclick: move || { editor.get().command("toggleBold"); }, b { "B" } }
@@ -1256,6 +1314,12 @@ pub fn app() -> NodeHandle {
                                     }
                                 }
                                 div { class: "editor__below",
+                                    // C15/B7/Q5: ONE shared live region for every
+                                    // chip/checkbox/tag action across BOTH taxonomy
+                                    // panels (never per-panel — an action only ever
+                                    // touches one taxonomy at a time, so one region
+                                    // suffices and avoids two competing announcers).
+                                    div { class: "sr-only", aria-live: "polite", {move || terms.live_announce.get()} }
                                     // SF3 remnant: `TaxonomyPanel` only exists per
                                     // ENTRY of `terms.taxonomies` — while that list is
                                     // empty (still loading, genuinely no taxonomies
@@ -1575,7 +1639,11 @@ pub fn app() -> NodeHandle {
                             }
                         }
                         if !menu.notice.get().is_empty() {
-                            div { class: "editor__error", {move || menu.notice.get()} }
+                            // C13 (same gap, same fix): every other
+                            // `.editor__error` in the admin now has
+                            // role="alert" — this was the one other surface
+                            // still missing it.
+                            div { class: "editor__error", role: "alert", {move || menu.notice.get()} }
                         }
                         if matches!(menu.load.get(), Load::Loading) {
                             div { class: "galley__state", "Loading the menu\u{2026}" }
@@ -1935,21 +2003,47 @@ pub fn app() -> NodeHandle {
                                 // split by whether the candidate's OWNING taxonomy is
                                 // hierarchical — looked up against the shared vocabulary
                                 // (`terms.taxonomies`), never a hardcoded "category"/"tag" key.
+                                // C1's fix: these two arms are the ONLY ones that also depend
+                                // on a SECOND, independently-fetched DTO (`terms.taxonomies`,
+                                // via `load_vocab`) rather than just `menu.candidates`
+                                // (`reload_candidates`) — the two fetches are never joined, and
+                                // the vocab fetch is 2+ sequential round trips vs. the
+                                // candidates fetch's 1, so it is the COMMON case, not a rare
+                                // one, for `candidates_state` to reach `Ready` while
+                                // `terms.taxonomies` is still unresolved. Classifying a term's
+                                // taxonomy while the vocab is unresolved defaults every term to
+                                // "flat" (`taxonomy_is_hierarchical`'s own documented fallback),
+                                // so real categories would misfile under Tags and Categories
+                                // would falsely claim "No matching categories." — a display gate
+                                // on `terms.vocab_load` is the proportionate fix (the blast-radius
+                                // lens found the underlying `LinkTarget::Term{id}` write is
+                                // unaffected either way, so this is purely about not showing the
+                                // user a wrong picture while it settles).
                                 PickerTab::Categories => div {
-                                    for c in term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), true) {
-                                        let ind = format!("padding-left: {:.2}rem", 0.25 + c.depth.unwrap_or(0) as f32 * 1.25);
-                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: ind }
+                                    if matches!(terms.vocab_load.get(), VocabLoad::Loading) {
+                                        div { class: "media-modal__state", "Loading categories\u{2026}" }
                                     }
-                                    if matches!(menu.candidates_state.get(), Load::Ready) && term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), true).is_empty() {
-                                        div { class: "truncnote", "No matching categories." }
+                                    if !matches!(terms.vocab_load.get(), VocabLoad::Loading) {
+                                        for c in term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), true) {
+                                            let ind = format!("padding-left: {:.2}rem", 0.25 + c.depth.unwrap_or(0) as f32 * 1.25);
+                                            CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: ind }
+                                        }
+                                        if matches!(menu.candidates_state.get(), Load::Ready) && term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), true).is_empty() {
+                                            div { class: "truncnote", "No matching categories." }
+                                        }
                                     }
                                 },
                                 PickerTab::Tags => div {
-                                    for c in term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), false) {
-                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: String::new() }
+                                    if matches!(terms.vocab_load.get(), VocabLoad::Loading) {
+                                        div { class: "media-modal__state", "Loading tags\u{2026}" }
                                     }
-                                    if matches!(menu.candidates_state.get(), Load::Ready) && term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), false).is_empty() {
-                                        div { class: "truncnote", "No matching tags." }
+                                    if !matches!(terms.vocab_load.get(), VocabLoad::Loading) {
+                                        for c in term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), false) {
+                                            CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: String::new() }
+                                        }
+                                        if matches!(menu.candidates_state.get(), Load::Ready) && term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), false).is_empty() {
+                                            div { class: "truncnote", "No matching tags." }
+                                        }
                                     }
                                 },
                                 PickerTab::Custom => div {
@@ -2068,6 +2162,14 @@ pub fn app() -> NodeHandle {
 /// Called once per TAXONOMY (1-2 times) — SF15a's actual concern (no per-ROW
 /// component; a checklist row, rendered tens of times in the `for` below, stays
 /// inline) is untouched.
+// C15: rinch's `for`-loop codegen duplicates a per-item leading-let into an
+// auto-generated, internal KEY-computation closure (verified via `cargo
+// expand`) that only actually uses the key it derives (here, `chip.id`) —
+// any OTHER leading-let a for-body needs (per-site name clones, this
+// component's own established fix for the shared-ancestor gotcha) is
+// computed-and-discarded there too, a harmless but real "unused variable" at
+// that copy. Function-scoped rather than per-`let`: rsx!'s parser rejects a
+// raw attribute directly before a leading-let (tested).
 #[component]
 fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
     // Split BEFORE `rsx!` even starts (plain Rust here, no macro-child
@@ -2102,25 +2204,47 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                 let error_msg = panel_error_text(&tax);
                 let key_for_empty_check = tax.key.clone();
                 let empty_msg = panel_empty_text(&tax);
+                let key_for_no_match_check = tax.key.clone();
+                let no_match_msg = panel_no_match_text(&tax);
                 let key_for_scroll_check = tax.key.clone();
                 let key_for_scroll_iter = tax.key.clone();
                 fieldset { class: "termcheck",
                     legend { class: "termcheck__legend", {{ let v = legend_text.clone(); move || v }} }
                     div { class: "chipline", aria-label: { let v = chip_label.clone(); move || v },
-                        for chip in chip_vms(&terms.selected_ids.get(), &terms.hierarchical_terms.get(), &terms.sidecar.get(), &key_for_chips, true) {
+                        for chip in chip_vms(&terms.selected_ids.get(), &terms.hierarchical_terms.get(), &terms.sidecar.get(), &key_for_chips, true, &terms.backspace_selected.get()) {
+                            // C15/B7/Q5: THREE independent sites below each
+                            // touch `chip.name` — each needs its OWN
+                            // separately-named leading-let clone (the
+                            // established fix for this file — see
+                            // `ferropress-rinch-if-else-capture-gotcha`), not
+                            // one shared clone or a direct field read reused
+                            // more than once. Leading `_`: rinch's `for`-loop
+                            // codegen ALSO computes (and discards) these
+                            // inside its own internal per-item KEY closure
+                            // (verified via `cargo expand`) — a real, if
+                            // slightly noisy, "unused variable" on that copy
+                            // otherwise; `#[allow]` doesn't reach it (tested
+                            // both above `#[component]` and just above `fn`;
+                            // neither propagates into the macro's generated
+                            // `impl Component::render`).
+                            let _chip_name_text = chip.name.clone();
+                            let _chip_name_label = chip.name.clone();
+                            let _chip_name_announce = chip.name.clone();
                             span { key: chip.id, class: {if chip.oov { "chip chip--oov" } else { "chip" }},
-                                {chip.name.clone()}
+                                {_chip_name_text}
                                 if chip.oov {
                                     small { "(unavailable)" }
                                 }
                                 button {
                                     class: "chip__x",
-                                    aria-label: format!("Remove {}", chip.name),
+                                    aria-label: format!("Remove {_chip_name_label}"),
                                     onclick: {
                                         let id = chip.id;
                                         move || {
                                             terms.selected_ids.update(|s| { s.remove(&id); });
                                             terms.terms_gen.update(|g| *g += 1);
+                                            // C15/B7/Q5: announce the outcome.
+                                            terms.live_announce.set(format!("Removed {_chip_name_announce}"));
                                         }
                                     },
                                     "\u{2715}"
@@ -2135,12 +2259,33 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                             placeholder: { let v = filter_placeholder_text.clone(); move || v },
                             value: {
                                 let tax_key = key_for_filter_value.clone();
-                                move || filter_text(terms, &tax_key)
+                                move || filter_raw_text(terms, &tax_key)
                             },
+                            // C17 (owner's explicit debounce requirement, Q8):
+                            // the box's OWN displayed text updates
+                            // immediately (`checklist_filter_raw`, read by
+                            // `value:` above) — only the propagation into
+                            // `checklist_filter` (what the actual keyed
+                            // row-filtering reads) is debounced. A rapid
+                            // second keystroke bumps the per-taxonomy
+                            // generation, so the FIRST keystroke's still-
+                            // pending timer sees it's been superseded and
+                            // drops its own write instead of clobbering the
+                            // newer one out of order.
                             oninput: {
                                 let tax_key = key_for_filter_input.clone();
                                 move |v: String| {
-                                    terms.checklist_filter.update(|m| { m.insert(tax_key.clone(), v); });
+                                    terms.checklist_filter_raw.update(|m| { m.insert(tax_key.clone(), v.clone()); });
+                                    let filter_gen = terms.checklist_filter_gen.get().get(&tax_key).copied().unwrap_or(0) + 1;
+                                    terms.checklist_filter_gen.update(|m| { m.insert(tax_key.clone(), filter_gen); });
+                                    let tax_key2 = tax_key.clone();
+                                    spawn_local(async move {
+                                        TimeoutFuture::new(250).await;
+                                        if terms.checklist_filter_gen.get().get(&tax_key2).copied() != Some(filter_gen) {
+                                            return;
+                                        }
+                                        terms.checklist_filter.update(|m| { m.insert(tax_key2.clone(), v); });
+                                    });
                                 }
                             },
                         }
@@ -2175,8 +2320,18 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                         let msg = error_msg.clone();
                         p { class: "panelerror", role: "alert", {{ let v = msg.clone(); move || v }} }
                     }
-                    if matches!(terms.vocab_load.get(), VocabLoad::Ready) && checklist_is_empty(terms, &key_for_empty_check) {
+                    // C14: three mutually-exclusive states, not two — the
+                    // vocabulary being genuinely empty (`empty_msg`) is a
+                    // DIFFERENT fact from a non-empty vocabulary's filter
+                    // matching nothing (`no_match_msg`, its own independent
+                    // sibling `if` per this component's own established
+                    // else-if-codegen rule, same as every other branch here).
+                    if matches!(terms.vocab_load.get(), VocabLoad::Ready) && taxonomy_vocab_is_empty(terms, &key_for_empty_check) {
                         let msg = empty_msg.clone();
+                        p { class: "panelstate", {{ let v = msg.clone(); move || v }} }
+                    }
+                    if matches!(terms.vocab_load.get(), VocabLoad::Ready) && !taxonomy_vocab_is_empty(terms, &key_for_no_match_check) && checklist_is_empty(terms, &key_for_no_match_check) {
+                        let msg = no_match_msg.clone();
                         p { class: "panelstate", {{ let v = msg.clone(); move || v }} }
                     }
                     if matches!(terms.vocab_load.get(), VocabLoad::Ready) && !checklist_is_empty(terms, &key_for_scroll_check) {
@@ -2207,8 +2362,10 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                                             // before this field existed).
                                             let tax_key = row.taxonomy.clone();
                                             move |_: String| {
+                                                let mut removed = false;
                                                 terms.selected_ids.update(|s| {
-                                                    if !s.remove(&id) { s.insert(id); }
+                                                    removed = s.remove(&id);
+                                                    if !removed { s.insert(id); }
                                                 });
                                                 terms.sidecar.update(|m| {
                                                     m.insert(id, api::TermRefDto {
@@ -2216,6 +2373,12 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                                                     });
                                                 });
                                                 terms.terms_gen.update(|g| *g += 1);
+                                                // C15/Q5: announce the outcome.
+                                                terms.live_announce.set(if removed {
+                                                    format!("Removed {name}")
+                                                } else {
+                                                    format!("Added {name}")
+                                                });
                                             }
                                         },
                                     }
@@ -2251,37 +2414,69 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                     legend { class: "termcheck__legend", {{ let v = legend_text.clone(); move || v }} }
                     div { class: "tokenfield",
                         div { class: "chipline", aria-label: { let v = chip_label.clone(); move || v },
-                            for chip in chip_vms(&terms.selected_ids.get(), &terms.hierarchical_terms.get(), &terms.sidecar.get(), &key_for_databuffer, false) {
-                                span { key: chip.id, class: "chip",
-                                    {chip.name.clone()}
+                            for chip in chip_vms(&terms.selected_ids.get(), &terms.hierarchical_terms.get(), &terms.sidecar.get(), &key_for_databuffer, false, &terms.backspace_selected.get()) {
+                                // C12: `pending_remove` is baked into the VM by
+                                // the iter_expr above (which reads
+                                // `terms.backspace_selected.get()`, so the
+                                // WHOLE for loop — and this flag — reactively
+                                // rebuilds on a change), never re-derived
+                                // inside a per-row attribute closure: rinch's
+                                // `for`-loop codegen auto-clone-shadows
+                                // whatever the iter_expr itself captures, and a
+                                // per-item closure trying to ALSO borrow that
+                                // same shared ancestor competes with that
+                                // shadow (confirmed empirically — see
+                                // `ferropress-rinch-if-else-capture-gotcha`).
+                                // C15: same "own clone per site" rule as the
+                                // hierarchical branch above.
+                                let _chip_name_text2 = chip.name.clone();
+                                let _chip_name_label2 = chip.name.clone();
+                                let _chip_name_announce2 = chip.name.clone();
+                                span { key: chip.id, class: {if chip.pending_remove { "chip chip--pending-remove" } else { "chip" }},
+                                    {_chip_name_text2}
                                     button {
                                         class: "chip__x",
-                                        aria-label: format!("Remove {}", chip.name),
+                                        aria-label: format!("Remove {_chip_name_label2}"),
                                         onclick: {
                                             let id = chip.id;
                                             move || {
                                                 terms.selected_ids.update(|s| { s.remove(&id); });
                                                 terms.terms_gen.update(|g| *g += 1);
+                                                // C15/B7/Q5: announce the outcome.
+                                                terms.live_announce.set(format!("Removed {_chip_name_announce2}"));
                                             }
                                         },
                                         "\u{2715}"
                                     }
                                 }
                             }
-                            for staged in staged_for_taxonomy(&terms.staged.get(), &key_for_databuffer) {
+                            for staged in staged_chip_vms(&terms.staged.get(), &key_for_databuffer, &terms.backspace_selected.get()) {
+                                let _staged_name_text = staged.name.clone();
+                                let _staged_name_label = staged.name.clone();
+                                let _staged_name_announce = staged.name.clone();
                                 span {
                                     key: format!("s{}", staged.cid),
-                                    class: {if staged.rejected { "chip chip--rejected" } else { "chip chip--new" }},
-                                    {staged.name.clone()}
+                                    class: {
+                                        if staged.rejected {
+                                            "chip chip--rejected"
+                                        } else if staged.pending_remove {
+                                            "chip chip--pending-remove"
+                                        } else {
+                                            "chip chip--new"
+                                        }
+                                    },
+                                    {_staged_name_text}
                                     small { {if staged.rejected { "couldn't add \u{2014} try again" } else { "will be created" }} }
                                     button {
                                         class: "chip__x",
-                                        aria-label: format!("Remove {}", staged.name),
+                                        aria-label: format!("Remove {_staged_name_label}"),
                                         onclick: {
                                             let cid = staged.cid;
                                             move || {
                                                 terms.staged.update(|v| v.retain(|s| s.cid != cid));
                                                 terms.terms_gen.update(|g| *g += 1);
+                                                // C15/B7/Q5: announce the outcome.
+                                                terms.live_announce.set(format!("Removed {_staged_name_announce}"));
                                             }
                                         },
                                         "\u{2715}"
@@ -2350,13 +2545,31 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                             let key_for_suggest_id = key_for_suggest_list.clone();
                             let key_for_suggest_iter = key_for_suggest_list.clone();
                             ul { class: "combobox__list", role: "listbox", id: { let v = key_for_suggest_id.clone(); move || suggest_listbox_id(&v) },
-                                for s in suggest_vms(&terms.suggestions.get().get(&key_for_suggest_iter).cloned().unwrap_or_default(), terms.suggest_active.get().get(&key_for_suggest_iter).copied(), &key_for_suggest_iter) {
+                                for s in suggest_vms(&terms.suggestions.get().get(&key_for_suggest_iter).cloned().unwrap_or_default(), &key_for_suggest_iter) {
+                                    // C6: two INDEPENDENT reactive attribute
+                                    // closures below, each its own
+                                    // for-item-level leading-let clone of
+                                    // `s.taxonomy` (the established rule —
+                                    // see `ferropress-rinch-if-else-capture-
+                                    // gotcha`); both read `terms.suggest_active`
+                                    // fresh, comparing against THIS row's own
+                                    // stable `s.index` — never a baked-in
+                                    // `is_active` the keyed `for` would treat
+                                    // as this row's data changing. Leading
+                                    // `_`: rinch's `for`-loop codegen ALSO
+                                    // computes (and discards) these in its
+                                    // own internal per-item KEY closure — the
+                                    // same harmless artifact as the chip
+                                    // rendering above.
+                                    let _s_index = s.index;
+                                    let _s_tax_for_class = s.taxonomy.clone();
+                                    let _s_tax_for_selected = s.taxonomy.clone();
                                     li {
                                         key: s.id,
                                         id: suggest_option_id(s.id),
-                                        class: {if s.is_active { "combobox__opt is-active" } else { "combobox__opt" }},
+                                        class: {|| if terms.suggest_active.get().get(&_s_tax_for_class) == Some(&_s_index) { "combobox__opt is-active" } else { "combobox__opt" }},
                                         role: "option",
-                                        aria-selected: {if s.is_active { "true" } else { "false" }},
+                                        aria-selected: {|| if terms.suggest_active.get().get(&_s_tax_for_selected) == Some(&_s_index) { "true" } else { "false" }},
                                         onclick: {
                                             let s_id = s.id;
                                             let s_name = s.name.clone();
@@ -2373,6 +2586,8 @@ fn TaxonomyPanel(tax: api::TaxonomyDto, terms: TermsCtx) -> NodeHandle {
                                                 terms.tag_buffer.update(|m| { m.remove(&tax_key); });
                                                 terms.suggestions.update(|m| { m.remove(&tax_key); });
                                                 terms.terms_gen.update(|g| *g += 1);
+                                                // C15/Q5: announce the outcome.
+                                                terms.live_announce.set(format!("Added {s_name}"));
                                             }
                                         },
                                         {s.name.clone()}
@@ -2590,25 +2805,50 @@ fn load_templates(templates: Signal<Vec<api::TemplateOption>>, auth: AuthCtx) {
 /// SF17: after ANY failed save, invalidate the shared vocabulary so a staged chip
 /// that turns out to have already become real (a partial `apply_terms` failure can
 /// leave an earlier tag created-but-unassigned) re-renders solid on the next load,
-/// and View::Terms (S3) shows the truth. Resets `taxonomies` to empty — the SAME
-/// signal `load_vocab`'s own idempotency check reads — so the very next call
+/// and View::Terms (S3) shows the truth. Resets `vocab_load` back to its
+/// never-fetched default (C2's fix — see `load_vocab`'s guard) — the SAME signal
+/// `load_vocab`'s idempotency check now reads — so the very next call
 /// (`open_post`/`new_post`/`open_posts_list`) re-fetches for real, not a no-op.
+/// (`taxonomies`/`hierarchical_terms` are cleared too, purely so a panel rendered
+/// between this call and the immediately-following `load_vocab` never shows a
+/// stale vocabulary; `vocab_load` alone is what the guard reads.)
 fn invalidate_vocab(terms: TermsCtx) {
     terms.taxonomies.set(Vec::new());
     terms.hierarchical_terms.set(HashMap::new());
+    terms.vocab_load.set(VocabLoad::default());
+}
+
+/// Fetch every HIERARCHICAL taxonomy's full term tree (`?counts=0`) for a given
+/// taxonomy list — the one place this loop is written, shared by `load_vocab`'s
+/// own fetch and `open_terms_view`'s (review C3: two independently-written
+/// producers of `taxonomies`/`hierarchical_terms` is exactly what let one of them
+/// forget to populate the second field — never again duplicate this loop).
+async fn fetch_hierarchical_trees(
+    taxonomies: &[api::TaxonomyDto],
+) -> Result<HashMap<String, Vec<api::TermDto>>, api::ApiError> {
+    let mut trees: HashMap<String, Vec<api::TermDto>> = HashMap::new();
+    for tax in taxonomies.iter().filter(|t| t.hierarchical) {
+        let resp = api::list_terms(&tax.key, false, None, None).await?;
+        trees.insert(tax.key.clone(), resp.terms);
+    }
+    Ok(trees)
 }
 
 fn load_vocab(terms: TermsCtx, auth: AuthCtx) {
-    // `VocabLoad::Loading` is ALSO the enum's `#[default]` — i.e. the signal's
-    // own INITIAL value, not solely an "already fetching" flag — so gating on
-    // it here would make this fn's very FIRST-EVER call see "Loading" (from
-    // nothing having run yet, not from an in-flight fetch) and return without
-    // ever fetching (a real bug this once was). `taxonomies.get().is_empty()`
-    // alone is the correct idempotency guard: a rare, harmless duplicate
-    // concurrent fetch (e.g. `open_posts_list` and `new_post` firing in the
-    // same tick) just costs one extra request — `vocab_gen` (below) already
-    // ensures only the LATEST response is ever applied.
-    if !terms.taxonomies.get().is_empty() {
+    // C2 fix: guard on `vocab_load == Ready`, NOT `taxonomies.get().is_empty()`.
+    // The Vec-emptiness guard collapsed "never fetched" with "fetched and
+    // genuinely empty" (a real, reachable state — SF3's zero-taxonomies bootstrap
+    // case): a successful-but-empty fetch left `taxonomies` exactly as it
+    // started, so the OLD guard never engaged and every later call site
+    // (`open_post`/`new_post`/`open_posts_list`/`open_picker`) re-issued the
+    // fetch from scratch, flashing the panel to "Loading…" and back on every
+    // single post open for the rest of the session. `VocabLoad::Ready` is set
+    // ONLY on a genuine success (empty or not) and is never the signal's default
+    // (`Loading` is), so this guard correctly lets the very FIRST-EVER call
+    // through, correctly short-circuits every call after a real success, and
+    // correctly ALLOWS A RETRY after a failure (`Error` is not `Ready` either) —
+    // `invalidate_vocab` resets this same field for exactly this reason.
+    if terms.vocab_load.get() == VocabLoad::Ready {
         return;
     }
     terms.vocab_load.set(VocabLoad::Loading);
@@ -2628,24 +2868,19 @@ fn load_vocab(terms: TermsCtx, auth: AuthCtx) {
                 return;
             }
         };
-        let mut trees: HashMap<String, Vec<api::TermDto>> = HashMap::new();
-        for tax in taxonomies.iter().filter(|t| t.hierarchical) {
-            match api::list_terms(&tax.key, false, None, None).await {
-                Ok(resp) => {
-                    trees.insert(tax.key.clone(), resp.terms);
-                }
-                Err(api::ApiError::Unauthorized) => {
-                    auth.session_expired();
-                    return;
-                }
-                Err(api::ApiError::Message(_)) => {
-                    if terms.vocab_gen.get() == load_gen {
-                        terms.vocab_load.set(VocabLoad::Error);
-                    }
-                    return;
-                }
+        let trees = match fetch_hierarchical_trees(&taxonomies).await {
+            Ok(t) => t,
+            Err(api::ApiError::Unauthorized) => {
+                auth.session_expired();
+                return;
             }
-        }
+            Err(api::ApiError::Message(_)) => {
+                if terms.vocab_gen.get() == load_gen {
+                    terms.vocab_load.set(VocabLoad::Error);
+                }
+                return;
+            }
+        };
         // A later `load_vocab` call (e.g. a fast Posts-list -> new-post sequence)
         // already superseded this one — never let a slow response win.
         if terms.vocab_gen.get() != load_gen {
@@ -2844,6 +3079,16 @@ fn panel_error_text(tax: &api::TaxonomyDto) -> String {
 fn panel_empty_text(tax: &api::TaxonomyDto) -> String {
     format!("No {} exist yet.", tax.label.to_lowercase())
 }
+/// C14: DISTINCT from `panel_empty_text` — the vocabulary is real and loaded,
+/// the current filter text just doesn't match any of it. Conflating this with
+/// "no {taxonomy} exist yet" (the SAME predicate, `checklist_is_empty`, used
+/// to gate both before this fix) falsely told the author their whole taxonomy
+/// was never set up, the moment a search simply missed. Mirrors the picker's
+/// OWN "No matching categories."/"No matching tags." wording for the
+/// analogous situation.
+fn panel_no_match_text(tax: &api::TaxonomyDto) -> String {
+    format!("No matching {}.", tax.label.to_lowercase())
+}
 fn panel_tag_label(tax: &api::TaxonomyDto) -> String {
     format!("Add a {}", singularize(&tax.label))
 }
@@ -2886,6 +3131,18 @@ fn filter_text(terms: TermsCtx, key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// C17: the search box's OWN controlled value — the immediate,
+/// never-debounced buffer, so typing never visibly lags even though the
+/// actual row-filtering (`filter_text`) only catches up after a pause.
+fn filter_raw_text(terms: TermsCtx, key: &str) -> String {
+    terms
+        .checklist_filter_raw
+        .get()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn buffer_text(terms: TermsCtx, key: &str) -> String {
     terms.tag_buffer.get().get(key).cloned().unwrap_or_default()
 }
@@ -2901,6 +3158,14 @@ struct ChipVm {
     id: u64,
     name: String,
     oov: bool,
+    /// C12: true when this chip is what a first Backspace-on-empty-buffer
+    /// press SELECTED for removal — baked into the VM (the
+    /// `checklist_row_vms` precedent: a for-item's OWN field, populated once
+    /// when the Vec is built by the iter_expr, never re-derived inside a
+    /// per-row reactive attribute closure) so the chipline's `for` reactively
+    /// rebuilds this flag whenever `backspace_selected` changes, simply by
+    /// also reading that signal in its OWN iter_expr call.
+    pending_remove: bool,
 }
 
 fn chip_vms(
@@ -2909,11 +3174,13 @@ fn chip_vms(
     sidecar: &HashMap<u64, api::TermRefDto>,
     taxonomy: &str,
     hierarchical: bool,
+    backspace_selected: &HashMap<String, StagedOrAssigned>,
 ) -> Vec<ChipVm> {
     let in_vocab: HashSet<u64> = hierarchical_terms
         .get(taxonomy)
         .map(|v| v.iter().map(|t| t.id).collect())
         .unwrap_or_default();
+    let pending = backspace_selected.get(taxonomy).copied();
     chip_ids_for_taxonomy(selected, hierarchical_terms, sidecar, taxonomy)
         .into_iter()
         .map(|id| {
@@ -2925,6 +3192,7 @@ fn chip_vms(
                 id,
                 name,
                 oov: hierarchical && !in_vocab.contains(&id),
+                pending_remove: pending == Some(StagedOrAssigned::Assigned(id)),
             }
         })
         .collect()
@@ -2942,6 +3210,15 @@ fn checklist_is_empty(terms: TermsCtx, taxonomy: &str) -> bool {
         taxonomy,
     )
     .is_empty()
+}
+
+/// C14: whether the RAW vocabulary itself (ignoring any filter text) has no
+/// terms — distinct from [`checklist_is_empty`], which also returns `true`
+/// when a non-empty vocabulary's filter simply matches nothing. Conflating
+/// the two made typing a non-matching search claim "No {taxonomy} exist
+/// yet." over a taxonomy that plainly does exist and is loaded.
+fn taxonomy_vocab_is_empty(terms: TermsCtx, taxonomy: &str) -> bool {
+    hier_vocab(terms, taxonomy).is_empty()
 }
 
 /// One checklist row, ready to render (SF15c: still just `TermDto`'s own fields plus
@@ -2975,35 +3252,66 @@ fn checklist_row_vms(vocab: &[api::TermDto], filter: &str, taxonomy: &str) -> Ve
 }
 
 /// One tag suggestion, ready to render. Carries its own `taxonomy` copy — see
-/// `ChecklistRowVm`'s identical doc comment.
+/// `ChecklistRowVm`'s identical doc comment. Review C6: deliberately carries
+/// `index` (this item's stable position in the CURRENT suggestion list), not
+/// an `is_active: bool` — the binding design's Q5 answer is explicit that the
+/// active-row highlight must be "a per-row `class:` closure, no list
+/// rebuild", i.e. driven by an independent reactive read of
+/// `terms.suggest_active` at render time, never baked into the VM the
+/// keyed `for`'s `PartialEq` reconciliation compares (which would make an
+/// arrow-key press — which only changes `suggest_active`, a signal this
+/// struct no longer depends on at all — dispose and recreate the (at most
+/// two) rows whose highlight flips, instead of patching an attribute in
+/// place).
 #[derive(Clone, PartialEq)]
 struct SuggestVm {
     id: u64,
     name: String,
     slug: String,
-    is_active: bool,
+    index: usize,
     taxonomy: String,
 }
 
-fn suggest_vms(list: &[api::TermDto], active: Option<usize>, taxonomy: &str) -> Vec<SuggestVm> {
+fn suggest_vms(list: &[api::TermDto], taxonomy: &str) -> Vec<SuggestVm> {
     list.iter()
         .enumerate()
         .map(|(i, t)| SuggestVm {
             id: t.id,
             name: t.name.clone(),
             slug: t.slug.clone(),
-            is_active: active == Some(i),
+            index: i,
             taxonomy: taxonomy.to_owned(),
         })
         .collect()
 }
 
-/// Every staged (pending-create) chip belonging to `taxonomy`, in insertion order.
-fn staged_for_taxonomy(staged: &[StagedTag], taxonomy: &str) -> Vec<StagedTag> {
+/// The rendering view of one staged chip — `StagedTag` plus C12's
+/// `pending_remove` flag, the SAME baked-into-the-VM discipline as
+/// [`ChipVm::pending_remove`] (never re-derived inside a per-row reactive
+/// attribute closure).
+#[derive(Clone, PartialEq)]
+struct StagedChipVm {
+    cid: u64,
+    name: String,
+    rejected: bool,
+    pending_remove: bool,
+}
+
+fn staged_chip_vms(
+    staged: &[StagedTag],
+    taxonomy: &str,
+    backspace_selected: &HashMap<String, StagedOrAssigned>,
+) -> Vec<StagedChipVm> {
+    let pending = backspace_selected.get(taxonomy).copied();
     staged
         .iter()
         .filter(|s| s.taxonomy == taxonomy)
-        .cloned()
+        .map(|s| StagedChipVm {
+            cid: s.cid,
+            name: s.name.clone(),
+            rejected: s.rejected,
+            pending_remove: pending == Some(StagedOrAssigned::Staged(s.cid)),
+        })
         .collect()
 }
 
@@ -3068,6 +3376,9 @@ fn commit_one_tag(terms: TermsCtx, taxonomy: &str, raw: &str) {
         .cloned();
     match reuse {
         Some(t) => {
+            // C15/Q5: an EXISTING term reused verbatim — announce it plainly,
+            // matching the checklist checkbox's own "Added X" wording.
+            terms.live_announce.set(format!("Added {}", t.name));
             terms.selected_ids.update(|s| {
                 s.insert(t.id);
             });
@@ -3091,11 +3402,18 @@ fn commit_one_tag(terms: TermsCtx, taxonomy: &str, raw: &str) {
             if !already_staged {
                 let cid = terms.next_staged_cid.get();
                 terms.next_staged_cid.set(cid + 1);
+                let name = raw.trim().to_owned();
+                // C15/Q5: the ruling's own quoted example wording —
+                // distinct from "Added X" since nothing exists server-side
+                // yet.
+                terms
+                    .live_announce
+                    .set(format!("New tag {name} will be created when you save."));
                 terms.staged.update(|v| {
                     v.push(StagedTag {
                         cid,
                         taxonomy: taxonomy.to_owned(),
-                        name: raw.trim().to_owned(),
+                        name,
                         rejected: false,
                     })
                 });
@@ -3202,6 +3520,30 @@ fn reseed_terms(
     terms.missing_term_notice.set(None);
 }
 
+/// Review C10/Q3(c): translates the server's per-taxonomy `multiple=false` cap 400
+/// (`ferropress-http::admin::posts::check_multiple_cap`: `taxonomy "{key}" accepts a
+/// single term per post; got {members}`) into human copy — an author must never see
+/// that raw string verbatim. `None` when `message` isn't this shape (surfaces
+/// verbatim, same as any other unrecognized failure). Unreachable today with the
+/// tooling this repo ships (no taxonomy is ever created `multiple: false`), but the
+/// design ruling frames this as forward-looking, not something to skip because it
+/// can't be exercised yet.
+fn multiple_cap_message(message: &str, taxonomies: &[api::TaxonomyDto]) -> Option<String> {
+    let rest = message.strip_prefix("taxonomy \"")?;
+    let (key, rest) = rest.split_once('"')?;
+    if !rest.starts_with(" accepts a single term per post; got ") {
+        return None;
+    }
+    let label = taxonomy_label(taxonomies, key);
+    let noun = {
+        let s = singularize(&label);
+        if s.is_empty() { "item".to_owned() } else { s }
+    };
+    Some(format!(
+        "Only one {noun} can be assigned to this post \u{2014} uncheck the extras and save again."
+    ))
+}
+
 /// Extracts the term id from the server's `"term {id} does not exist"` 400 (B10b) —
 /// the ONE error shape this needs to recognize to offer the removed-it-for-you
 /// recovery. Any other message (including the sibling "term {id} has no taxonomy" —
@@ -3236,7 +3578,33 @@ fn rejected_tag_slug(message: &str) -> Option<String> {
 // iteration + slug compare, verified by reading rather than by a live 409.
 #[cfg(test)]
 mod tests {
-    use super::{RowKind, candidate_kind_of, rejected_tag_slug};
+    use super::{
+        RowKind, TermsCtx, VocabLoad, api, candidate_kind_of, multiple_cap_message,
+        rejected_tag_slug, resolve_delete_term_identity, seed_terms,
+    };
+
+    fn taxonomy(id: u64, key: &str, label: &str) -> api::TaxonomyDto {
+        api::TaxonomyDto {
+            id,
+            key: key.to_owned(),
+            label: label.to_owned(),
+            hierarchical: false,
+            multiple: false,
+        }
+    }
+
+    fn term(id: u64, name: &str, parent: Option<u64>) -> api::TermDto {
+        api::TermDto {
+            id,
+            slug: String::new(),
+            name: name.to_owned(),
+            description: String::new(),
+            parent,
+            depth: 0,
+            count: 0,
+            rev: 0,
+        }
+    }
 
     // S4/B3: an EXHAUSTIVE table over every `LinkCandidate::kind` string the
     // server can send, plus a genuinely unrecognized one — the regression
@@ -3289,6 +3657,109 @@ mod tests {
             None
         );
         assert_eq!(rejected_tag_slug(""), None);
+    }
+
+    // Review C4: `seed_terms` runs on EVERY document switch (`open_post`/
+    // `new_post`) and must invalidate any suggestion fetch still in flight
+    // for the PREVIOUS document — `load_suggestions` only guards against a
+    // slower response for the SAME document (`suggest_gen` unchanged), so a
+    // reseed that forgot to bump it would let a stale "myst" response for
+    // Post A silently populate (and be clickable into) Post B's Tags panel.
+    #[test]
+    fn seed_terms_bumps_suggest_gen_so_a_stale_fetch_cannot_attach_to_the_new_document() {
+        let terms = TermsCtx::default();
+        terms.suggest_gen.set(5);
+        seed_terms(terms, &[]);
+        assert_ne!(
+            terms.suggest_gen.get(),
+            5,
+            "seed_terms must bump suggest_gen on every document switch"
+        );
+    }
+
+    // Review C2: `load_vocab`'s idempotency guard reads `vocab_load ==
+    // Ready`, never the taxonomies Vec's emptiness — the fix depends on
+    // `VocabLoad`'s default NOT being `Ready` (else the guard would
+    // wrongly skip the very first-ever fetch) and on `Ready` being reachable
+    // only via a genuine successful load. This pins that invariant down so a
+    // future edit to the enum's `#[default]` fails a test, not silently
+    // reintroduces the never-fetched-vs-empty bug.
+    #[test]
+    fn vocab_load_default_is_not_ready() {
+        assert_ne!(VocabLoad::default(), VocabLoad::Ready);
+    }
+
+    // Review C8/C11: the delete-confirm's name/destination must come from the
+    // term's STORED data, never a live, possibly-unsaved edit — even when the
+    // live values differ from what's stored (the exact dirty-then-delete
+    // sequence the finding describes).
+    #[test]
+    fn delete_term_identity_prefers_stored_over_a_dirty_live_edit() {
+        let list = vec![
+            term(1, "Fiction", None),
+            term(2, "Engine Room", None),
+            term(3, "Sea Stories", Some(1)),
+        ];
+        // The user changed the Name field and the Parent dropdown to id 2
+        // ("Engine Room") but never clicked Save — the term's REAL stored
+        // name/parent (what the server will actually re-home children under)
+        // is still "Sea Stories" / id 1 ("Fiction").
+        let (name, parent) = resolve_delete_term_identity(
+            3,
+            &list,
+            "Renamed In Progress".to_owned(),
+            Some(2),
+        );
+        assert_eq!(name, "Sea Stories");
+        assert_eq!(parent, Some(1));
+    }
+
+    #[test]
+    fn delete_term_identity_falls_back_to_live_when_the_term_is_not_in_the_loaded_list() {
+        let list = vec![term(1, "Fiction", None)];
+        let (name, parent) = resolve_delete_term_identity(99, &list, "Only Known Locally".to_owned(), Some(1));
+        assert_eq!(name, "Only Known Locally");
+        assert_eq!(parent, Some(1));
+    }
+
+    // Review C10/Q3(c): the raw server string must never reach an author
+    // verbatim — this is the ONE recognized shape that gets translated.
+    #[test]
+    fn multiple_cap_message_translates_the_exact_server_shape() {
+        let taxonomies = vec![taxonomy(1, "category", "Categories")];
+        let msg = multiple_cap_message(
+            "taxonomy \"category\" accepts a single term per post; got 2",
+            &taxonomies,
+        );
+        assert_eq!(
+            msg.as_deref(),
+            Some("Only one category can be assigned to this post \u{2014} uncheck the extras and save again.")
+        );
+    }
+
+    #[test]
+    fn multiple_cap_message_falls_back_to_one_for_an_unknown_taxonomy_key() {
+        let msg = multiple_cap_message(
+            "taxonomy \"mystery\" accepts a single term per post; got 3",
+            &[],
+        );
+        assert_eq!(
+            msg.as_deref(),
+            Some("Only one item can be assigned to this post \u{2014} uncheck the extras and save again.")
+        );
+    }
+
+    #[test]
+    fn multiple_cap_message_is_none_for_an_unrelated_message() {
+        assert_eq!(multiple_cap_message("term 5 does not exist", &[]), None);
+        assert_eq!(
+            multiple_cap_message(
+                "the archive path \"tag/sea-glass\" is already used by a post or page",
+                &[]
+            ),
+            None
+        );
+        assert_eq!(multiple_cap_message("", &[]), None);
     }
 }
 
@@ -3345,6 +3816,16 @@ fn install_tag_buffer_guard(terms: TermsCtx) {
         else {
             return;
         };
+        // C12: any key OTHER than Backspace cancels a pending "chip selected
+        // for removal" state (B7's two-step mandate is specifically Backspace-
+        // Backspace; typing a character, committing via Enter, arrowing
+        // through suggestions, or Escaping must never leave a stale selection
+        // that a LATER, unrelated Backspace press could go on to remove).
+        if e.key() != "Backspace" {
+            terms.backspace_selected.update(|m| {
+                m.remove(&taxonomy);
+            });
+        }
         match e.key().as_str() {
             "Enter" => {
                 e.prevent_default();
@@ -3359,6 +3840,8 @@ fn install_tag_buffer_guard(terms: TermsCtx) {
                 });
                 match picked {
                     Some(t) => {
+                        // C15/Q5: announce the accepted suggestion.
+                        terms.live_announce.set(format!("Added {}", t.name));
                         terms.selected_ids.update(|s| {
                             s.insert(t.id);
                         });
@@ -3425,18 +3908,52 @@ fn install_tag_buffer_guard(terms: TermsCtx) {
                             .max()
                             .map(StagedOrAssigned::Assigned)
                     });
-                match last {
-                    Some(StagedOrAssigned::Staged(cid)) => {
-                        terms.staged.update(|v| v.retain(|s| s.cid != cid));
-                        terms.terms_gen.update(|g| *g += 1);
+                let Some(candidate) = last else {
+                    // Nothing left to select or remove — also clears any
+                    // (now-stale, since its chip is gone) prior selection.
+                    terms.backspace_selected.update(|m| {
+                        m.remove(&taxonomy);
+                    });
+                    return;
+                };
+                // B7's two-step (Gutenberg behaviour) — the ONLY keyboard
+                // route to chip removal, since the chip's `×` is pointer-only.
+                // First press: SELECT (highlight) the last chip, remove
+                // nothing yet. Second CONSECUTIVE press, with the buffer
+                // still empty and the candidate still the SAME chip (nothing
+                // else was staged/removed/typed in between — re-derived fresh
+                // above, never trusted stale): remove it for real.
+                let candidate_name = backspace_candidate_name(terms, candidate);
+                let already_selected = terms.backspace_selected.get().get(&taxonomy).copied();
+                if already_selected == Some(candidate) {
+                    match candidate {
+                        StagedOrAssigned::Staged(cid) => {
+                            terms.staged.update(|v| v.retain(|s| s.cid != cid));
+                            terms.terms_gen.update(|g| *g += 1);
+                        }
+                        StagedOrAssigned::Assigned(id) => {
+                            terms.selected_ids.update(|s| {
+                                s.remove(&id);
+                            });
+                            terms.terms_gen.update(|g| *g += 1);
+                        }
                     }
-                    Some(StagedOrAssigned::Assigned(id)) => {
-                        terms.selected_ids.update(|s| {
-                            s.remove(&id);
-                        });
-                        terms.terms_gen.update(|g| *g += 1);
-                    }
-                    None => {}
+                    terms.backspace_selected.update(|m| {
+                        m.remove(&taxonomy);
+                    });
+                    // C15/B7: the two-step's FINAL outcome.
+                    terms.live_announce.set(format!("Removed {candidate_name}"));
+                } else {
+                    terms.backspace_selected.update(|m| {
+                        m.insert(taxonomy.clone(), candidate);
+                    });
+                    // C15/B7: the two-step's FIRST press — B7 requires the
+                    // OUTCOME announced, and "selected, not yet removed" is
+                    // itself an outcome the user needs confirmed before
+                    // they commit to a second press.
+                    terms
+                        .live_announce
+                        .set(format!("{candidate_name} selected \u{2014} press Backspace again to remove"));
                 }
             }
             "ArrowDown" | "ArrowUp" => {
@@ -3516,6 +4033,13 @@ fn install_tag_buffer_guard(terms: TermsCtx) {
         terms.suggest_active.update(|m| {
             m.remove(&taxonomy);
         });
+        // C12 hygiene: leaving the field entirely clears a pending "chip
+        // selected for removal" too — coming back later and pressing
+        // Backspace again should always start a fresh first press, never
+        // silently remove a chip the user selected in a previous visit.
+        terms.backspace_selected.update(|m| {
+            m.remove(&taxonomy);
+        });
     });
     let _ = doc2.add_event_listener_with_callback("focusout", blur_cb.as_ref().unchecked_ref());
     blur_cb.forget();
@@ -3524,9 +4048,38 @@ fn install_tag_buffer_guard(terms: TermsCtx) {
 /// Which side of the assignment a Backspace-on-empty-buffer removes: the most
 /// recently staged new chip for this taxonomy, else the highest-id assigned term
 /// (a stable, if arbitrary, "most recent" proxy — assignment order isn't tracked).
+/// `Copy`/`PartialEq` (review C12): a taxonomy's `backspace_selected` entry is
+/// this same value, compared against the freshly-recomputed "last chip" on the
+/// SECOND press to confirm it's still the same chip before removing it.
+#[derive(Clone, Copy, PartialEq)]
 enum StagedOrAssigned {
     Staged(u64),
     Assigned(u64),
+}
+
+/// C15: the display name for a Backspace-selection candidate — a small
+/// `staged`/`sidecar` lookup, only ever needed to build the live-region
+/// announcement text. Falls back to a generic word rather than panicking or
+/// showing nothing if the id has somehow already fallen out of both maps
+/// (should not happen — `candidate` is always re-derived fresh from these
+/// SAME maps immediately before this is called — but a stale announcement
+/// beats a missing one).
+fn backspace_candidate_name(terms: TermsCtx, candidate: StagedOrAssigned) -> String {
+    match candidate {
+        StagedOrAssigned::Staged(cid) => terms
+            .staged
+            .get()
+            .iter()
+            .find(|s| s.cid == cid)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "the tag".to_owned()),
+        StagedOrAssigned::Assigned(id) => terms
+            .sidecar
+            .get()
+            .get(&id)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "the tag".to_owned()),
+    }
 }
 
 /// Whether the signed-in user is an Administrator — the only role that manages
@@ -3900,7 +4453,36 @@ fn seed_terms(terms: TermsCtx, seed: &[api::TermRefDto]) {
     terms.suggestions.set(HashMap::new());
     terms.suggest_active.set(HashMap::new());
     terms.missing_term_notice.set(None);
+    // Found live while verifying C4's own fix (a genuine, if narrower, sibling
+    // of the same bug class — cross-document transient-state leakage):
+    // `backspace_selected` (C12) is keyed by TAXONOMY, not by document, so a
+    // chip "selected" (first Backspace press, not yet removed) on the post
+    // being navigated AWAY from would otherwise survive into the new
+    // document. Since a candidate is re-validated fresh against THIS
+    // document's own `staged`/`sidecar` before acting, this can't silently
+    // remove the WRONG term in general — except a term id is a server-global
+    // identity, so if the new document's own last-assigned term HAPPENS to
+    // share the same id (the same popular tag assigned to both posts, an
+    // entirely realistic case), a single Backspace press here would read as
+    // "already selected" and remove it immediately — a real one-press
+    // surprise removal, not merely a stale highlight.
+    terms.backspace_selected.set(HashMap::new());
+    // Same reasoning, lower stakes but still wrong: `live_announce` (C15) is
+    // the shared live-region text — without resetting it, an announcement
+    // set on the OLD document (e.g. via B8's commit-on-blur firing during
+    // this very navigation) reads out an action for a document that is no
+    // longer open, to whoever is listening on the NEW one.
+    terms.live_announce.set(String::new());
     terms.terms_gen.update(|g| *g += 1);
+    // C4 fix: `load_suggestions` only guards a fetch against a SLOWER/OUT-OF-
+    // ORDER response for the SAME document (`suggest_gen`) — it has no way to
+    // know the document itself changed underneath it. Without this bump, a
+    // suggestion fetch started on the post being navigated AWAY from can land
+    // after this reseed and silently repopulate (and be clickable into) the
+    // NEW document's Tags panel, attaching a term nobody typed here to the
+    // wrong post. Bumping here — on every document switch, not just every
+    // keystroke — invalidates any such in-flight fetch immediately.
+    terms.suggest_gen.update(|g| *g += 1);
 }
 
 /// Open a page in the editor: fetch it, populate the meta fields (including the
@@ -4183,6 +4765,11 @@ fn save_post(ectx: EditorCtx) {
                 if stale {
                     return;
                 }
+                // C10/Q3(c): snapshot the vocab BEFORE `invalidate_vocab`
+                // blanks it below — `multiple_cap_message` needs the
+                // taxonomy's real label to build human copy, and by the time
+                // the fallback arm ran this otherwise reads an empty Vec.
+                let taxonomies_snapshot = terms.taxonomies.get();
                 // SF17: every failed save invalidates the vocab, regardless of
                 // WHY it failed — `apply_terms` mutates one tag at a time, so a
                 // partial failure can leave an earlier tag created-but-
@@ -4225,7 +4812,15 @@ fn save_post(ectx: EditorCtx) {
                     // chip instead of a global message next to every chip.
                     None => {
                         mark_rejected_staged_tag(terms, &e);
-                        notice.set(e);
+                        // C10/Q3(c): translate the multiple=false cap 400
+                        // into human copy — an author must never see the raw
+                        // server string. Falls through to the verbatim
+                        // message (unchanged, pre-existing behavior) for
+                        // every OTHER unrecognized shape.
+                        match multiple_cap_message(&e, &taxonomies_snapshot) {
+                            Some(human) => notice.set(human),
+                            None => notice.set(e),
+                        }
                     }
                 }
             }
@@ -4435,6 +5030,8 @@ fn preview_post(ectx: EditorCtx) {
                 if stale {
                     return;
                 }
+                // C10 — snapshot BEFORE invalidate, see the identical note in `save_post`.
+                let taxonomies_snapshot = terms.taxonomies.get();
                 // SF17 — see the identical note in `save_post`.
                 invalidate_vocab(terms);
                 load_vocab(terms, auth);
@@ -4455,7 +5052,11 @@ fn preview_post(ectx: EditorCtx) {
                     }
                     None => {
                         mark_rejected_staged_tag(terms, &e);
-                        notice.set(e);
+                        // C10 — see the identical note in `save_post`.
+                        match multiple_cap_message(&e, &taxonomies_snapshot) {
+                            Some(human) => notice.set(human),
+                            None => notice.set(e),
+                        }
                     }
                 }
             }
@@ -5209,13 +5810,31 @@ fn open_terms_view(tv: TermsViewCtx) {
     tv.list_state.set(Load::Loading);
     let keep = tv.active_taxonomy.get();
     spawn_local(async move {
-        let taxonomies = if tv.terms.taxonomies.get().is_empty() {
+        // C3/C2: mirrors `load_vocab`'s OWN guard (`vocab_load == Ready`, not
+        // `taxonomies.is_empty()` — the same never-fetched-vs-genuinely-empty
+        // fix) and its SAME `fetch_hierarchical_trees` call, so this is no
+        // longer a second, independent implementation that can (and did)
+        // forget to populate `hierarchical_terms` alongside `taxonomies`.
+        let taxonomies = if tv.terms.vocab_load.get() != VocabLoad::Ready {
             match api::list_taxonomies().await {
-                Ok(v) => {
-                    tv.terms.taxonomies.set(v.clone());
-                    tv.terms.vocab_load.set(VocabLoad::Ready);
-                    v
-                }
+                Ok(v) => match fetch_hierarchical_trees(&v).await {
+                    Ok(trees) => {
+                        tv.terms.taxonomies.set(v.clone());
+                        tv.terms.hierarchical_terms.set(trees);
+                        tv.terms.vocab_load.set(VocabLoad::Ready);
+                        v
+                    }
+                    Err(api::ApiError::Unauthorized) => {
+                        tv.auth.session_expired();
+                        return;
+                    }
+                    Err(api::ApiError::Message(e)) => {
+                        tv.terms.vocab_load.set(VocabLoad::Error);
+                        tv.list_state.set(Load::Error);
+                        tv.notice.set(e);
+                        return;
+                    }
+                },
                 Err(api::ApiError::Unauthorized) => {
                     tv.auth.session_expired();
                     return;
@@ -5251,15 +5870,29 @@ fn open_terms_view(tv: TermsViewCtx) {
 
 /// Fetch one taxonomy's full term list WITH counts and apply it — the shared
 /// body behind `open_terms_view`'s initial load, a tab switch, and the
-/// post-mutation refresh.
+/// post-mutation refresh. C5's fix: bumps + captures `term_list_gen` BEFORE
+/// the fetch and re-checks it after — the `vocab_gen`/`candidates_gen` idiom.
+/// Two of these can be in flight together (a fast tab switch firing request B
+/// before request A resolves); without the guard, whichever RESOLVES LAST
+/// wins regardless of which taxonomy tab is actually active by then, silently
+/// mislabeling `tv.list` under the wrong taxonomy's heading. The bump lives
+/// HERE (not at each call site) so every caller gets the guard for free.
 async fn load_term_list(tv: TermsViewCtx, key: String) {
+    let load_gen = tv.term_list_gen.get() + 1;
+    tv.term_list_gen.set(load_gen);
     match api::list_terms(&key, true, None, None).await {
         Ok(resp) => {
+            if tv.term_list_gen.get() != load_gen {
+                return;
+            }
             tv.list.set(resp.terms);
             tv.list_state.set(Load::Ready);
         }
         Err(api::ApiError::Unauthorized) => tv.auth.session_expired(),
         Err(api::ApiError::Message(e)) => {
+            if tv.term_list_gen.get() != load_gen {
+                return;
+            }
             tv.notice.set(e);
             tv.list_state.set(Load::Error);
         }
@@ -5418,6 +6051,18 @@ fn save_term(tv: TermsViewCtx) {
                     focus_field("term-editor-slug");
                 }
                 tv.notice.set(e);
+                // C9/SF10: a re-parent 400/409 must "surface verbatim AND
+                // trigger a term-list reload before retry" — without this,
+                // the Parent <select>'s option set (and, if the user backs
+                // out to Delete instead, the blast-radius child-count/
+                // destination text) stays frozen at whatever `tv.list` was
+                // when the form opened, through any number of failed
+                // retries, silently inviting a re-pick of the same stale
+                // (now-invalid) option. Stays ON TermEditor — never the
+                // success path's `view.set(View::Terms)` navigation — a
+                // background reload of the SAME taxonomy's list.
+                let key = tv.edit_taxonomy.get();
+                load_term_list(tv, key).await;
             }
         }
     });
@@ -5431,6 +6076,30 @@ fn save_term(tv: TermsViewCtx) {
 /// to). The server re-checks the same per-sibling-slug/archive-path invariants
 /// a re-parent would and 409s (naming the offending child) rather than
 /// silently breaking them; that message is surfaced verbatim (SF13).
+/// Review C8/C11: the delete-confirm dialog's label and "moves to X" text must
+/// describe the term's ACTUAL STORED name/parent — `list` (already loaded,
+/// authoritative) — never a live, possibly-unsaved form signal. The server's
+/// own re-home logic reads the term's real DB-stored parent, completely
+/// unaffected by any unsaved client-side edit, so building the confirm text
+/// from the live signal can make the dialog and the server's real action name
+/// two different destinations for the exact same delete. Pulled out as a pure
+/// function (a Vec lookup, no signals) so this exact resolution rule is
+/// directly unit-testable without a DOM/`confirm()` harness. Falls back to the
+/// live values ONLY if the term has somehow fallen out of the loaded list (a
+/// stale-list edge case, not the normal path) — there is no other
+/// authoritative source then, and showing something is better than a blank.
+fn resolve_delete_term_identity(
+    id: u64,
+    list: &[api::TermDto],
+    live_name: String,
+    live_parent: Option<u64>,
+) -> (String, Option<u64>) {
+    match list.iter().find(|t| t.id == id) {
+        Some(stored) => (stored.name.clone(), stored.parent),
+        None => (live_name, live_parent),
+    }
+}
+
 fn delete_term_clicked(tv: TermsViewCtx) {
     if tv.saving.get() {
         return;
@@ -5439,8 +6108,15 @@ fn delete_term_clicked(tv: TermsViewCtx) {
         return;
     };
     let list = tv.list.get();
-    let name = tv.edit_name.get();
-    let parent = tv.edit_parent.get();
+    // Review C8/C11 (one root cause): the confirm dialog's label AND its
+    // "moves to X" destination must reflect the term's ACTUAL STORED
+    // name/parent, never the LIVE `tv.edit_name`/`tv.edit_parent` form
+    // signals an unsaved in-progress edit (change Parent, then click Delete
+    // instead of Save) would otherwise leak in — the server re-homes
+    // children to the term's REAL stored parent regardless, so a confirm
+    // built from the dirty edit would promise a destination the delete
+    // won't actually honor. See `resolve_delete_term_identity`'s own doc.
+    let (name, parent) = resolve_delete_term_identity(id, &list, tv.edit_name.get(), tv.edit_parent.get());
     // SF14e: name the taxonomy actually being deleted — a Tag's confirm must
     // not say "category". The taxonomy's OWN `label` is already its natural
     // plural (WP convention — "Categories"/"Tags"), so the plural noun is

@@ -151,8 +151,15 @@ const ADMIN_CSS: &str = r#"
 /* ── MASTHEAD ─────────────────────────────────────────────────────── */
 .masthead { background: var(--ink); color: #E7E8E2; border-bottom: 1px solid #000; }
 .masthead__bar {
-  display: flex; align-items: center; gap: 1rem; padding: 0 1.25rem;
-  height: 52px; max-width: 68rem; margin: 0 auto;
+  /* C16/SF14(b): this row now carries an eighth item ("Categories", added
+     alongside "Menus" in Inc-3) for an Administrator, on top of the
+     brand/separator/location text — `flex-wrap` (a `min-height`, not a fixed
+     `height`, so a wrapped second line can actually grow the bar rather than
+     being clipped by it) is the fix SF14(b) already called for and flagged as
+     overdue; `row-gap` gives a wrapped second line the same breathing room
+     `gap` already gives items along one line. */
+  display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; row-gap: .5rem;
+  padding: .5rem 1.25rem; min-height: 52px; max-width: 68rem; margin: 0 auto;
 }
 .masthead__brand {
   display: flex; align-items: center; gap: .5rem; font-family: var(--ff-display);
@@ -268,6 +275,14 @@ const ADMIN_CSS: &str = r#"
    block flow (the panels render in normal DOM order, below the sheet). */
 .editor__body { display: block; }
 .editor__below { max-width: calc(var(--measure) + 6rem); margin: 1.5rem auto 0; }
+/* C15: visually-hidden but still reachable by assistive tech — the standard
+   clip-based pattern (display:none would pull it from the accessibility tree
+   too, defeating an aria-live region entirely). Backs the chip/checkbox/tag
+   action announcements B7 and Q5 both require. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 @media (min-width: 1280px) {
   .editor__body {
     display: grid; grid-template-columns: 1fr 19rem; gap: 1.75rem; align-items: start;
