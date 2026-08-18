@@ -96,6 +96,13 @@ pub struct ResolvedTarget {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
+    /// S4 fix-forward: a `Term` target's OWNING TAXONOMY's display label
+    /// (`"Categories"`, `"Tags"`) — Post/Page/Custom leave this `None`. Exists
+    /// so the admin's row "kind" stamp can show the real taxonomy name instead
+    /// of the literal word "Term" (SF14e) without a second round-trip; the
+    /// SAME `AppState::taxonomies` snapshot `title`/`href` already read below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taxonomy_label: Option<String>,
 }
 
 /// One menu item on the wire — used BOTH in the GET response and the whole-tree
@@ -294,22 +301,28 @@ async fn resolve_item_displays(
                 Some(posts.get(id).cloned().unwrap_or_else(|| ResolvedTarget {
                     title: format!("Post #{id} (deleted)"),
                     href: None,
+                    taxonomy_label: None,
                 }))
             }
             LinkTarget::Page { id } => {
                 Some(pages.get(id).cloned().unwrap_or_else(|| ResolvedTarget {
                     title: format!("Page #{id} (deleted)"),
                     href: None,
+                    taxonomy_label: None,
                 }))
             }
             LinkTarget::Term { id } => Some(match taxonomies.term(*id) {
                 Some(entry) => ResolvedTarget {
                     title: entry.name.clone(),
                     href: taxonomies.archive_href(*id),
+                    taxonomy_label: taxonomies
+                        .taxonomy(&entry.taxonomy_key)
+                        .map(|t| t.label.clone()),
                 },
                 None => ResolvedTarget {
                     title: format!("Term #{id} (deleted)"),
                     href: None,
+                    taxonomy_label: None,
                 },
             }),
             // A Custom item's URL is its target; no sidecar needed.
@@ -345,7 +358,14 @@ async fn fetch_display_map(
         } else {
             None
         };
-        map.insert(obj.id.0, ResolvedTarget { title, href });
+        map.insert(
+            obj.id.0,
+            ResolvedTarget {
+                title,
+                href,
+                taxonomy_label: None,
+            },
+        );
     }
     Ok(map)
 }

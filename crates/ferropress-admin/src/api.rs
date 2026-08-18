@@ -1006,6 +1006,12 @@ pub struct ResolvedTarget {
     pub title: String,
     #[serde(default)]
     pub href: Option<String>,
+    /// S4 fix-forward: a `Term` target's owning taxonomy's display label
+    /// ("Categories"/"Tags") — `None` for Post/Page/Custom, or an
+    /// unresolvable (deleted) term. Lets the row's kind stamp show the real
+    /// taxonomy name instead of the literal word "Term" (SF14e).
+    #[serde(default)]
+    pub taxonomy_label: Option<String>,
 }
 
 /// One menu item on the wire — the GET response shape AND the whole-tree PUT body.

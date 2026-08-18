@@ -3230,6 +3230,13 @@ async fn menu_item_resolved_sidecar_names_and_links_targets() {
     let term_item = by_target_id("term", term_id.0);
     assert_eq!(term_item["resolved"]["title"], "Fiction");
     assert_eq!(term_item["resolved"]["href"], "/category/fiction");
+    // S4 fix-forward: the OWNING TAXONOMY's own label rides along too, so the
+    // admin's row "kind" stamp can show it instead of the literal word "Term"
+    // (SF14e) — `seed_taxonomy` sets `label` == `key` ("category") here.
+    assert_eq!(
+        term_item["resolved"]["taxonomy_label"], "category",
+        "{term_item}"
+    );
 
     // B2(a): an unresolvable term id mirrors the Post/Page "(deleted)" fallback
     // exactly — never an error, never the placeholder title, never a stray href.
@@ -3242,6 +3249,14 @@ async fn menu_item_resolved_sidecar_names_and_links_targets() {
         deleted_item["resolved"]["href"].is_null(),
         "an unresolvable term must resolve NO href: {deleted_item}"
     );
+    assert!(
+        deleted_item["resolved"]["taxonomy_label"].is_null(),
+        "an unresolvable term has no taxonomy to name either: {deleted_item}"
+    );
+
+    // Post/Page keep NO taxonomy_label — the field only ever appears for Term.
+    assert!(post_item["resolved"]["taxonomy_label"].is_null());
+    assert!(page_item["resolved"]["taxonomy_label"].is_null());
 }
 
 // ---------------------------------------------------------------------------
