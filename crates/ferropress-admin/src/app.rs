@@ -38,6 +38,11 @@ enum View {
     Menus,
     /// Editing ONE menu's item tree (the reorderable forest + the add-item picker).
     MenuEditor,
+    /// The taxonomy "cabinet": a taxonomy switcher + the active taxonomy's flat-with-
+    /// depth term list (mirrors `View::Menus`).
+    Terms,
+    /// Creating or editing ONE term (Name/Slug/Description/Parent/Delete).
+    TermEditor,
 }
 
 /// Which content type the shared List + Editor views are working on. Posts are flat
@@ -395,6 +400,55 @@ impl Default for TermsCtx {
     }
 }
 
+/// `View::Terms` (the taxonomy management list + switcher) and `View::TermEditor`
+/// (the create/edit form) — a separate bundle from `TermsCtx` (which is the post
+/// editor's OWN vocabulary + assignment state): this is the taxonomy MANAGEMENT
+/// surface, with its own list (fetched WITH counts — `TermsCtx::hierarchical_terms`
+/// is deliberately the `?counts=0` cheap mode the post editor's checklist needs, a
+/// different request), its own create/edit form fields, and its own dirty/save
+/// state (SF16). `terms: TermsCtx` rides along only so a term
+/// create/update/delete can invalidate the shared vocabulary the post editor reads
+/// (`invalidate_vocab`) — this view never touches `terms`'s OWN assignment fields.
+#[derive(Clone, Copy)]
+struct TermsViewCtx {
+    // View::Terms — the switcher + list.
+    /// The active taxonomy's KEY (which tab is showing). Never a raw index: the
+    /// server-sorted taxonomy list is the source of truth, and a key survives a
+    /// vocabulary reload that a positional index wouldn't.
+    active_taxonomy: Signal<String>,
+    list: Signal<Vec<api::TermDto>>,
+    list_state: Signal<Load>,
+
+    // View::TermEditor — the create/edit form. `edit_id: None` = create.
+    edit_id: Signal<Option<u64>>,
+    /// The taxonomy this term belongs to (fixed for the life of one editor visit —
+    /// a term never moves taxonomies). Also determines the Parent field's presence
+    /// (flat taxonomies have none).
+    edit_taxonomy: Signal<String>,
+    edit_name: Signal<String>,
+    /// SF11: `None` on CREATE (empty field, "auto from name" placeholder, NOT
+    /// controlled — matches the post/page slug idiom); `Some(current slug)` on
+    /// EDIT (pre-filled, controlled — an edit's empty slug means "keep the
+    /// current one" server-side, so the UI must show what that current one IS,
+    /// never silently re-derive from a changed name).
+    edit_slug: Signal<String>,
+    edit_description: Signal<String>,
+    edit_parent: Signal<Option<u64>>,
+    /// SF12: `meta._rev` as loaded/last-saved, snapshotted and echoed back as
+    /// `expected_rev` — the server 409s a stale save rather than silently
+    /// reverting a rename/re-parent that happened elsewhere.
+    edit_rev: Signal<i64>,
+    saving: Signal<bool>,
+    /// SF16: sibling to the menu editor's own `dirty`/beforeunload guard.
+    dirty: Signal<bool>,
+
+    terms: TermsCtx,
+    view: Signal<View>,
+    notice: Signal<String>,
+    toast: Signal<bool>,
+    auth: AuthCtx,
+}
+
 /// The post editor's per-document signals, bundled so `open_post`/`new_post`/
 /// `save_post`/`preview_post` take ONE parameter instead of nine-plus loose ones
 /// (B5) — `terms` (the taxonomy half) rides along so every seed/save/reseed path
@@ -539,6 +593,28 @@ pub fn app() -> NodeHandle {
         toast,
         auth,
     };
+    // Taxonomy MANAGEMENT (View::Terms/TermEditor) — a separate bundle from
+    // `terms` (the post editor's own vocabulary + assignment state); see
+    // `TermsViewCtx`'s own doc comment.
+    let terms_view = TermsViewCtx {
+        active_taxonomy: Signal::new(String::new()),
+        list: Signal::new(Vec::<api::TermDto>::new()),
+        list_state: Signal::new(Load::Loading),
+        edit_id: Signal::new(Option::<u64>::None),
+        edit_taxonomy: Signal::new(String::new()),
+        edit_name: Signal::new(String::new()),
+        edit_slug: Signal::new(String::new()),
+        edit_description: Signal::new(String::new()),
+        edit_parent: Signal::new(Option::<u64>::None),
+        edit_rev: Signal::new(0i64),
+        saving: Signal::new(false),
+        dirty: Signal::new(false),
+        terms,
+        view,
+        notice,
+        toast,
+        auth,
+    };
     // The B7 keyboard mechanism: Enter/Backspace/Arrow/Escape for EVERY tag
     // token-input, from one document-level listener target-gated on
     // `data-fp-tagbuffer` (never `onkeydown:`/`onsubmit:` in rsx — rinch's event map
@@ -581,7 +657,14 @@ pub fn app() -> NodeHandle {
     };
     // Guard a browser tab-close/reload while a menu edit is unsaved (the in-app exit
     // paths are guarded by a confirm; this catches the ones the app can't intercept).
-    install_beforeunload_guard(menu.dirty, menu.view);
+    // SF16 widens this to also cover an unsaved View::TermEditor.
+    install_beforeunload_guard(
+        menu.view,
+        vec![
+            (menu.dirty, View::MenuEditor),
+            (terms_view.dirty, View::TermEditor),
+        ],
+    );
     // Escape closes the add-item picker.
     install_escape_guard(menu.picker_open);
 
@@ -742,13 +825,19 @@ pub fn app() -> NodeHandle {
                                     "Posts"
                                 }
                             }
-                            // Menus is Editor+ (the ManageMenus capability). Shown to
-                            // Editors and Administrators; the server enforces it regardless.
-                            if can_manage_menus(&me_user.get()) {
+                            // Menus + Categories are BOTH Editor+ (ManageMenus /
+                            // ManageTerms — identical role sets), sharing one
+                            // predicate (Q1). The server enforces regardless.
+                            if is_editor_plus(&me_user.get()) {
                                 button {
                                     class: "btn btn--quiet",
                                     onclick: move || open_menus(menu),
                                     "Menus"
+                                }
+                                button {
+                                    class: "btn btn--quiet",
+                                    onclick: move || open_terms_view(terms_view),
+                                    "Categories"
                                 }
                             }
                             // Plugins + Settings are Administrator-only; hide the nav
@@ -1484,6 +1573,223 @@ pub fn app() -> NodeHandle {
                         }
                     }
                 },
+
+                // ── TAXONOMY MANAGEMENT (THE VOCABULARY) — Inc 3 S3 ─────────────
+                // Mirrors View::Menus (SF14d): "← Posts" back button, `masthead__here`
+                // naming the active taxonomy, a Posts/Pages-toggle-style switcher pair,
+                // and a primary "+ New {singular}" button. Every visible string comes
+                // from `TaxonomyDto.label` — never the literal "Term"/"Terms" (SF14e).
+                View::Terms => div {
+                    header { class: "masthead",
+                        div { class: "ruler" }
+                        div { class: "masthead__bar",
+                            button {
+                                class: "btn btn--quiet",
+                                onclick: move || { terms_view.notice.set(String::new()); terms_view.view.set(View::List); },
+                                "\u{2190} Posts"
+                            }
+                            span { class: "masthead__sep", "\u{00B7}" }
+                            span { class: "masthead__here",
+                                {move || taxonomy_label(&terms_view.terms.taxonomies.get(), &terms_view.active_taxonomy.get())}
+                            }
+                            span { class: "masthead__spacer" }
+                            // One quiet button per OTHER taxonomy (the Posts/Pages
+                            // toggle idiom, `app.rs:812-827`) — never the active one.
+                            for tax in terms_view.terms.taxonomies.get() {
+                                // A leading clone dedicated to the CONDITION itself —
+                                // it reads a signal (`active_taxonomy`), so it is its
+                                // own reactive closure site, distinct from the
+                                // button's `onclick`/`key`/text sites below (the
+                                // if/else-capture gotcha:
+                                // `ferropress-rinch-if-else-capture-gotcha` memory).
+                                let cond_key = tax.key.clone();
+                                if cond_key != terms_view.active_taxonomy.get() {
+                                    button {
+                                        key: tax.key.clone(),
+                                        class: "btn btn--quiet",
+                                        onclick: { let k = tax.key.clone(); move || switch_taxonomy(terms_view, k.clone()) },
+                                        {tax.label.clone()}
+                                    }
+                                }
+                            }
+                            button {
+                                class: "btn btn--primary", style: "width:auto",
+                                onclick: move || new_term_editor(terms_view),
+                                {move || {
+                                    let label = taxonomy_label(&terms_view.terms.taxonomies.get(), &terms_view.active_taxonomy.get());
+                                    format!("\u{002B} New {}", singularize(&label))
+                                }}
+                            }
+                        }
+                    }
+                    div { class: "wrap",
+                        div { class: "galley__head",
+                            h2 {
+                                id: "terms-heading", tabindex: "-1", class: "galley__title",
+                                {move || taxonomy_label(&terms_view.terms.taxonomies.get(), &terms_view.active_taxonomy.get())}
+                            }
+                            span { class: "galley__count",
+                                {move || match terms_view.list_state.get() {
+                                    Load::Ready => format!("{} total", terms_view.list.get().len()),
+                                    _ => String::new(),
+                                }}
+                            }
+                        }
+                        if !terms_view.notice.get().is_empty() {
+                            div { class: "galley__state err", role: "alert", {move || terms_view.notice.get()} }
+                        }
+                        if matches!(terms_view.list_state.get(), Load::Loading) {
+                            div { class: "galley__state", "Loading\u{2026}" }
+                        }
+                        if matches!(terms_view.list_state.get(), Load::Error) {
+                            div { class: "galley__state err", "This list is unavailable right now." }
+                        }
+                        // SF9: name the count column honestly — it is a DIRECT,
+                        // published-only count (never "posts affected by deletion").
+                        // SF14e: the taxonomy noun comes from the active tab, never
+                        // a hardcoded "category" (a flat taxonomy also has no parent
+                        // rollup to mention).
+                        p { class: "panel__note",
+                            {move || published_count_note(&terms_view.terms.taxonomies.get(), &terms_view.active_taxonomy.get())}
+                        }
+                        div { class: "galley__rows",
+                            for row in term_row_vms(&terms_view.list.get()) {
+                                button {
+                                    key: row.id,
+                                    class: "row", style: "grid-template-columns: 1fr auto auto",
+                                    onclick: { let id = row.id; move || open_term_editor_by_id(terms_view, id) },
+                                    span { style: row.indent,
+                                        span { class: "row__title", {row.name} }
+                                        span { class: "row__slug", {row.slug} }
+                                    }
+                                    span { class: "row__time", {row.count_label} }
+                                    span { class: "row__edit", "Edit \u{2192}" }
+                                }
+                            }
+                            if matches!(terms_view.list_state.get(), Load::Ready) && terms_view.list.get().is_empty() {
+                                div {
+                                    class: "galley__state",
+                                    {move || format!(
+                                        "No {} yet.",
+                                        taxonomy_label(&terms_view.terms.taxonomies.get(), &terms_view.active_taxonomy.get()).to_lowercase(),
+                                    )}
+                                }
+                            }
+                        }
+                    }
+                },
+
+                // ── TERM EDITOR (CREATE / EDIT ONE CATEGORY OR TAG) ─────────────
+                // `edit_id: None` = create (SF11: empty slug field, "auto from name"
+                // placeholder); `Some` = edit (slug pre-filled + controlled — an edit's
+                // empty slug means "keep the stored slug" server-side, so a cleared
+                // field blocks Save rather than silently lying about what it shows).
+                View::TermEditor => div {
+                    header { class: "masthead",
+                        div { class: "ruler" }
+                        div { class: "masthead__bar",
+                            button {
+                                class: "btn btn--quiet",
+                                onclick: move || leave_term_editor(terms_view),
+                                {move || format!(
+                                    "\u{2190} {}",
+                                    taxonomy_label(&terms_view.terms.taxonomies.get(), &terms_view.edit_taxonomy.get()),
+                                )}
+                            }
+                            span { class: "masthead__sep", "\u{00B7}" }
+                            span { class: "masthead__here",
+                                {move || { let n = terms_view.edit_name.get(); if n.trim().is_empty() { "Untitled".to_owned() } else { n } }}
+                            }
+                            span { class: "masthead__spacer" }
+                            button {
+                                class: "btn btn--primary", style: "width:auto",
+                                onclick: move || save_term(terms_view),
+                                {move || if terms_view.saving.get() { "Saving\u{2026}" } else { "Save" }}
+                            }
+                        }
+                    }
+                    div { class: "wrap",
+                        if !terms_view.notice.get().is_empty() {
+                            div { class: "editor__error", role: "alert", {move || terms_view.notice.get()} }
+                        }
+                        div { class: "panel",
+                            div { class: "setrow",
+                                div { class: "setrow__label", "Name" }
+                                div { class: "setrow__control",
+                                    input {
+                                        class: "input",
+                                        value: {move || terms_view.edit_name.get()},
+                                        oninput: move |v: String| { if terms_view.saving.get() { return; } terms_view.edit_name.set(v); terms_view.dirty.set(true); },
+                                    }
+                                }
+                            }
+                            div { class: "setrow",
+                                div { class: "setrow__label", "Slug" }
+                                div { class: "setrow__control",
+                                    input {
+                                        id: "term-editor-slug",
+                                        class: "input input--mono",
+                                        spellcheck: "false",
+                                        placeholder: {move || if terms_view.edit_id.get().is_none() { "auto from name".to_owned() } else { String::new() }},
+                                        value: {move || terms_view.edit_slug.get()},
+                                        oninput: move |v: String| { if terms_view.saving.get() { return; } terms_view.edit_slug.set(v); terms_view.dirty.set(true); },
+                                    }
+                                    // Only meaningful once there IS an old URL to move
+                                    // away from — a brand new term has none yet.
+                                    if terms_view.edit_id.get().is_some() {
+                                        p { class: "setrow__help",
+                                            "Changing the slug moves this archive's URL immediately \u{2014} no redirect is recorded from the old one."
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "setrow",
+                                div { class: "setrow__label", "Description" }
+                                div { class: "setrow__control",
+                                    textarea {
+                                        class: "input",
+                                        value: {move || terms_view.edit_description.get()},
+                                        oninput: move |v: String| { if terms_view.saving.get() { return; } terms_view.edit_description.set(v); terms_view.dirty.set(true); },
+                                    }
+                                }
+                            }
+                            // Flat taxonomies (tags) have no Parent field (SF10).
+                            if term_editor_taxonomy_hierarchical(terms_view) {
+                                div { class: "setrow",
+                                    div { class: "setrow__label", "Parent" }
+                                    div { class: "setrow__control",
+                                        select {
+                                            class: "select",
+                                            oninput: move |v: String| {
+                                                if terms_view.saving.get() { return; }
+                                                terms_view.edit_parent.set(if v.is_empty() { None } else { v.parse::<u64>().ok() });
+                                                terms_view.dirty.set(true);
+                                            },
+                                            for opt in term_parent_options(&terms_view.list.get(), terms_view.edit_id.get(), terms_view.edit_parent.get()) {
+                                                option { key: opt.value.clone(), value: opt.value, selected: opt.selected, {opt.label} }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "savebar",
+                            if terms_view.edit_id.get().is_some() {
+                                button {
+                                    class: "btn btn--danger",
+                                    onclick: move || delete_term_clicked(terms_view),
+                                    {move || format!(
+                                        "Delete {}",
+                                        singularize(&taxonomy_label(&terms_view.terms.taxonomies.get(), &terms_view.edit_taxonomy.get())),
+                                    )}
+                                }
+                            }
+                            if terms_view.dirty.get() {
+                                span { class: "dirtydot", "\u{25CF} unsaved changes" }
+                            }
+                        }
+                    }
+                },
             }
 
             // The link-candidate picker (reuses the media-modal chrome). Mounted only while
@@ -1626,7 +1932,12 @@ pub fn app() -> NodeHandle {
                 }
             }
 
-            div { class: {move || if toast.get() { "toast is-shown" } else { "toast" }},
+            // SF16: role="status" so a save/delete outcome is announced — before this
+            // the toast was a purely visual cue (a view switch also drops focus to
+            // `document.body` with nothing spoken).
+            div {
+                class: {move || if toast.get() { "toast is-shown" } else { "toast" }},
+                role: "status",
                 span { class: "regmark", style: "font-size:.85rem", "\u{2295}" }
                 "Saved"
             }
@@ -2513,7 +2824,11 @@ fn checklist_row_is_match(term: &api::TermDto, filter: &str) -> bool {
 /// unsafe one.
 fn singularize(label: &str) -> String {
     let lower = label.to_lowercase();
-    if let Some(stem) = lower.strip_suffix("es") {
+    if let Some(stem) = lower.strip_suffix("ies") {
+        // "Categories" -> "category" (this taxonomy's OWN label, not just an
+        // edge case) — stripping only "es" left a bare, wrong "categori".
+        format!("{stem}y")
+    } else if let Some(stem) = lower.strip_suffix("es") {
         stem.to_owned()
     } else if let Some(stem) = lower.strip_suffix('s') {
         stem.to_owned()
@@ -3594,9 +3909,10 @@ fn save_post(ectx: EditorCtx) {
                         });
                         terms.terms_gen.update(|g| *g += 1);
                         terms.missing_term_notice.set(Some(missing_id));
-                        notice.set(format!(
+                        notice.set(
                             "One of this post's categories/tags no longer exists, so nothing was saved. It's been removed here \u{2014} click Save again."
-                        ));
+                                .to_string(),
+                        );
                     }
                     None => notice.set(e),
                 }
@@ -3819,9 +4135,10 @@ fn preview_post(ectx: EditorCtx) {
                         });
                         terms.terms_gen.update(|g| *g += 1);
                         terms.missing_term_notice.set(Some(missing_id));
-                        notice.set(format!(
+                        notice.set(
                             "One of this post's categories/tags no longer exists, so nothing was saved. It's been removed here \u{2014} click Preview again."
-                        ));
+                                .to_string(),
+                        );
                     }
                     None => notice.set(e),
                 }
@@ -4412,13 +4729,490 @@ fn display_name(user: &Option<UserDto>) -> String {
 }
 
 // ============================================================================
+// Taxonomy MANAGEMENT (View::Terms / View::TermEditor) — Inc 3 S3. A separate
+// surface from `TaxonomyPanel` (the post editor's assignment checklist/tags):
+// this is where categories and tags themselves are created, renamed,
+// re-parented, and deleted. SF14e: every visible string comes from
+// `TaxonomyDto.label` — never the literal "Term"/"Terms".
+// ============================================================================
+
+/// The active/editing taxonomy's display label, or "" if the vocabulary hasn't
+/// loaded (or resolved) yet — the sole source of every user-facing name on
+/// these two views (SF14e).
+fn taxonomy_label(taxonomies: &[api::TaxonomyDto], key: &str) -> String {
+    taxonomies
+        .iter()
+        .find(|t| t.key == key)
+        .map(|t| t.label.clone())
+        .unwrap_or_default()
+}
+
+/// SF9's "Published" column note, worded for whichever taxonomy is active
+/// (SF14e — never a hardcoded "category"): a flat taxonomy has no parent
+/// rollup to mention, so its sentence drops entirely rather than describing a
+/// hierarchy relation that doesn't exist for it.
+fn published_count_note(taxonomies: &[api::TaxonomyDto], key: &str) -> String {
+    let Some(tax) = taxonomies.iter().find(|t| t.key == key) else {
+        return String::new();
+    };
+    let noun = singularize(&tax.label);
+    let mut note = format!(
+        "\u{201c}Published\u{201d} counts this {noun}'s own direct posts (drafts excluded)."
+    );
+    if tax.hierarchical {
+        note.push_str(" A parent's public archive additionally rolls up its descendants.");
+    }
+    note
+}
+
+/// Whether the taxonomy currently open in the editor is hierarchical — gates
+/// the Parent field (SF10: a flat taxonomy's terms have none).
+fn term_editor_taxonomy_hierarchical(tv: TermsViewCtx) -> bool {
+    let key = tv.edit_taxonomy.get();
+    tv.terms
+        .taxonomies
+        .get()
+        .iter()
+        .any(|t| t.key == key && t.hierarchical)
+}
+
+/// One term-management row's presentation fields (mirrors [`PageRowVm`]).
+/// `indent` comes straight from `TermDto.depth` (a flat taxonomy's rows are
+/// always depth 0, so no indent). `count_label` names SF9's "Published" column
+/// honestly — `TermDto.count` is the live DIRECT published-post count, never
+/// "posts affected by deleting this term". Deliberately carries only `id` (not
+/// the whole [`api::TermDto`]) — the row's click handlers re-look-up the term
+/// from `TermsViewCtx::list` by id, so `id` (a `Copy` `u64`) is the only field
+/// referenced from more than one place in a row's body, sidestepping the
+/// if/else-capture gotcha a second `.clone()` of a shared non-`Copy` field
+/// would invite (`ferropress-rinch-if-else-capture-gotcha` memory).
+#[derive(Clone, PartialEq)]
+struct TermRowVm {
+    id: u64,
+    name: String,
+    slug: String,
+    count_label: String,
+    indent: String,
+}
+
+fn term_row_vms(terms: &[api::TermDto]) -> Vec<TermRowVm> {
+    terms
+        .iter()
+        .map(|t| TermRowVm {
+            id: t.id,
+            name: if t.name.trim().is_empty() {
+                "(untitled)".to_owned()
+            } else {
+                t.name.clone()
+            },
+            slug: t.slug.clone(),
+            count_label: format!("{} published", t.count),
+            indent: format!("padding-left: {:.2}rem", 0.25 + t.depth as f32 * 1.25),
+        })
+        .collect()
+}
+
+/// The Parent `<select>` options for the term editor (SF10, Q4): a top-level
+/// ("— None —") entry first, then every OTHER term in the taxonomy except
+/// `self_id` and its own subtree — computed by walking `TermDto.parent`
+/// upward from each CANDIDATE term (mirroring the server's own
+/// `is_ancestor_or_self`, `ferropress-http::admin::terms`), never a
+/// depth-ordinal scan (`flatten_tree` can append an unreachable/cyclic row at
+/// depth 0 after the tree, which a depth-run scan would misclassify). A brand
+/// new term (`self_id: None`) excludes nothing. `current` (the term's current
+/// parent) marks the selected option; if it isn't among the candidates — a
+/// stale list, or a corrupt/foreign id — it is still represented so "None"
+/// becomes a real, clickable change rather than a silently-already-selected
+/// option a re-pick can't distinguish from (mirrors `parent_options`).
+fn term_parent_options(
+    list: &[api::TermDto],
+    self_id: Option<u64>,
+    current: Option<u64>,
+) -> Vec<SelectOpt> {
+    let current_str = opt_value(current);
+    let mut opts = vec![SelectOpt {
+        value: String::new(),
+        label: "\u{2014} None (top level) \u{2014}".to_owned(),
+        selected: current_str.is_empty(),
+    }];
+    for t in list {
+        if Some(t.id) == self_id {
+            continue; // not itself
+        }
+        if let Some(sid) = self_id {
+            // Walk UP from this candidate; if `self_id` appears, the candidate
+            // is self's own descendant (or self) — excluded.
+            let mut cur = Some(t.id);
+            let mut seen = HashSet::new();
+            let mut in_subtree = false;
+            while let Some(id) = cur {
+                if id == sid {
+                    in_subtree = true;
+                    break;
+                }
+                if !seen.insert(id) {
+                    break; // pre-existing cycle in stored data — stop walking
+                }
+                cur = list.iter().find(|x| x.id == id).and_then(|x| x.parent);
+            }
+            if in_subtree {
+                continue;
+            }
+        }
+        let indent = "\u{00A0}\u{00A0}".repeat(t.depth);
+        let value = t.id.to_string();
+        let selected = value == current_str;
+        opts.push(SelectOpt {
+            value,
+            label: format!("{indent}{}", t.name),
+            selected,
+        });
+    }
+    if let Some(pid) = current
+        && !opts.iter().any(|o| o.selected)
+    {
+        opts.push(SelectOpt {
+            value: pid.to_string(),
+            label: format!("#{pid} (current parent)"),
+            selected: true,
+        });
+    }
+    opts
+}
+
+/// Switch to the Categories cabinet (Q2): ensure the shared taxonomy
+/// vocabulary is loaded (the SAME `terms.taxonomies`/`vocab_load` cache the
+/// post editor's assignment panels read), pick the active taxonomy tab (the
+/// one already showing, if it still exists; else the first), and load that
+/// taxonomy's WHOLE term list WITH counts — unlike the post editor's cheap
+/// `?counts=0` checklist mode, this screen's whole point is the "Published"
+/// column (SF9).
+fn open_terms_view(tv: TermsViewCtx) {
+    tv.notice.set(String::new());
+    tv.view.set(View::Terms);
+    tv.list_state.set(Load::Loading);
+    let keep = tv.active_taxonomy.get();
+    spawn_local(async move {
+        let taxonomies = if tv.terms.taxonomies.get().is_empty() {
+            match api::list_taxonomies().await {
+                Ok(v) => {
+                    tv.terms.taxonomies.set(v.clone());
+                    tv.terms.vocab_load.set(VocabLoad::Ready);
+                    v
+                }
+                Err(api::ApiError::Unauthorized) => {
+                    tv.auth.session_expired();
+                    return;
+                }
+                Err(api::ApiError::Message(e)) => {
+                    tv.terms.vocab_load.set(VocabLoad::Error);
+                    tv.list_state.set(Load::Error);
+                    tv.notice.set(e);
+                    return;
+                }
+            }
+        } else {
+            tv.terms.taxonomies.get()
+        };
+        let key = if taxonomies.iter().any(|t| t.key == keep) {
+            keep
+        } else {
+            taxonomies
+                .first()
+                .map(|t| t.key.clone())
+                .unwrap_or_default()
+        };
+        tv.active_taxonomy.set(key.clone());
+        if key.is_empty() {
+            // No taxonomies at all — a real, non-error empty state (SF13).
+            tv.list.set(Vec::new());
+            tv.list_state.set(Load::Ready);
+            return;
+        }
+        load_term_list(tv, key).await;
+    });
+}
+
+/// Fetch one taxonomy's full term list WITH counts and apply it — the shared
+/// body behind `open_terms_view`'s initial load, a tab switch, and the
+/// post-mutation refresh.
+async fn load_term_list(tv: TermsViewCtx, key: String) {
+    match api::list_terms(&key, true, None, None).await {
+        Ok(resp) => {
+            tv.list.set(resp.terms);
+            tv.list_state.set(Load::Ready);
+        }
+        Err(api::ApiError::Unauthorized) => tv.auth.session_expired(),
+        Err(api::ApiError::Message(e)) => {
+            tv.notice.set(e);
+            tv.list_state.set(Load::Error);
+        }
+    }
+}
+
+/// Switch the active taxonomy tab (the Posts/Pages-toggle idiom, SF14d).
+fn switch_taxonomy(tv: TermsViewCtx, key: String) {
+    if tv.active_taxonomy.get() == key {
+        return;
+    }
+    tv.notice.set(String::new());
+    tv.active_taxonomy.set(key.clone());
+    tv.list_state.set(Load::Loading);
+    spawn_local(async move { load_term_list(tv, key).await });
+}
+
+/// Open the create form for the currently active taxonomy (SF11: CREATE mode
+/// — an empty slug field with the "auto from name" placeholder).
+fn new_term_editor(tv: TermsViewCtx) {
+    tv.notice.set(String::new());
+    tv.edit_id.set(None);
+    tv.edit_taxonomy.set(tv.active_taxonomy.get());
+    tv.edit_name.set(String::new());
+    tv.edit_slug.set(String::new());
+    tv.edit_description.set(String::new());
+    tv.edit_parent.set(None);
+    tv.edit_rev.set(0);
+    tv.dirty.set(false);
+    tv.view.set(View::TermEditor);
+}
+
+/// Open the edit form for one existing term, looked up fresh from the loaded
+/// list by id (SF11: EDIT mode — the slug field is pre-filled + controlled,
+/// never re-derived from a changed name).
+fn open_term_editor_by_id(tv: TermsViewCtx, id: u64) {
+    let Some(term) = tv.list.get().into_iter().find(|t| t.id == id) else {
+        return;
+    };
+    tv.notice.set(String::new());
+    tv.edit_id.set(Some(term.id));
+    tv.edit_taxonomy.set(tv.active_taxonomy.get());
+    tv.edit_name.set(term.name);
+    tv.edit_slug.set(term.slug);
+    tv.edit_description.set(term.description);
+    tv.edit_parent.set(term.parent);
+    tv.edit_rev.set(term.rev);
+    tv.dirty.set(false);
+    tv.view.set(View::TermEditor);
+}
+
+/// Leave the term editor, confirming first if there are unsaved changes
+/// (mirrors `leave_menu_editor`) — a full reload of the Categories cabinet.
+fn leave_term_editor(tv: TermsViewCtx) {
+    if tv.dirty.get() {
+        // SF14e: the noun names the taxonomy actually being edited (a Tag
+        // form must not say "category").
+        let noun = singularize(&taxonomy_label(
+            &tv.terms.taxonomies.get(),
+            &tv.edit_taxonomy.get(),
+        ));
+        let noun = if noun.is_empty() {
+            "item".to_owned()
+        } else {
+            noun
+        };
+        if !confirm(&format!(
+            "Leave without saving? Your changes to this {noun} will be lost."
+        )) {
+            return;
+        }
+    }
+    tv.dirty.set(false);
+    open_terms_view(tv);
+}
+
+/// Save the create/edit form. SF11: CREATE derives the slug server-side when
+/// the field is empty; EDIT always sends the field's live value — an edit's
+/// empty slug means "keep the stored slug" server-side (`update_term`'s own
+/// doc comment), so a cleared field would silently NOT do what it visually
+/// shows and is refused client-side instead. SF12: an edit echoes the loaded
+/// `rev` as `expected_rev`, so a save that lost a race with another session's
+/// edit 409s instead of silently reverting it. SF13: a sibling-slug 409 moves
+/// focus to the Slug field (a string match on the server's own message text —
+/// the only signal a `{ error }` string body gives the client).
+fn save_term(tv: TermsViewCtx) {
+    if tv.saving.get() {
+        return;
+    }
+    let name = tv.edit_name.get();
+    if name.trim().is_empty() {
+        tv.notice.set("A name is required.".to_owned());
+        return;
+    }
+    let id = tv.edit_id.get();
+    let slug_trimmed = tv.edit_slug.get().trim().to_owned();
+    if id.is_some() && slug_trimmed.is_empty() {
+        tv.notice.set("A slug is required.".to_owned());
+        focus_field("term-editor-slug");
+        return;
+    }
+    let slug_arg = if slug_trimmed.is_empty() {
+        None
+    } else {
+        Some(slug_trimmed)
+    };
+    let taxonomy = tv.edit_taxonomy.get();
+    let description = tv.edit_description.get();
+    let parent = tv.edit_parent.get();
+    let expected_rev = id.map(|_| tv.edit_rev.get());
+    tv.notice.set(String::new());
+    tv.saving.set(true);
+    spawn_local(async move {
+        let result = match id {
+            Some(id) => {
+                api::update_term(
+                    id,
+                    &name,
+                    slug_arg.as_deref(),
+                    &description,
+                    parent,
+                    expected_rev,
+                )
+                .await
+            }
+            None => {
+                api::create_term(&taxonomy, &name, slug_arg.as_deref(), &description, parent).await
+            }
+        };
+        tv.saving.set(false);
+        match result {
+            Ok(_) => {
+                tv.dirty.set(false);
+                // `invalidate_vocab` blanks the SAME shared `taxonomies` cache
+                // this view's own masthead/switcher/heading read (Q2) — it
+                // exists so the post editor's checklist re-fetches on its
+                // NEXT open, but staying HERE needs it repopulated right
+                // away, not left empty until some unrelated code path
+                // happens to call `load_vocab`. `load_vocab` is the one
+                // function that refills both `taxonomies` and
+                // `hierarchical_terms` together (they share one fetch), so
+                // fire it immediately rather than duplicating its fetch.
+                invalidate_vocab(tv.terms);
+                load_vocab(tv.terms, tv.auth);
+                tv.view.set(View::Terms);
+                let key = tv.active_taxonomy.get();
+                load_term_list(tv, key).await;
+                focus_field("terms-heading");
+                tv.toast.set(true);
+                TimeoutFuture::new(1600).await;
+                tv.toast.set(false);
+            }
+            Err(api::ApiError::Unauthorized) => tv.auth.session_expired(),
+            Err(api::ApiError::Message(e)) => {
+                if e.to_lowercase().contains("slug") {
+                    focus_field("term-editor-slug");
+                }
+                tv.notice.set(e);
+            }
+        }
+    });
+}
+
+/// Delete one term (SF9): a native `confirm()` naming the REAL blast radius —
+/// its direct children's new parent (WP's own `wp_delete_term` re-homing: they
+/// move under the deleted term's OWN parent, or become top-level; there is no
+/// "Uncategorized" fallback here) and that posts in it lose the category
+/// outright (never re-assigned — this codebase has nowhere to re-home them
+/// to). The server re-checks the same per-sibling-slug/archive-path invariants
+/// a re-parent would and 409s (naming the offending child) rather than
+/// silently breaking them; that message is surfaced verbatim (SF13).
+fn delete_term_clicked(tv: TermsViewCtx) {
+    if tv.saving.get() {
+        return;
+    }
+    let Some(id) = tv.edit_id.get() else {
+        return;
+    };
+    let list = tv.list.get();
+    let name = tv.edit_name.get();
+    let parent = tv.edit_parent.get();
+    // SF14e: name the taxonomy actually being deleted — a Tag's confirm must
+    // not say "category". The taxonomy's OWN `label` is already its natural
+    // plural (WP convention — "Categories"/"Tags"), so the plural noun is
+    // just that lowercased; only the singular needs `singularize`.
+    let tax_label = taxonomy_label(&tv.terms.taxonomies.get(), &tv.edit_taxonomy.get());
+    let noun_singular = {
+        let s = singularize(&tax_label);
+        if s.is_empty() { "item".to_owned() } else { s }
+    };
+    let noun_plural = {
+        let p = tax_label.to_lowercase();
+        if p.is_empty() { "items".to_owned() } else { p }
+    };
+    let child_count = list.iter().filter(|t| t.parent == Some(id)).count();
+    let label = if name.trim().is_empty() {
+        format!("this {noun_singular}")
+    } else {
+        format!("\u{201c}{name}\u{201d}")
+    };
+    let mut msg = format!("Delete {label}?");
+    if child_count > 0 {
+        let word = if child_count == 1 {
+            noun_singular.clone()
+        } else {
+            noun_plural.clone()
+        };
+        let verb = if child_count == 1 { "moves" } else { "move" };
+        let dest = match parent {
+            Some(pid) => list
+                .iter()
+                .find(|t| t.id == pid)
+                .map(|t| format!("\u{201c}{}\u{201d}", t.name))
+                .unwrap_or_else(|| "its parent".to_owned()),
+            None => "the top level".to_owned(),
+        };
+        msg.push_str(&format!(
+            " Its {child_count} child {word} {verb} to {dest}."
+        ));
+    }
+    msg.push_str(&format!(
+        " Posts in it lose this {noun_singular} (they will not be re-assigned)."
+    ));
+    if !confirm(&msg) {
+        return;
+    }
+    tv.notice.set(String::new());
+    tv.saving.set(true);
+    spawn_local(async move {
+        match api::delete_term(id).await {
+            Ok(()) => {
+                tv.saving.set(false);
+                tv.dirty.set(false);
+                // See the identical comment in `save_term` — `invalidate_vocab`
+                // blanks the SAME `taxonomies` cache this view's own chrome
+                // reads, so refill it right away via `load_vocab`.
+                invalidate_vocab(tv.terms);
+                load_vocab(tv.terms, tv.auth);
+                tv.view.set(View::Terms);
+                let key = tv.active_taxonomy.get();
+                load_term_list(tv, key).await;
+                focus_field("terms-heading");
+                tv.toast.set(true);
+                TimeoutFuture::new(1600).await;
+                tv.toast.set(false);
+            }
+            Err(api::ApiError::Unauthorized) => {
+                tv.saving.set(false);
+                tv.auth.session_expired();
+            }
+            Err(api::ApiError::Message(e)) => {
+                tv.saving.set(false);
+                tv.notice.set(e);
+            }
+        }
+    });
+}
+
+// ============================================================================
 // Nav-menu editor — components, navigation/save helpers, and the pure tree ops.
 // ============================================================================
 
-/// Whether this user's role grants `ManageMenus` (Editor+), mirroring the server gate.
-/// A role-string check like [`is_admin`] — a display hint only; the server enforces the
-/// capability authoritatively, so a stale/edge role just sees a nav button that 403s.
-fn can_manage_menus(user: &Option<UserDto>) -> bool {
+/// Whether this user's role is Editor+ — grants BOTH `ManageMenus` and `ManageTerms`
+/// (identical role sets server-side, ferropress_core::role), so Menus and Categories
+/// share this ONE predicate rather than two role-string lists that could drift (Inc-3
+/// design ruling Q1). A role-string check like [`is_admin`] — a display hint only;
+/// the server enforces the capability authoritatively, so a stale/edge role just sees
+/// a nav button that 403s.
+fn is_editor_plus(user: &Option<UserDto>) -> bool {
     matches!(
         user.as_ref().map(|u| u.role.as_str()),
         Some("editor") | Some("administrator")
@@ -5775,11 +6569,33 @@ fn focus_first_modal_input() {
     });
 }
 
+/// Focus one element by id, on the next tick (so a just-mounted/reactively-swapped
+/// element exists in the DOM first) — the Terms/TermEditor SF16 focus-management
+/// idiom: a returned list's heading (`tabindex="-1"`, a landmark rather than a
+/// control) or a form field a server error names (`#term-editor-slug`).
+fn focus_field(id: &str) {
+    use wasm_bindgen::JsCast;
+    let id = id.to_owned();
+    spawn_local(async move {
+        TimeoutFuture::new(0).await;
+        if let Some(doc) = web_sys::window().and_then(|w| w.document())
+            && let Some(el) = doc.get_element_by_id(&id)
+            && let Ok(html) = el.dyn_into::<web_sys::HtmlElement>()
+        {
+            let _ = html.focus();
+        }
+    });
+}
+
 /// Install a `beforeunload` guard so a tab close/reload while a menu edit is unsaved
 /// prompts the browser's leave-confirmation. Gated on being IN the menu editor (F8): a
 /// menu action that 401s routes to Login but leaves `dirty` set, and without the view
 /// gate the guard would then fire a spurious prompt on the unrelated Posts list.
-fn install_beforeunload_guard(dirty: Signal<bool>, view: Signal<View>) {
+/// `guards`: one `(dirty, expected_view)` pair per unsaved-changes editor — SF16
+/// widens this from the menu editor alone to also cover `View::TermEditor`, sharing
+/// the ONE app-wide `view` signal (there is only ever one `Signal<View>`) rather
+/// than installing a second, independent `beforeunload` listener.
+fn install_beforeunload_guard(view: Signal<View>, guards: Vec<(Signal<bool>, View)>) {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
     let Some(window) = web_sys::window() else {
@@ -5787,7 +6603,11 @@ fn install_beforeunload_guard(dirty: Signal<bool>, view: Signal<View>) {
     };
     let cb = Closure::<dyn FnMut(web_sys::BeforeUnloadEvent)>::new(
         move |e: web_sys::BeforeUnloadEvent| {
-            if dirty.get() && matches!(view.get(), View::MenuEditor) {
+            let current = view.get();
+            if guards
+                .iter()
+                .any(|(dirty, expected)| dirty.get() && current == *expected)
+            {
                 e.prevent_default();
                 e.set_return_value("");
             }

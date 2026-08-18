@@ -359,7 +359,7 @@ pub async fn create_post(body: &CreateRequest) -> Result<PostCreateResponse, Api
 /// One taxonomy, for the assignment panels + the term-management screen. Mirrors
 /// `ferropress-http::admin::terms::TaxonomyDto`. (`Default` only to satisfy the
 /// rinch `#[component]` macro — `TaxonomyPanel` takes it as a prop.)
-#[derive(Clone, PartialEq, Default, Deserialize)]
+#[derive(Clone, PartialEq, Default, Deserialize, Debug)]
 pub struct TaxonomyDto {
     pub id: u64,
     /// Stable key (`"category"`, `"tag"`) — the archive URL base + the API handle.
@@ -406,7 +406,19 @@ pub struct TermDto {
 pub struct ListTermsResponse {
     #[serde(default)]
     pub terms: Vec<TermDto>,
+    /// Only ever `true` for a `limit`-bounded call (`list_terms`'s own doc
+    /// comment — an unbounded call always returns the whole vocabulary,
+    /// never partial). The ONE bounded caller today, the tag token-input's
+    /// suggestion combobox (`load_suggestions`), does not yet surface this —
+    /// a search matching more than its 8-item cap silently shows only the
+    /// first 8 with no "keep typing to narrow" affordance (unlike the
+    /// link-candidate picker's `posts_truncated`, which IS surfaced). A real,
+    /// tracked UX gap, left for Inc-3's adversarial review (the S2 tag-input
+    /// combobox owns the keyboard-nav state this would need to thread
+    /// through, and reworking that is out of S3's scope) rather than papered
+    /// over by dropping the field the server correctly sends.
     #[serde(default)]
+    #[allow(dead_code)]
     pub truncated: bool,
 }
 
@@ -1082,7 +1094,12 @@ pub struct LinkCandidates {
     pub posts: Vec<LinkCandidate>,
     #[serde(default)]
     pub posts_truncated: bool,
+    /// S1 wire groundwork for Inc-3 S4 (the menu-item picker growing
+    /// Categories/Tags tabs, per the design ruling's owner call #2) — the
+    /// picker modal itself does not read this yet, so it is dead until S4
+    /// lands.
     #[serde(default)]
+    #[allow(dead_code)]
     pub terms: Vec<LinkCandidate>,
 }
 
