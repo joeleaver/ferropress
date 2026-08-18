@@ -266,6 +266,17 @@ pub enum ApiError {
     Message(String),
 }
 
+/// SF3 remnant: a `.send()` failure means the REQUEST never reached the server
+/// (DNS, connection refused, offline, CORS) — never a status the server chose,
+/// which always goes through [`classify`] instead. The raw JS error
+/// (`e.to_string()`, e.g. `"TypeError: Failed to fetch"`) is not something a
+/// user can act on, so every send-failure site uses this fixed, human message
+/// instead of surfacing it verbatim. Deliberately NOT applied to a `.json()`
+/// parse failure (a malformed response body) or a request-BODY construction
+/// failure (`.json(&body)`/`.body(form)`) — both indicate an actual bug, not a
+/// connectivity problem, and stay as `{e}` for that signal.
+const NETWORK_ERROR: &str = "Couldn't reach the server \u{2014} check your connection and try again.";
+
 /// Classify a non-2xx response: a 401 is a session problem, anything else carries
 /// its message.
 async fn classify(resp: Response) -> ApiError {
@@ -282,7 +293,7 @@ pub async fn list_posts() -> Result<Vec<PostSummary>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -297,7 +308,7 @@ pub async fn get_post(id: u64) -> Result<PostDetail, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -318,7 +329,7 @@ pub async fn save_post(id: u64, body: &SaveRequest) -> Result<PostSaveResponse, 
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -339,7 +350,7 @@ pub async fn create_post(body: &CreateRequest) -> Result<PostCreateResponse, Api
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -465,7 +476,7 @@ pub async fn list_taxonomies() -> Result<Vec<TaxonomyDto>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -498,7 +509,7 @@ pub async fn list_terms(
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -531,7 +542,7 @@ pub async fn create_term(
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -567,7 +578,7 @@ pub async fn update_term(
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -586,7 +597,7 @@ pub async fn delete_term(id: u64) -> Result<(), ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -699,7 +710,7 @@ pub async fn list_pages() -> Result<Vec<PageSummary>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -714,7 +725,7 @@ pub async fn get_page(id: u64) -> Result<PageDetail, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -734,7 +745,7 @@ pub async fn save_page(id: u64, body: &SavePageRequest) -> Result<(), ApiError> 
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -751,7 +762,7 @@ pub async fn create_page(body: &CreatePageRequest) -> Result<u64, ApiError> {
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -768,7 +779,7 @@ pub async fn list_templates() -> Result<Vec<TemplateOption>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -801,7 +812,7 @@ pub async fn upload_media(form: FormData) -> Result<UploadResponse, ApiError> {
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -834,7 +845,7 @@ pub async fn list_media() -> Result<Vec<MediaSummary>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -872,7 +883,7 @@ pub async fn get_settings() -> Result<SettingsDto, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -894,7 +905,7 @@ pub async fn put_settings(
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -917,7 +928,7 @@ pub async fn list_plugins() -> Result<Vec<PluginDescriptor>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -933,7 +944,7 @@ pub async fn get_plugin_settings(id: &str) -> Result<SettingsDto, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -956,7 +967,7 @@ pub async fn put_plugin_settings(
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1135,7 +1146,7 @@ pub async fn list_menus() -> Result<Vec<MenuSummary>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1150,7 +1161,7 @@ pub async fn get_menu(id: u64) -> Result<MenuDetail, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1172,7 +1183,7 @@ pub async fn create_menu(name: &str, slug: Option<&str>) -> Result<MenuRef, ApiE
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1200,7 +1211,7 @@ pub async fn update_menu(
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1215,7 +1226,7 @@ pub async fn delete_menu(id: u64) -> Result<(), ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1232,7 +1243,7 @@ pub async fn save_menu_items(id: u64, items: &[MenuItemNode]) -> Result<MenuDeta
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1247,7 +1258,7 @@ pub async fn list_menu_locations() -> Result<Vec<MenuLocationRow>, ApiError> {
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1266,7 +1277,7 @@ pub async fn assign_location(location: &str, menu_id: Option<u64>) -> Result<(),
     let resp = req
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }
@@ -1284,7 +1295,7 @@ pub async fn list_link_candidates(q: Option<&str>) -> Result<LinkCandidates, Api
         .credentials(RequestCredentials::SameOrigin)
         .send()
         .await
-        .map_err(|e| ApiError::Message(e.to_string()))?;
+        .map_err(|_| ApiError::Message(NETWORK_ERROR.to_owned()))?;
     if !resp.ok() {
         return Err(classify(resp).await);
     }

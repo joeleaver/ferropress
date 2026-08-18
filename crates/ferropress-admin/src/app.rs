@@ -125,7 +125,7 @@ const MAX_MENU_DEPTH: u32 = 5;
 /// item's URL lives in its editable per-row signal (not here), so the target is
 /// reconstructed at save time. Kind never changes without remove+re-add (WP-faithful),
 /// so it is a static per-row fact — reordering only moves the row, never its kind.
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 enum RowKind {
     Post(u64),
     Page(u64),
@@ -134,6 +134,36 @@ enum RowKind {
     // `RowKind` prop, whose generated default props need `RowKind: Default`).
     #[default]
     Custom,
+}
+
+/// The add-item picker's tab (S4: replaces a bare `u8`, whose `_ => Custom` wildcard
+/// silently rendered the Custom form for any unrecognized value — an exhaustive match
+/// makes that class of bug a compile error instead). `Categories`/`Tags` both browse
+/// `LinkCandidates::terms` (split by `LinkCandidate::taxonomy`, per the pinned
+/// two-taxonomy vocabulary); `Custom` has no server-side candidates at all.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum PickerTab {
+    #[default]
+    Pages,
+    Posts,
+    Categories,
+    Tags,
+    Custom,
+}
+
+impl PickerTab {
+    /// The Custom-link tab is the ONE tab with no candidate list at all — its own
+    /// URL/label form instead of a search box + rows.
+    fn is_custom(self) -> bool {
+        matches!(self, PickerTab::Custom)
+    }
+
+    /// Every OTHER tab is a server-searched candidate list (the search box shows,
+    /// and typing into it re-queries via the SAME `reload_candidates` all four
+    /// share — never a client-side re-filter).
+    fn is_searchable(self) -> bool {
+        !self.is_custom()
+    }
 }
 
 /// One tree row's STRUCTURE (the flat-with-depth model). The tree is a pre-order
@@ -224,8 +254,7 @@ struct MenuCtx {
     /// discipline).
     candidates_gen: Signal<u64>,
     picker_query: Signal<String>,
-    /// 0 = Pages, 1 = Posts, 2 = Custom link.
-    picker_tab: Signal<u8>,
+    picker_tab: Signal<PickerTab>,
     /// The candidates checked for a BULK add (accumulates across searches within a tab; cleared on
     /// open/close/tab-switch so a Pages selection can't leak into Posts). "Add N selected" commits
     /// them all at once (dedup-guarded against items already in the tree).
@@ -678,7 +707,7 @@ pub fn app() -> NodeHandle {
         candidates_state: Signal::new(Load::Loading),
         candidates_gen: Signal::new(0u64),
         picker_query: Signal::new(String::new()),
-        picker_tab: Signal::new(0u8),
+        picker_tab: Signal::new(PickerTab::default()),
         picker_selected: Signal::new(Vec::<api::LinkCandidate>::new()),
         custom_url: Signal::new(String::new()),
         custom_label: Signal::new(String::new()),
@@ -1227,9 +1256,27 @@ pub fn app() -> NodeHandle {
                                     }
                                 }
                                 div { class: "editor__below",
-                                    // Zero taxonomies (migrate not run) renders no
-                                    // panels at all — SF3: a genuinely empty
-                                    // vocabulary is not an error state.
+                                    // SF3 remnant: `TaxonomyPanel` only exists per
+                                    // ENTRY of `terms.taxonomies` — while that list is
+                                    // empty (still loading, genuinely no taxonomies
+                                    // configured, OR the fetch failed), there is
+                                    // nothing to iterate and so no panel to show a
+                                    // Loading/Error/Empty state INSIDE. These three
+                                    // sibling `if`s cover exactly that gap, each its
+                                    // own `show_dom` (not an `if`/`else if` chain —
+                                    // the established rule for this file) so a
+                                    // failed load reads as an honest error, not
+                                    // silence indistinguishable from "no taxonomies
+                                    // exist yet".
+                                    if terms.taxonomies.get().is_empty() && matches!(terms.vocab_load.get(), VocabLoad::Loading) {
+                                        p { class: "panelstate", "Loading categories\u{2026}" }
+                                    }
+                                    if terms.taxonomies.get().is_empty() && matches!(terms.vocab_load.get(), VocabLoad::Error) {
+                                        p { class: "panelerror", role: "alert", "Couldn't load categories \u{2014} your existing assignments are preserved." }
+                                    }
+                                    if terms.taxonomies.get().is_empty() && matches!(terms.vocab_load.get(), VocabLoad::Ready) {
+                                        p { class: "panelstate", "No categories or tags are set up yet." }
+                                    }
                                     for tax in terms.taxonomies.get() {
                                         TaxonomyPanel { key: tax.id, tax: tax, terms: terms }
                                     }
@@ -1560,7 +1607,7 @@ pub fn app() -> NodeHandle {
                                 }
                                 button {
                                     class: "btn btn--ghost", style: "width:auto",
-                                    onclick: move || open_picker(menu),
+                                    onclick: move || open_picker(menu, terms),
                                     "\u{002B} Add item"
                                 }
                             }
@@ -1839,12 +1886,16 @@ pub fn app() -> NodeHandle {
                         }
                         div { class: "media-modal__body",
                             div { class: "tabs",
-                                button { class: {move || tab_class(menu.picker_tab.get(), 0)}, onclick: move || switch_picker_tab(menu, 0), "Pages" }
-                                button { class: {move || tab_class(menu.picker_tab.get(), 1)}, onclick: move || switch_picker_tab(menu, 1), "Posts" }
-                                button { class: {move || tab_class(menu.picker_tab.get(), 2)}, onclick: move || switch_picker_tab(menu, 2), "Custom link" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), PickerTab::Pages)}, onclick: move || switch_picker_tab(menu, PickerTab::Pages), "Pages" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), PickerTab::Posts)}, onclick: move || switch_picker_tab(menu, PickerTab::Posts), "Posts" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), PickerTab::Categories)}, onclick: move || switch_picker_tab(menu, PickerTab::Categories), "Categories" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), PickerTab::Tags)}, onclick: move || switch_picker_tab(menu, PickerTab::Tags), "Tags" }
+                                button { class: {move || tab_class(menu.picker_tab.get(), PickerTab::Custom)}, onclick: move || switch_picker_tab(menu, PickerTab::Custom), "Custom link" }
                             }
-                            // Search box (Pages/Posts tabs).
-                            if menu.picker_tab.get() != 2 {
+                            // Search box (every tab but Custom) — the SAME `reload_candidates`
+                            // every searchable tab shares; the server's own `q` does the
+                            // filtering (never a client-side re-filter, B3/SF8).
+                            if menu.picker_tab.get().is_searchable() {
                                 div { class: "pickerfield",
                                     input {
                                         class: "input", placeholder: "Search\u{2026}",
@@ -1853,23 +1904,25 @@ pub fn app() -> NodeHandle {
                                     }
                                 }
                             }
-                            if matches!(menu.candidates_state.get(), Load::Loading) && menu.picker_tab.get() != 2 {
+                            if matches!(menu.candidates_state.get(), Load::Loading) && menu.picker_tab.get().is_searchable() {
                                 div { class: "media-modal__state", "Loading targets\u{2026}" }
                             }
-                            // Pages/Posts: click a candidate to TOGGLE its checkbox (the picker
-                            // stays open); "Add N selected" in the footer commits them all at once.
+                            // Every searchable tab: click a candidate to TOGGLE its checkbox (the
+                            // picker stays open); "Add N selected" in the footer commits them all
+                            // at once. An EXHAUSTIVE match — no wildcard arm, so a new PickerTab
+                            // variant is a compile error here until it's given real handling.
                             match menu.picker_tab.get() {
-                                0 => div {
+                                PickerTab::Pages => div {
                                     for c in menu.candidates.get().pages {
-                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree }
+                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: String::new() }
                                     }
                                     if matches!(menu.candidates_state.get(), Load::Ready) && menu.candidates.get().pages.is_empty() {
                                         div { class: "truncnote", "No matching pages." }
                                     }
                                 },
-                                1 => div {
+                                PickerTab::Posts => div {
                                     for c in menu.candidates.get().posts {
-                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree }
+                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: String::new() }
                                     }
                                     if menu.candidates.get().posts_truncated {
                                         div { class: "truncnote", "More posts exist \u{2014} refine your search." }
@@ -1878,7 +1931,28 @@ pub fn app() -> NodeHandle {
                                         div { class: "truncnote", "No matching posts." }
                                     }
                                 },
-                                _ => div {
+                                // B3/SF8: Categories/Tags both browse `LinkCandidates::terms`,
+                                // split by whether the candidate's OWNING taxonomy is
+                                // hierarchical — looked up against the shared vocabulary
+                                // (`terms.taxonomies`), never a hardcoded "category"/"tag" key.
+                                PickerTab::Categories => div {
+                                    for c in term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), true) {
+                                        let ind = format!("padding-left: {:.2}rem", 0.25 + c.depth.unwrap_or(0) as f32 * 1.25);
+                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: ind }
+                                    }
+                                    if matches!(menu.candidates_state.get(), Load::Ready) && term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), true).is_empty() {
+                                        div { class: "truncnote", "No matching categories." }
+                                    }
+                                },
+                                PickerTab::Tags => div {
+                                    for c in term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), false) {
+                                        CandidateRow { key: c.id, cand: c, selected: menu.picker_selected, tree: menu.tree, indent: String::new() }
+                                    }
+                                    if matches!(menu.candidates_state.get(), Load::Ready) && term_candidates_for_tab(&menu.candidates.get().terms, &terms.taxonomies.get(), false).is_empty() {
+                                        div { class: "truncnote", "No matching tags." }
+                                    }
+                                },
+                                PickerTab::Custom => div {
                                     div { class: "pickerfield",
                                         label { "URL" }
                                         input {
@@ -1903,12 +1977,12 @@ pub fn app() -> NodeHandle {
                             }
                         }
                         div { class: "media-modal__foot",
-                            // Bulk "Add to menu" for the Pages/Posts tabs (the Custom tab has its
+                            // Bulk "Add to menu" for every searchable tab (the Custom tab has its
                             // own "Add custom link" button in its form).
-                            if menu.picker_tab.get() != 2 {
+                            if menu.picker_tab.get().is_searchable() {
                                 button {
                                     class: "btn btn--primary", style: "width:auto",
-                                    onclick: move || add_selected_items(menu),
+                                    onclick: move || add_selected_items(menu, terms),
                                     {move || { let n = menu.picker_selected.get().len(); if n == 0 { "Add to menu".to_owned() } else { format!("Add {n} selected") } }}
                                 }
                             }
@@ -3162,7 +3236,35 @@ fn rejected_tag_slug(message: &str) -> Option<String> {
 // iteration + slug compare, verified by reading rather than by a live 409.
 #[cfg(test)]
 mod tests {
-    use super::rejected_tag_slug;
+    use super::{RowKind, candidate_kind_of, rejected_tag_slug};
+
+    // S4/B3: an EXHAUSTIVE table over every `LinkCandidate::kind` string the
+    // server can send, plus a genuinely unrecognized one — the regression
+    // guard against ever silently defaulting an unknown kind to Post again.
+    // Exercises `candidate_kind_of` (the pure decision) directly —
+    // `candidate_kind` itself additionally logs on the `None` arm via
+    // `web_sys::console`, which aborts outside a real wasm/JS environment
+    // and so can't run under this crate's native test target.
+    #[test]
+    fn candidate_kind_maps_every_known_kind_and_skips_unknown() {
+        assert_eq!(candidate_kind_of("page", 1), Some(RowKind::Page(1)));
+        assert_eq!(candidate_kind_of("post", 2), Some(RowKind::Post(2)));
+        assert_eq!(candidate_kind_of("term", 3), Some(RowKind::Term(3)));
+        assert_eq!(candidate_kind_of("comment", 4), None);
+        assert_eq!(candidate_kind_of("", 5), None);
+    }
+
+    // B3: dedupe against the tree compares the WHOLE `RowKind` (variant +
+    // id), never the bare id alone — a Term and a Post sharing the SAME
+    // numeric id (entirely possible; they're different object types) must
+    // never be treated as "the same item already in the menu".
+    #[test]
+    fn row_kind_equality_is_kind_aware_not_just_id_aware() {
+        assert_ne!(RowKind::Term(7), RowKind::Post(7));
+        assert_ne!(RowKind::Term(7), RowKind::Page(7));
+        assert_ne!(RowKind::Post(7), RowKind::Page(7));
+        assert_eq!(RowKind::Term(7), RowKind::Term(7));
+    }
 
     #[test]
     fn rejected_tag_slug_extracts_the_slug_from_the_real_server_message() {
@@ -5583,7 +5685,7 @@ fn MenuRowView(
         return rsx! { li { class: "menurow" } };
     };
     let is_custom = matches!(kind, RowKind::Custom);
-    let kind_word = kind_word(&kind);
+    let kind_word = kind_display_word(&kind, &resolved);
     let kind_tag = kind_tag_class(&kind);
     let title = resolved
         .as_ref()
@@ -6037,8 +6139,17 @@ fn delete_menu_clicked(menu: MenuCtx) {
 
 // ── the add-item picker ───────────────────────────────────────────────────────
 
-/// Open the add-item picker and load the candidate targets.
-fn open_picker(menu: MenuCtx) {
+/// Open the add-item picker and load the candidate targets. `terms` (S4) is the
+/// SAME shared taxonomy vocabulary Inc-3's post editor/View::Terms already
+/// read — needed here to tell a hierarchical taxonomy's candidates (the
+/// Categories tab) from a flat one's (Tags) by the taxonomy's OWN
+/// `hierarchical` flag, never by hardcoding "category"/"tag" as magic key
+/// strings. `load_vocab` is idempotent (Q2's guard), so this is a no-op on
+/// every open AFTER the first — but the picker is reachable straight from
+/// View::MenuEditor, which never itself calls `load_vocab` (unlike
+/// `open_post`/`open_posts_list`), so a menu-only session opening the picker
+/// before ever visiting Posts still gets the vocabulary it needs.
+fn open_picker(menu: MenuCtx, terms: TermsCtx) {
     if menu.saving.get() {
         return;
     }
@@ -6046,6 +6157,7 @@ fn open_picker(menu: MenuCtx) {
     menu.picker_query.set(String::new());
     menu.picker_selected.set(Vec::new());
     menu.picker_open.set(true);
+    load_vocab(terms, menu.auth);
     reload_candidates(menu);
     focus_first_modal_input();
 }
@@ -6059,7 +6171,7 @@ fn close_picker(menu: MenuCtx) {
 }
 
 /// Switch the picker tab, clearing the bulk selection so a Pages selection can't leak into Posts.
-fn switch_picker_tab(menu: MenuCtx, tab: u8) {
+fn switch_picker_tab(menu: MenuCtx, tab: PickerTab) {
     menu.picker_tab.set(tab);
     menu.picker_selected.set(Vec::new());
 }
@@ -6089,49 +6201,131 @@ fn reload_candidates(menu: MenuCtx) {
     });
 }
 
-/// The [`RowKind`] a link candidate implies (`"page"` → Page, else Post).
-fn candidate_kind(cand: &api::LinkCandidate) -> RowKind {
-    if cand.kind == "page" {
-        RowKind::Page(cand.id)
-    } else {
-        RowKind::Post(cand.id)
+/// The [`RowKind`] a link candidate implies — an EXHAUSTIVE match over the
+/// server's `kind` string (S4: replaces an `if cand.kind == "page" {Page}
+/// else {Post}` that silently defaulted every OTHER value, including a
+/// genuinely unknown one, to Post). An unrecognized kind is logged and
+/// skipped (`None`) — NEVER defaulted to any concrete kind, since guessing
+/// wrong here would let the wrong target land in the menu tree silently.
+fn candidate_kind(cand: &api::LinkCandidate) -> Option<RowKind> {
+    let result = candidate_kind_of(&cand.kind, cand.id);
+    if result.is_none() {
+        web_sys::console::error_1(
+            &format!(
+                "link-candidate: unknown kind {:?} (id={}) — skipped, never defaulted to Post",
+                cand.kind, cand.id
+            )
+            .into(),
+        );
     }
+    result
+}
+
+/// The pure decision `candidate_kind` wraps with the log-on-unknown side
+/// effect — split out so it's directly unit-testable (`web_sys::console`
+/// aborts on a native, non-wasm target, which is how this crate's own tests
+/// run; the DECISION itself has no such dependency).
+fn candidate_kind_of(kind: &str, id: u64) -> Option<RowKind> {
+    match kind {
+        "page" => Some(RowKind::Page(id)),
+        "post" => Some(RowKind::Post(id)),
+        "term" => Some(RowKind::Term(id)),
+        _ => None,
+    }
+}
+
+/// Whether `key` names a hierarchical taxonomy, per the SHARED vocabulary
+/// (`TermsCtx::taxonomies` — the SAME cache the post editor's checklist and
+/// View::Terms already read) — never hardcoded "category"/"tag" strings, so
+/// the picker's Categories/Tags split follows whatever the taxonomy's OWN
+/// `hierarchical` flag says. An unknown/not-yet-loaded key is conservatively
+/// `false` (routes to Tags rather than Categories — a flat listing is the
+/// safer default for a taxonomy the picker doesn't yet know about).
+fn taxonomy_is_hierarchical(taxonomies: &[api::TaxonomyDto], key: &str) -> bool {
+    taxonomies
+        .iter()
+        .find(|t| t.key == key)
+        .is_some_and(|t| t.hierarchical)
+}
+
+/// The Categories-tab (`want_hierarchical: true`) or Tags-tab (`false`)
+/// candidate slice — `LinkCandidates::terms` filtered by whether each
+/// candidate's OWNING taxonomy is hierarchical. A candidate with no
+/// `taxonomy` at all (should never happen for `kind == "term"`, but the
+/// field is `Option`) is excluded from BOTH tabs rather than guessed into
+/// one.
+fn term_candidates_for_tab(
+    terms_list: &[api::LinkCandidate],
+    taxonomies: &[api::TaxonomyDto],
+    want_hierarchical: bool,
+) -> Vec<api::LinkCandidate> {
+    terms_list
+        .iter()
+        .filter(|c| {
+            c.taxonomy
+                .as_deref()
+                .is_some_and(|key| taxonomy_is_hierarchical(taxonomies, key) == want_hierarchical)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Append every checked candidate at the top level in one batch (dedup-guarded against items
 /// already in the tree — defensive, since [`CandidateRow`] hides already-added ones), then clear
-/// the selection and close the picker. A no-op with nothing selected.
-fn add_selected_items(menu: MenuCtx) {
+/// the selection and close the picker. A no-op with nothing selected. `terms` (S4) resolves a
+/// Term candidate's taxonomy KEY to its display LABEL for the row's own optimistic sidecar —
+/// the NEXT save's re-seed overwrites this with the server's authoritative value regardless, so
+/// a not-yet-loaded vocabulary just shows no label for a moment, never a wrong one.
+fn add_selected_items(menu: MenuCtx, terms: TermsCtx) {
     let selected = menu.picker_selected.get();
     if selected.is_empty() {
         return;
     }
+    let taxonomies = terms.taxonomies.get();
     for cand in selected {
-        let kind = candidate_kind(&cand);
+        // An unrecognized kind was already logged by `candidate_kind` itself —
+        // dedupe stays KIND-AWARE (an `Option<RowKind>` never collides with a
+        // real kind), and there is nothing to add for it.
+        let Some(kind) = candidate_kind(&cand) else {
+            continue;
+        };
         if menu.tree.get().iter().any(|r| r.kind == kind) {
             continue; // already in the menu
         }
+        let taxonomy_label = cand
+            .taxonomy
+            .as_deref()
+            .map(|key| taxonomy_label(&taxonomies, key));
         let resolved = Some(api::ResolvedTarget {
             title: cand.title,
             href: Some(cand.href),
+            taxonomy_label,
         });
         add_row(menu, kind, resolved, String::new(), String::new());
     }
     close_picker(menu);
 }
 
-/// One pickable Post/Page candidate row (Pages/Posts tabs). Clicking TOGGLES its checkbox in the
-/// bulk `selected` list (the picker stays open); a candidate already in the tree renders as a
-/// non-interactive "already in menu" row (dedup at the source). Its own `#[component]` so the
-/// toggle closure can own the non-Copy candidate while the reactive checkbox reads only Copy state.
+/// One pickable Post/Page/Term candidate row (every searchable tab). Clicking TOGGLES its
+/// checkbox in the bulk `selected` list (the picker stays open); a candidate already in the
+/// tree renders as a non-interactive "already in menu" row (dedup at the source, KIND-aware —
+/// `candidate_kind`'s `Option` means an unrecognized candidate can never collide with a real
+/// one). Its own `#[component]` so the toggle closure can own the non-Copy candidate while the
+/// reactive checkbox reads only Copy state. `indent` is a plain inline `padding-left` (the
+/// `PageRowVm` idiom) — empty for every tab except Categories, where a child term's `depth`
+/// nests it; computed once by the caller, never recomputed here.
 #[component]
 fn CandidateRow(
     cand: api::LinkCandidate,
     selected: Signal<Vec<api::LinkCandidate>>,
     tree: Signal<Vec<MenuRow>>,
+    indent: String,
 ) -> NodeHandle {
     let id = cand.id;
-    let kind = candidate_kind(&cand);
+    let Some(kind) = candidate_kind(&cand) else {
+        // Logged by `candidate_kind` already — nothing sane to render.
+        return rsx! { div { class: "candidate" } };
+    };
     let title = if cand.title.is_empty() {
         cand.href.clone()
     } else {
@@ -6141,26 +6335,59 @@ fn CandidateRow(
     // Already in the tree? The tree can't change while the picker is open, so a one-shot read.
     if tree.get().iter().any(|r| r.kind == kind) {
         return rsx! {
-            div { class: "candidate is-added",
+            div { class: "candidate is-added", style: indent,
                 span { class: "candidate__check", "\u{2713}" }
                 span { class: "candidate__title", {title} }
                 span { class: "candidate__href", "already in menu" }
             }
         };
     }
+    // Defensive kind-awareness: `picker_selected` is cleared on every tab
+    // switch (B3/SF8 — see `switch_picker_tab`'s own doc comment), so within
+    // ONE open tab every candidate already shares the SAME `kind`, and `id`
+    // alone happens to be a sufficient key today. Comparing `(id, kind)`
+    // together anyway costs nothing and removes the latent hazard outright —
+    // a Page and a Term CAN share the same numeric id (different object
+    // types), so a future change that ever let selection span kinds would
+    // otherwise show one as spuriously "checked" for the other. `cand.kind`
+    // (the raw wire string) is the discriminator, not the `RowKind` enum
+    // above (a differently-named local here).
+    //
+    // A NEW rinch gotcha found here (distinct from the documented if/else
+    // shared-ancestor one): `create_effect` re-runs its `move` closure on
+    // every reactive tick, and the macro desugars a reactive `class:`/text
+    // block into an IIFE *inside* that same closure — i.e. `class: {move ||
+    // if COND {A} else {B}}` expands to `create_effect(move || { ...
+    // &(move || if COND {A} else {B})() ... })`. The INNER `move` there
+    // tries to MOVE any non-Copy capture (a `String`) out of the OUTER
+    // closure's own environment, on every single tick — which only survives
+    // tick #1 (E0507 on tick #2, since it's already gone). `Signal`s and
+    // other Copy captures never hit this, because "moving" a Copy value
+    // just makes a fresh copy each time. Fix: drop `move` from an IIFE'd
+    // inner closure — it's called and discarded synchronously within the
+    // outer tick, so it never needs `'static`, and a plain (non-move)
+    // closure captures a `String` local by REFERENCE instead, which is
+    // freely re-borrowable every tick. `onclick`'s handler is NOT an IIFE
+    // (rinch's `register_handler` stores it ONCE via `Rc::new(move || ..)`
+    // and calls that SAME instance on every future click), so it genuinely
+    // needs `move` + its own owned clone for `'static`.
+    let kind_for_class = cand.kind.clone();
+    let kind_for_onclick = cand.kind.clone();
+    let kind_for_check = cand.kind.clone();
     let cand_toggle = cand.clone();
     rsx! {
         button {
             r#type: "button",
-            class: {move || if selected.get().iter().any(|c| c.id == id) { "candidate is-selected" } else { "candidate" }},
+            class: {|| if selected.get().iter().any(|c| c.id == id && c.kind == kind_for_class) { "candidate is-selected" } else { "candidate" }},
+            style: indent,
             onclick: move || selected.update(|v| {
-                if let Some(pos) = v.iter().position(|c| c.id == id) {
+                if let Some(pos) = v.iter().position(|c| c.id == id && c.kind == kind_for_onclick) {
                     v.remove(pos);
                 } else {
                     v.push(cand_toggle.clone());
                 }
             }),
-            span { class: "candidate__check", {move || if selected.get().iter().any(|c| c.id == id) { "\u{2611}" } else { "\u{2610}" }} }
+            span { class: "candidate__check", {|| if selected.get().iter().any(|c| c.id == id && c.kind == kind_for_check) { "\u{2611}" } else { "\u{2610}" }} }
             span { class: "candidate__title", {title} }
             span { class: "candidate__href", {href} }
         }
@@ -6709,7 +6936,7 @@ fn rbtn_class(ok: bool) -> &'static str {
 }
 
 /// The picker tab's class (highlighted when current).
-fn tab_class(current: u8, tab: u8) -> &'static str {
+fn tab_class(current: PickerTab, tab: PickerTab) -> &'static str {
     if current == tab { "tab is-on" } else { "tab" }
 }
 
@@ -6721,6 +6948,24 @@ fn kind_word(k: &RowKind) -> &'static str {
         RowKind::Term(_) => "Term",
         RowKind::Custom => "Custom",
     }
+}
+
+/// SF14(e): a `Term` row's kind stamp shows its OWNING TAXONOMY's real label
+/// ("Categories", "Tags") — never the literal word "Term" — sourced from the
+/// SAME server-computed `resolved.taxonomy_label` sidecar `MenuRowView`
+/// already carries (the S4 fix-forward to `ResolvedTarget`), never re-derived
+/// client-side. Falls back to `kind_word`'s generic word only when that
+/// sidecar genuinely has none (Post/Page/Custom, which never carry a
+/// taxonomy label at all — or a not-yet-loaded Term row, never actually
+/// reachable since `resolved` is seeded from the SAME load that supplies
+/// `kind`).
+fn kind_display_word(k: &RowKind, resolved: &Option<api::ResolvedTarget>) -> String {
+    if matches!(k, RowKind::Term(_))
+        && let Some(label) = resolved.as_ref().and_then(|r| r.taxonomy_label.clone())
+    {
+        return label;
+    }
+    kind_word(k).to_owned()
 }
 
 /// The tag CSS class for a target kind.
