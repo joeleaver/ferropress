@@ -6,7 +6,7 @@
 //! wasm admin renders the very same schema. Adding a setting is a data edit here,
 //! not new UI code.
 
-use crate::schema::{Choice, Condition, Field, FormSchema, FormSection, TextFormat, WidgetKind};
+use crate::schema::{Choice, Condition, ControlKind, Field, FormSchema, FormSection, TextFormat};
 use serde_json::Value;
 
 fn text(key: &str, label: &str, help: &str, format: TextFormat) -> Field {
@@ -15,7 +15,7 @@ fn text(key: &str, label: &str, help: &str, format: TextFormat) -> Field {
         label: label.to_owned(),
         help: Some(help.to_owned()),
         default: Value::String(String::new()),
-        widget: WidgetKind::Text { format },
+        widget: ControlKind::Text { format },
         visible_when: None,
     }
 }
@@ -114,7 +114,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                         ),
                         // Null = "no logo"; a set value is the chosen Media's object id.
                         default: Value::Null,
-                        widget: WidgetKind::MediaPicker,
+                        widget: ControlKind::MediaPicker,
                         visible_when: None,
                     },
                 ],
@@ -132,7 +132,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                             .to_owned(),
                     ),
                     default: Value::String(DEFAULT_THEME.to_owned()),
-                    widget: WidgetKind::Select {
+                    widget: ControlKind::Select {
                         options: themes.to_vec(),
                     },
                     visible_when: None,
@@ -148,7 +148,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                         label: "Your homepage displays".to_owned(),
                         help: None,
                         default: Value::String("posts".to_owned()),
-                        widget: WidgetKind::Radio {
+                        widget: ControlKind::Radio {
                             options: vec![
                                 choice("posts", "Your latest posts"),
                                 choice("page", "A static page"),
@@ -166,7 +166,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                         ),
                         // Null = "no page chosen"; a set value is the chosen Page's object id.
                         default: Value::Null,
-                        widget: WidgetKind::EntityRef {
+                        widget: ControlKind::EntityRef {
                             entity: "page".to_owned(),
                         },
                         visible_when: Some(Condition {
@@ -181,7 +181,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                             "How many posts a listing page shows before paginating.".to_owned(),
                         ),
                         default: Value::from(10),
-                        widget: WidgetKind::Number {
+                        widget: ControlKind::Number {
                             min: Some(1.0),
                             max: Some(100.0),
                             step: Some(1.0),
@@ -194,7 +194,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                         label: "Feed items".to_owned(),
                         help: Some("Most-recent items included in syndication feeds.".to_owned()),
                         default: Value::from(10),
-                        widget: WidgetKind::Number {
+                        widget: ControlKind::Number {
                             min: Some(1.0),
                             max: Some(100.0),
                             step: Some(1.0),
@@ -211,7 +211,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                                 .to_owned(),
                         ),
                         default: Value::Bool(true),
-                        widget: WidgetKind::Toggle {
+                        widget: ControlKind::Toggle {
                             text: Some("Allow search engines to index this site".to_owned()),
                         },
                         visible_when: None,
@@ -230,7 +230,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                             "Choose a city or region that shares your local time.".to_owned(),
                         ),
                         default: Value::String("UTC".to_owned()),
-                        widget: WidgetKind::Select {
+                        widget: ControlKind::Select {
                             options: timezones(),
                         },
                         visible_when: None,
@@ -240,7 +240,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                         label: "Date format".to_owned(),
                         help: None,
                         default: Value::String("F j, Y".to_owned()),
-                        widget: WidgetKind::Radio {
+                        widget: ControlKind::Radio {
                             options: vec![
                                 choice("F j, Y", "January 8, 2026"),
                                 choice("Y-m-d", "2026-01-08"),
@@ -259,7 +259,7 @@ pub fn schema_for_settings(themes: &[Choice]) -> FormSchema {
                                 .to_owned(),
                         ),
                         default: Value::String(String::new()),
-                        widget: WidgetKind::Text {
+                        widget: ControlKind::Text {
                             format: TextFormat::Plain,
                         },
                         visible_when: Some(Condition {

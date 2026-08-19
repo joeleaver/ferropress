@@ -2,7 +2,7 @@
 //! the [`SettingRefs`] sidecar shipped beside `{schema, values}`.
 //!
 //! `MediaPicker` and `EntityRef` store a bare object id (see
-//! [`WidgetKind::coerce`](ferropress_render_form::WidgetKind)). An id alone can't be
+//! [`ControlKind::coerce`](ferropress_render_form::ControlKind)). An id alone can't be
 //! rendered: a media picker needs the picked image's `/media/{uuid}` URL for its
 //! thumbnail, and a page picker needs the list of pages to choose from. The schema
 //! is deliberately store-free, so this — the ONE place that reaches the store for
@@ -19,7 +19,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use ferropress_core::value::{ObjectId, TypeName};
 use ferropress_core::{CoreError, MEDIA_TYPE, PAGE_TYPE, Status, media_url};
-use ferropress_render_form::{EntityOption, FormSchema, MediaRef, SettingRefs, WidgetKind};
+use ferropress_render_form::{ControlKind, EntityOption, FormSchema, MediaRef, SettingRefs};
 
 use super::settings::SettingsDto;
 use super::{AdminError, str_field};
@@ -56,10 +56,10 @@ async fn resolve_refs(
     let mut media_ids: BTreeSet<u64> = BTreeSet::new();
     for field in schema.fields() {
         match &field.widget {
-            WidgetKind::EntityRef { entity } => {
+            ControlKind::EntityRef { entity } => {
                 entities.insert(entity.as_str());
             }
-            WidgetKind::MediaPicker => {
+            ControlKind::MediaPicker => {
                 if let Some(id) = values.get(&field.key).and_then(JsonValue::as_u64) {
                     media_ids.insert(id);
                 }

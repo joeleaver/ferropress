@@ -2,7 +2,7 @@
 //! made of, plus the untrusted-input validation/coercion that guards a write.
 //!
 //! This module is deliberately **render-agnostic**: it knows nothing about rinch
-//! or HTML. The single `WidgetKind -> edit-UI` dispatch lives in the excluded
+//! or HTML. The single `ControlKind -> edit-UI` dispatch lives in the excluded
 //! `ferropress-form-view` crate (it emits rinch nodes, which the dep-graph lint
 //! bans from any workspace member). Keeping the schema here — rinch-free and
 //! serde-serializable — is what lets the SERVER produce a schema, ship it over
@@ -49,7 +49,7 @@ pub struct Field {
     /// Value used when no stored value exists yet (seeds both the form and, on
     /// first save, the persisted row).
     pub default: Value,
-    pub widget: WidgetKind,
+    pub widget: ControlKind,
     /// Render this field only when another field's current value equals a target.
     /// A hidden field's value is still persisted (never silently dropped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,7 +82,7 @@ pub enum TextFormat {
     Slug,
 }
 
-/// THE widget vocabulary. A pure DATA enum: the single `WidgetKind -> edit-UI`
+/// THE widget vocabulary. A pure DATA enum: the single `ControlKind -> edit-UI`
 /// dispatch lives in `ferropress-form-view` (marker `FERROPRESS-FORM-DISPATCH`),
 /// NEVER inline at a call site — that is what keeps "one form renderer" true.
 ///
@@ -90,7 +90,7 @@ pub enum TextFormat {
 /// wire and both ends (server producer, wasm renderer) share this exact type.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum WidgetKind {
+pub enum ControlKind {
     /// Single-line text (titles, slugs, emails, URLs — see `TextFormat`).
     Text {
         #[serde(default)]
@@ -185,14 +185,14 @@ impl FormSchema {
     }
 }
 
-impl WidgetKind {
+impl ControlKind {
     /// Validate + normalize one submitted value against this widget's type.
     /// Rejects the wrong JSON type, an out-of-vocabulary choice, an unsafe URL,
     /// or an implausible email; clamps a number into range. Returns the canonical
     /// stored form (e.g. an integral `Number` becomes a JSON integer).
     pub fn coerce(&self, v: &Value) -> Result<Value, String> {
         match self {
-            WidgetKind::Text { format } => {
+            ControlKind::Text { format } => {
                 let s = v.as_str().ok_or("expected a string")?;
                 match format {
                     TextFormat::Url => {
@@ -209,15 +209,15 @@ impl WidgetKind {
                 }
                 Ok(Value::String(s.to_owned()))
             }
-            WidgetKind::TextArea => {
+            ControlKind::TextArea => {
                 let s = v.as_str().ok_or("expected a string")?;
                 Ok(Value::String(s.to_owned()))
             }
-            WidgetKind::Toggle { .. } => {
+            ControlKind::Toggle { .. } => {
                 let b = v.as_bool().ok_or("expected a boolean")?;
                 Ok(Value::Bool(b))
             }
-            WidgetKind::Number { min, max, step, .. } => {
+            ControlKind::Number { min, max, step, .. } => {
                 let mut n = v.as_f64().ok_or("expected a number")?;
                 if !n.is_finite() {
                     return Err("not a finite number".to_owned());
@@ -239,7 +239,7 @@ impl WidgetKind {
                         .ok_or_else(|| "not a representable number".to_owned())
                 }
             }
-            WidgetKind::Select { options } | WidgetKind::Radio { options } => {
+            ControlKind::Select { options } | ControlKind::Radio { options } => {
                 let s = v.as_str().ok_or("expected a string")?;
                 if options.iter().any(|c| c.value == s) {
                     Ok(Value::String(s.to_owned()))
@@ -247,12 +247,12 @@ impl WidgetKind {
                     Err("not one of the allowed options".to_owned())
                 }
             }
-            WidgetKind::MediaPicker | WidgetKind::EntityRef { .. } => match v {
+            ControlKind::MediaPicker | ControlKind::EntityRef { .. } => match v {
                 Value::Null => Ok(Value::Null),
                 Value::Number(n) if n.is_u64() => Ok(v.clone()),
                 _ => Err("expected an object id or null".to_owned()),
             },
-            WidgetKind::BlockEditor => {
+            ControlKind::BlockEditor => {
                 Err("block content is not a plain settings value".to_owned())
             }
         }

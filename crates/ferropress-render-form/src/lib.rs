@@ -8,7 +8,7 @@
 //!
 //! ## Where the single dispatch lives
 //!
-//! The one `WidgetKind -> edit-UI` dispatch is NOT here. It emits rinch nodes, and
+//! The one `ControlKind -> edit-UI` dispatch is NOT here. It emits rinch nodes, and
 //! the dep-graph lint bans rinch from every workspace member, so it lives in the
 //! excluded `ferropress-form-view` crate (marker `FERROPRESS-FORM-DISPATCH`). This
 //! crate stays rinch-free so the whole host workspace — the server included — can
@@ -26,7 +26,7 @@ mod site_settings;
 pub use catalog::{NoPlugins, PluginCatalog, PluginDescriptor};
 pub use refs::{EntityOption, MediaRef, SettingRefs};
 pub use schema::{
-    Choice, Condition, Field, FieldError, FormSchema, FormSection, TextFormat, WidgetKind,
+    Choice, Condition, ControlKind, Field, FieldError, FormSchema, FormSection, TextFormat,
 };
 pub use settings::{DEFAULT_THEME, THEME_LETTERPRESS, schema_for_settings};
 pub use site_settings::SiteSettings;
@@ -45,9 +45,9 @@ mod tests {
     }
 
     #[test]
-    fn widget_kind_is_internally_tagged() {
+    fn control_kind_is_internally_tagged() {
         // The wire shape both ends rely on: `{"type":"number", ...}`.
-        let w = WidgetKind::Number {
+        let w = ControlKind::Number {
             min: Some(1.0),
             max: Some(100.0),
             step: Some(1.0),
@@ -57,14 +57,14 @@ mod tests {
         assert_eq!(v["type"], "number");
         assert_eq!(v["unit"], "posts");
 
-        let t = serde_json::to_value(WidgetKind::Text {
+        let t = serde_json::to_value(ControlKind::Text {
             format: TextFormat::Url,
         })
         .unwrap();
         assert_eq!(t["type"], "text");
         assert_eq!(t["format"], "url");
 
-        let toggle = serde_json::to_value(WidgetKind::TextArea).unwrap();
+        let toggle = serde_json::to_value(ControlKind::TextArea).unwrap();
         assert_eq!(toggle["type"], "text_area");
     }
 

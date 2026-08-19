@@ -183,7 +183,7 @@ struct PluginManifest {
     /// The plugin's declarative config form, as an inline `[settings]` table whose
     /// shape is a [`FormSchema`] (sections → fields → widgets). Held as a raw
     /// [`toml::Value`] and converted to a `FormSchema` at load ([`parse_settings_schema`])
-    /// so any TOML-vs-serde edge with the internally-tagged `WidgetKind` is sidestepped
+    /// so any TOML-vs-serde edge with the internally-tagged `ControlKind` is sidestepped
     /// (the conversion routes through `serde_json`). Absent → the plugin is not
     /// configurable. Field keys are BARE (e.g. `default_variant`); the host owns the
     /// persisted `plugin.<id>.` prefix.
@@ -849,7 +849,7 @@ host_fn!(fp_get_setting(user_data: SettingsBackend; key: String) -> String {
 
 /// Convert a plugin's inline `[settings]` TOML table into a [`FormSchema`] and
 /// validate it. The conversion routes through `serde_json` (TOML value → JSON value →
-/// `FormSchema`) rather than deserializing `FormSchema` straight from TOML: `WidgetKind`
+/// `FormSchema`) rather than deserializing `FormSchema` straight from TOML: `ControlKind`
 /// is an internally-tagged enum, and going via a self-describing JSON value sidesteps
 /// any TOML/serde tag-buffering edge. Validation rejects an empty schema and a
 /// duplicate/blank field key (the field key is the persisted `Setting` sub-key).

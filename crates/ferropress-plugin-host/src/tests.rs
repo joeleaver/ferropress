@@ -619,7 +619,7 @@ fn settings_toml_parses_into_a_form_schema() {
     let field = schema.field("default_variant").expect("field present");
     assert!(matches!(
         field.widget,
-        ferropress_render_form::WidgetKind::Select { .. }
+        ferropress_render_form::ControlKind::Select { .. }
     ));
 }
 

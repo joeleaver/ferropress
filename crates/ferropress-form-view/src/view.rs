@@ -33,7 +33,9 @@ use std::rc::Rc;
 use rinch::prelude::*;
 use serde_json::Value;
 
-use ferropress_render_form::{Field, FormSchema, FormSection, SettingRefs, TextFormat, WidgetKind};
+use ferropress_render_form::{
+    ControlKind, Field, FormSchema, FormSection, SettingRefs, TextFormat,
+};
 
 use crate::values::FormValues;
 
@@ -173,12 +175,12 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
         |h| rsx! { p { class: "setrow__help", {h} } },
     );
 
-    // FERROPRESS-FORM-DISPATCH — the one and only WidgetKind -> edit-control match.
+    // FERROPRESS-FORM-DISPATCH — the one and only ControlKind -> edit-control match.
     // A plain-Rust match (so each arm may use `let`) returning the control node. Moved
     // by value (a partial move of `field.widget`) — the arms only ever read `field.key`
     // afterward, so no clone of the widget's option vectors is needed.
     let control: NodeHandle = match field.widget {
-        WidgetKind::Text { format } => {
+        ControlKind::Text { format } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
             let cls = match format {
@@ -206,7 +208,7 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 }
             }
         }
-        WidgetKind::TextArea => {
+        ControlKind::TextArea => {
             let key = field.key.clone();
             let values = ctx.values.clone();
             rsx! {
@@ -225,7 +227,7 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 }
             }
         }
-        WidgetKind::Number {
+        ControlKind::Number {
             min,
             max,
             step,
@@ -275,7 +277,7 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 }
             }
         }
-        WidgetKind::Toggle { text } => {
+        ControlKind::Toggle { text } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
             let text_node = opt_node(text, |t| rsx! { span { class: "switch__text", {t} } });
@@ -304,7 +306,7 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 }
             }
         }
-        WidgetKind::Select { options } => {
+        ControlKind::Select { options } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
             let current = state.get().as_str().unwrap_or_default().to_owned();
@@ -344,7 +346,7 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 }
             }
         }
-        WidgetKind::Radio { options } => {
+        ControlKind::Radio { options } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
             rsx! {
@@ -365,7 +367,7 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
         // Picks a Media object id: a thumbnail of the current selection (resolved via
         // `refs.media`) plus Choose/Replace/Remove. The dialog + upload + library live
         // in the host (via `on_pick_media`); this widget only shows + writes the id.
-        WidgetKind::MediaPicker => {
+        ControlKind::MediaPicker => {
             // The current selection's thumbnail URL, empty when unset (an `Option` prop
             // trips the rsx event-handler coercion, so "" stands in for "no thumbnail").
             let initial_url = state
@@ -386,8 +388,8 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
         }
         // Picks an object id of a named entity (a `Page` today) from a dropdown of the
         // candidates the server resolved into `refs.entity_options`. Stores a `u64` id
-        // or null (the empty option) — the shape `WidgetKind::coerce` validates.
-        WidgetKind::EntityRef { entity } => {
+        // or null (the empty option) — the shape `ControlKind::coerce` validates.
+        ControlKind::EntityRef { entity } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
             let options = ctx.refs.options_for(&entity);
@@ -437,7 +439,7 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
         }
         // The rich block-tree body editor isn't mounted through this form (the post
         // editor mounts the rinch editor directly).
-        WidgetKind::BlockEditor => {
+        ControlKind::BlockEditor => {
             rsx! { p { class: "setrow__help", "This field type isn\u{2019}t editable here yet." } }
         }
     };

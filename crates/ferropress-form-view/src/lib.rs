@@ -3,7 +3,7 @@
 //! THE `FormSchema -> rinch edit-UI` renderer for the Ferropress admin SPA — the
 //! editing-side mirror of `ferropress-render` (block-tree -> HTML). It takes the
 //! declarative [`ferropress_render_form::FormSchema`] (rinch-free schema data) and
-//! projects it into a rinch component tree, with the SINGLE `WidgetKind -> control`
+//! projects it into a rinch component tree, with the SINGLE `ControlKind -> control`
 //! dispatch (marker `FERROPRESS-FORM-DISPATCH`, in [`view`]).
 //!
 //! It depends on the `rinch` facade, so — like `ferropress-admin`,

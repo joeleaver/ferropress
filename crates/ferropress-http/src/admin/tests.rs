@@ -2070,7 +2070,7 @@ impl ferropress_render_form::PluginCatalog for FakeCatalog {
 /// A compact demo schema exercising a Select (vocabulary gate) and a bounded Number
 /// (clamp), mirroring what a real plugin ships.
 fn demo_schema() -> ferropress_render_form::FormSchema {
-    use ferropress_render_form::{Choice, Field, FormSchema, FormSection, WidgetKind};
+    use ferropress_render_form::{Choice, ControlKind, Field, FormSchema, FormSection};
     FormSchema {
         sections: vec![FormSection {
             id: "appearance".to_owned(),
@@ -2082,7 +2082,7 @@ fn demo_schema() -> ferropress_render_form::FormSchema {
                     label: "Variant".to_owned(),
                     help: None,
                     default: serde_json::json!("info"),
-                    widget: WidgetKind::Select {
+                    widget: ControlKind::Select {
                         options: vec![
                             Choice {
                                 value: "info".to_owned(),
@@ -2101,7 +2101,7 @@ fn demo_schema() -> ferropress_render_form::FormSchema {
                     label: "Count".to_owned(),
                     help: None,
                     default: serde_json::json!(3),
-                    widget: WidgetKind::Number {
+                    widget: ControlKind::Number {
                         min: Some(1.0),
                         max: Some(10.0),
                         step: Some(1.0),

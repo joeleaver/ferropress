@@ -3,7 +3,7 @@
 //! `EntityRef` — as real controls.
 //!
 //! A `MediaPicker`/`EntityRef` value is a bare object id (`u64` or null; see
-//! [`WidgetKind::coerce`](crate::WidgetKind)). An id alone can't be *shown*: a
+//! [`ControlKind::coerce`](crate::ControlKind)). An id alone can't be *shown*: a
 //! media picker needs the picked image's `/media/{uuid}` URL for its thumbnail, and
 //! a page picker needs the list of pages to choose from. Neither is derivable from
 //! the schema (which is deliberately store-free and deterministic) — both require a
