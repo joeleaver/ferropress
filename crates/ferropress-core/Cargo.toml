@@ -18,3 +18,4 @@ futures-core = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+ammonia = { workspace = true }

@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use minijinja::Environment;
+use minijinja::{AutoEscape, Environment};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -73,8 +73,16 @@ impl ThemeEngine {
     pub fn new(limits: SandboxLimits) -> Self {
         let mut env = Environment::new();
         env.set_recursion_limit(limits.recursion_limit);
-        // TODO: install the function allow-list and confirm the autoescape
-        // policy for `.html` templates before loading untrusted theme sources.
+        // Autoescape is pinned to HTML UNCONDITIONALLY, for every template
+        // name — never MiniJinja's own extension-keyed default (which maps
+        // `.html`/`.htm`/`.xml` to `Html` and everything else to `None`).
+        // Every typed ctx field (widget HTML included) reaches templates
+        // through this engine, so a template registered under any other name
+        // must escape identically or the whole `|safe`-boundary safety story
+        // silently depends on an accident of file naming. See MF19.
+        // TODO: install the function allow-list before loading untrusted
+        // theme sources.
+        env.set_auto_escape_callback(|_name| AutoEscape::Html);
         Self { env, limits }
     }
 
@@ -90,7 +98,8 @@ impl ThemeEngine {
     /// The caller shapes the context (site settings, page fields, and the
     /// already-rendered block body from `ferropress-render`); the template frames
     /// it. Any pre-rendered HTML in the context is emitted through the `| safe`
-    /// filter — everything else auto-escapes, since the templates are `.html`.
+    /// filter — everything else auto-escapes UNCONDITIONALLY (every template
+    /// name, not just ones ending in `.html`; see [`ThemeEngine::new`]).
     pub fn render<C: Serialize>(&self, template: &str, ctx: &C) -> Result<String> {
         // TODO: run this render on a worker thread and abort it if it exceeds
         // `self.limits.render_timeout` (MiniJinja has no internal time guard).
@@ -105,5 +114,51 @@ impl ThemeEngine {
             });
         }
         Ok(rendered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct Ctx {
+        x: &'static str,
+    }
+
+    /// MF19 regression: autoescape must apply to EVERY template name, not
+    /// just ones MiniJinja's own extension-keyed default would recognize
+    /// (`.html`/`.htm`/`.xml`). A template registered under a name with no
+    /// such extension is the exact shape the old TODO left unguarded.
+    #[test]
+    fn autoescape_applies_regardless_of_template_name() {
+        let mut engine = ThemeEngine::new(SandboxLimits::default());
+        engine
+            .add_template("snippet.txt".to_owned(), "{{ x }}".to_owned())
+            .expect("add_template");
+
+        let out = engine
+            .render("snippet.txt", &Ctx { x: "<script>" })
+            .expect("render");
+
+        assert_eq!(out, "&lt;script&gt;");
+        assert!(!out.contains("<script>"), "{out}");
+    }
+
+    /// Same assertion through a canonical `.html`-named template, so the
+    /// unconditional callback is proven not to have REGRESSED the ordinary
+    /// case while fixing the non-`.html` one.
+    #[test]
+    fn autoescape_still_applies_to_html_named_templates() {
+        let mut engine = ThemeEngine::new(SandboxLimits::default());
+        engine
+            .add_template("page.html".to_owned(), "{{ x }}".to_owned())
+            .expect("add_template");
+
+        let out = engine
+            .render("page.html", &Ctx { x: "<script>" })
+            .expect("render");
+
+        assert_eq!(out, "&lt;script&gt;");
     }
 }

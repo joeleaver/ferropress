@@ -29,6 +29,7 @@ pub mod plugin_caps;
 pub mod ports;
 pub mod query;
 pub mod role;
+pub mod sanitize;
 pub mod seo;
 pub mod status;
 pub mod store;
@@ -49,6 +50,7 @@ pub use query::{
     Change, ChangeKind, Compare, Edge, FilterSpec, ScoredId, SubscribeFilter, VectorQuery,
 };
 pub use role::{Capability, Role};
+pub use sanitize::{SANDBOX_TOKENS, sanitize_widget_html};
 pub use seo::{Robots, Seo};
 pub use status::{CommentStatus, Status};
 pub use store::RhypeStore;

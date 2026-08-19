@@ -132,6 +132,11 @@ extism = "1"
 # --- Templating / rendering --------------------------------------------------
 minijinja = { version = "2", features = ["loader"] }
 html-escape = "0.2"
+# HTML sanitizer (ferropress-core's `sanitize_widget_html`, the single shared
+# cleaner for widget-authored HTML — Custom HTML kind). Re-exports the `url`
+# crate's `Url` at its root, so no separate `url` dep is needed for the
+# iframe-src https-only scheme check.
+ammonia = "4"
 
 # --- Media -------------------------------------------------------------------
 # Header-only image sniffing: validates an upload really is a known image and
