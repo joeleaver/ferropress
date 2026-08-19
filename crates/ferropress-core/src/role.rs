@@ -39,6 +39,14 @@ pub enum Capability {
     PublishOthersContent,
     ManageTerms,
     ManageMenus,
+    /// Author/edit/reorder/delete sidebar `Widget`s (Editor tier, joining
+    /// `ManageMenus`/`ManageTerms` — T6 ruling). INVARIANT: sanitization of
+    /// widget-authored HTML (`sanitize_widget_html`) is UNCONDITIONAL for
+    /// every role that holds this capability, forever — ferropress has no
+    /// `unfiltered_html` tier. The sanitizer, not this capability check, is
+    /// the XSS boundary; no future per-user grant mechanism may reopen it by
+    /// bypassing the sanitizer for a "trusted" role.
+    ManageWidgets,
     ManageSettings,
     ManageUsers,
     ManagePlugins,
@@ -63,6 +71,7 @@ impl Role {
                     PublishOthersContent,
                     ManageTerms,
                     ManageMenus,
+                    ManageWidgets,
                     CommentModerate,
                 ]);
                 caps.extend(Role::Author.capabilities());
@@ -84,5 +93,21 @@ impl Role {
 
     pub fn has(self, cap: Capability) -> bool {
         self.capabilities().contains(&cap)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ManageWidgets` joins `ManageMenus`/`ManageTerms` in the Editor tier
+    /// (T6 ruling: Editor+, not Administrator-only) and is cumulative upward.
+    #[test]
+    fn manage_widgets_is_editor_plus() {
+        assert!(!Role::Subscriber.has(Capability::ManageWidgets));
+        assert!(!Role::Contributor.has(Capability::ManageWidgets));
+        assert!(!Role::Author.has(Capability::ManageWidgets));
+        assert!(Role::Editor.has(Capability::ManageWidgets));
+        assert!(Role::Administrator.has(Capability::ManageWidgets));
     }
 }

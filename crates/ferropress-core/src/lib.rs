@@ -10,7 +10,7 @@
 //! Key surfaces:
 //! - **Domain entities** (`entity::*`): `Post`, `Page`, `Media`, `Taxonomy`,
 //!   `Term`, `User`, `Comment`, `Menu`, `MenuItem`, `MenuLocation`, `Setting`,
-//!   `Revision`, `Redirect` — the typed WordPress content model.
+//!   `Revision`, `Redirect`, `Widget` — the typed WordPress content model.
 //! - **Value objects**: `BlockTree` (typed JSON block tree, a native `Value::Json`),
 //!   `Status` / `CommentStatus` state machines, `Role` / `Capability`,
 //!   `Slug`, `SchemaVersion`, `Seo`.

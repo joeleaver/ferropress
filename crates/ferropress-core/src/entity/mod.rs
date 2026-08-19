@@ -29,6 +29,7 @@ pub mod revision;
 pub mod setting;
 pub mod taxonomy;
 pub mod user;
+pub mod widget;
 
 pub use comment::Comment;
 pub use media::{
@@ -45,6 +46,7 @@ pub use setting::{
 };
 pub use taxonomy::{Taxonomy, Term};
 pub use user::User;
+pub use widget::Widget;
 
 /// Canonical store type-name constants. These MUST match the SDL type names in
 /// `ferropress-schema-sdl`.
@@ -61,3 +63,4 @@ pub const MENU_LOCATION_TYPE: &str = "MenuLocation";
 pub const SETTING_TYPE: &str = "Setting";
 pub const REVISION_TYPE: &str = "Revision";
 pub const REDIRECT_TYPE: &str = "Redirect";
+pub const WIDGET_TYPE: &str = "Widget";

@@ -251,6 +251,15 @@ type Redirect {
     to_path: String
     status_code: u32
 }
+
+type Widget {
+    area: String @indexed
+    widget_order: i32 @indexed
+    kind: String @indexed
+    title: String
+    config: Json
+    meta: Json
+}
 "#;
 
 /// Parse + validate the canonical schema. Wraps
@@ -282,8 +291,8 @@ mod tests {
         assert!(schema.get_type("Page").is_some());
         assert!(schema.get_type("Comment").is_some());
         assert!(schema.get_type("User").is_some());
-        // 13 content types, single-site (no tenancy types).
-        assert_eq!(schema.types.len(), 13);
+        // 14 content types, single-site (no tenancy types).
+        assert_eq!(schema.types.len(), 14);
     }
 
     /// Guard the GLOBAL DECISION embedding choice so a stray edit can't silently
