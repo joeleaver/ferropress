@@ -45,6 +45,7 @@ pub mod settings;
 pub mod taxonomies;
 pub mod templates;
 pub mod themes;
+pub mod widgets;
 
 pub use authors::{AuthorDirectory, AuthorsHandle, load_author_directory};
 pub use content::{
@@ -60,6 +61,7 @@ pub use redirects::{RedirectHandle, RedirectMap, RedirectTarget, load_redirects}
 pub use settings::{SettingsHandle, load_site_settings, load_values, overlay_settings};
 pub use taxonomies::{TaxonomyHandle, TaxonomyInfo, TaxonomySet, TermEntry, load_taxonomies};
 pub use themes::{ThemeHandle, ThemeRegistry};
+pub use widgets::{WidgetSpec, widget_specs};
 
 /// Identifies one prerendered output page. The serve cache is keyed by the path
 /// (URL path -> `BlobKey`); a content change maps to the set of `OutputPage`s it
