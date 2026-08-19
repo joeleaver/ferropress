@@ -395,9 +395,11 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
                 }
             }
         }
-        // Picks an object id of a named entity (a `Page` today) from a dropdown of the
-        // candidates the server resolved into `refs.entity_options`. Stores a `u64` id
-        // or null (the empty option) — the shape `ControlKind::coerce` validates.
+        // Picks an object id of a named entity (`page` or `menu` today) from a
+        // dropdown of the candidates the server resolved into `refs.entity_options`.
+        // Stores a `u64` id or null (the empty option) — the shape `ControlKind::coerce`
+        // validates. ONE shared arm across every entity, so its copy is entity-AWARE
+        // rather than hard-coded to "page" (its original, only consumer).
         ControlKind::EntityRef { entity } => {
             let key = field.key.clone();
             let values = ctx.values.clone();
@@ -405,18 +407,40 @@ fn FieldRow(field: Field, ctx: FormContext) -> NodeHandle {
             let current_id = state.get().as_u64();
             let current_key = current_id.map(|id| id.to_string()).unwrap_or_default();
 
+            // The display noun for this entity. `entity`'s own value already reads
+            // naturally for both entities today ("page", "menu"); a future entity
+            // whose id doesn't (e.g. an abbreviation) would need a real match here
+            // instead of this direct passthrough.
+            let noun: &str = entity.as_str();
+
             // (value, label) entries: a placeholder for "none", each candidate, and —
             // if the stored id is no longer a candidate (e.g. a page since unpublished)
             // — the stored id itself, so the control still reflects the real value.
             let mut entries: Vec<(String, String)> = Vec::with_capacity(options.len() + 2);
-            entries.push((String::new(), "\u{2014} Select a page \u{2014}".to_owned()));
+            entries.push((String::new(), format!("\u{2014} Select a {noun} \u{2014}")));
             for o in options {
                 entries.push((o.id.to_string(), o.label.clone()));
             }
             if let Some(id) = current_id
                 && !options.iter().any(|o| o.id == id)
             {
-                entries.push((id.to_string(), format!("Page #{id} (not published)")));
+                // "page" keeps its exact original reason — a page's publish state
+                // is real, and this IS what "unpublished since this was saved"
+                // looks like. Every OTHER entity gets an entity-neutral reason: a
+                // menu, for one, has no publish-state concept at all (see
+                // `resolve_entity_options`'s own doc in `setting_refs.rs`), so
+                // "(not published)" would be a wrong REASON, not just a wrong noun.
+                let reason = if entity.as_str() == "page" {
+                    "not published"
+                } else {
+                    "unavailable"
+                };
+                let mut noun_chars = noun.chars();
+                let noun_cap = match noun_chars.next() {
+                    Some(c) => c.to_uppercase().collect::<String>() + noun_chars.as_str(),
+                    None => String::new(),
+                };
+                entries.push((id.to_string(), format!("{noun_cap} #{id} ({reason})")));
             }
             // Natural order + a per-option `selected` bool marking the stored id (mirrors
             // the `Select` arm; rinch reflects the `selected` property so exactly one is

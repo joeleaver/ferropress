@@ -5140,21 +5140,60 @@ async fn widget_endpoints_require_manage_widgets_capability() {
     let tmp = tempfile::tempdir().unwrap();
     let (_store, state) = boot(tmp.path());
     seed_user(&_store, "sub", "hunter2hunter2", "subscriber").await;
-    let cookie = login_cookie(&state, "sub").await;
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let sub_cookie = login_cookie(&state, "sub").await;
+    let ed_cookie = login_cookie(&state, "ed").await;
 
-    let (st, _b) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let (st, _b) = do_json(&state, "GET", "/admin/api/widgets", &sub_cookie, None).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    let (st, _b) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let (st, _b) = create_widget(&state, &sub_cookie, "sidebar", "text", None, None).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     let (st, _b) = do_json(
         &state,
         "PUT",
         "/admin/api/widgets/order",
-        &cookie,
+        &sub_cookie,
         Some(serde_json::json!({})),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // The two DESTRUCTIVE per-widget routes — real widget, real body (so the
+    // capability check, not a 400/404 on malformed input, is what fires).
+    let (_st, created) =
+        create_widget(&state, &ed_cookie, "sidebar", "text", Some("Orig"), None).await;
+    let id = created["id"].as_u64().unwrap();
+
+    let (st, _b) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/widgets/{id}"),
+        &sub_cookie,
+        Some(serde_json::json!({ "expected_rev": 0, "title": "Hijacked", "config": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _b) = do_json(
+        &state,
+        "DELETE",
+        &format!("/admin/api/widgets/{id}"),
+        &sub_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Prove both were true no-ops, not just status-coded: the widget still
+    // exists, unrenamed, at its original rev.
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &ed_cookie, None).await;
+    let row = dto["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"].as_u64().unwrap() == id)
+        .expect("the widget still exists — DELETE was a no-op");
+    assert_eq!(row["title"], "Orig", "PUT was a no-op: {dto}");
+    assert_eq!(row["rev"], 0, "PUT was a no-op: {dto}");
 }
 
 #[tokio::test]
@@ -5203,6 +5242,32 @@ async fn widget_update_refuses_a_stale_expected_rev_and_writes_nothing() {
     );
 }
 
+/// PUT/DELETE `/admin/api/widgets/{id}` for an id that never existed → 404 —
+/// pins the explicit get-first shape both handlers document. The PUT body is
+/// well-formed (`config: {}` against the `text` kind coerces cleanly) so the
+/// store `get` is actually reached and asserting 404 (never 409) also pins
+/// that the existence check precedes the `expected_rev` check.
+#[tokio::test]
+async fn missing_widget_id_404s_on_update_and_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/999999",
+        &cookie,
+        Some(serde_json::json!({ "expected_rev": 0, "title": "x", "config": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+
+    let (st, body) = do_json(&state, "DELETE", "/admin/api/widgets/999999", &cookie, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{body}");
+}
+
 #[tokio::test]
 async fn order_put_rejects_an_unknown_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5221,6 +5286,82 @@ async fn order_put_rejects_an_unknown_id() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// The order PUT's third documented structural 400: an id listed more than
+/// once ANYWHERE in the body — twice within one area, or once in each of two
+/// areas (the ambiguous-destination shape) — is refused, and the refusal
+/// applies nothing.
+#[tokio::test]
+async fn order_put_rejects_a_duplicated_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, w) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let w_id = w["id"].as_u64().unwrap();
+
+    // Twice within one area.
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "sidebar": [w_id, w_id] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("more than once"),
+        "{body}"
+    );
+
+    // Once in each of two areas — the ambiguous-destination shape.
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "sidebar": [w_id], "other": [w_id] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+    // Neither refused write applied anything.
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let row = &dto["widgets"].as_array().unwrap()[0];
+    assert_eq!(row["area"], "sidebar", "{dto}");
+    assert_eq!(row["widget_order"], 0, "{dto}");
+}
+
+/// F4: two raw body keys that TRIM to the same area key must 400, not let the
+/// later one silently overwrite the earlier one's list (which could strand a
+/// legal move-in from an area neither raw key names).
+#[tokio::test]
+async fn order_put_rejects_a_post_trim_duplicate_area_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, a) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let (_st, b) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let a_id = a["id"].as_u64().unwrap();
+    let b_id = b["id"].as_u64().unwrap();
+
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "sidebar": [a_id], " sidebar": [b_id] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
 #[tokio::test]
 async fn order_put_400s_when_a_listed_area_is_missing_a_current_member() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5233,27 +5374,38 @@ async fn order_put_400s_when_a_listed_area_is_missing_a_current_member() {
     let a_id = a["id"].as_u64().unwrap();
     let b_id = b["id"].as_u64().unwrap();
 
-    // Lists "sidebar" but omits `b` — as if the client's view were stale.
+    // Lists "sidebar" but omits `a` (currently at order 0) — as if the
+    // client's view were stale. Listing `b` (not `a`) is deliberate: applying
+    // this body would move `b` from order 1 to order 0, an OBSERVABLE change
+    // — listing `a` instead would be a no-op even if wrongly applied (`a` is
+    // already at order 0), making the "untouched" assertion below vacuous.
     let (st, body) = do_json(
         &state,
         "PUT",
         "/admin/api/widgets/order",
         &cookie,
-        Some(serde_json::json!({ "sidebar": [a_id] })),
+        Some(serde_json::json!({ "sidebar": [b_id] })),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
 
     let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
-    let ids: Vec<u64> = dto["widgets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w["id"].as_u64().unwrap())
-        .collect();
-    assert!(
-        ids.contains(&a_id) && ids.contains(&b_id),
-        "neither widget was touched by the refused write: {dto}"
+    let widgets = dto["widgets"].as_array().unwrap();
+    let row = |id: u64| {
+        widgets
+            .iter()
+            .find(|w| w["id"].as_u64().unwrap() == id)
+            .unwrap()
+    };
+    assert_eq!(
+        (row(a_id)["area"].clone(), row(a_id)["widget_order"].clone()),
+        (serde_json::json!("sidebar"), serde_json::json!(0)),
+        "the refused write must not have moved a: {dto}"
+    );
+    assert_eq!(
+        (row(b_id)["area"].clone(), row(b_id)["widget_order"].clone()),
+        (serde_json::json!("sidebar"), serde_json::json!(1)),
+        "the refused write must not have moved b: {dto}"
     );
 }
 
@@ -5289,16 +5441,33 @@ async fn order_put_catches_a_concurrent_add_rather_than_silently_dropping_it() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
 
+    // Full untouched state, not just presence: applying the stale
+    // `{"sidebar": [b_id, a_id]}` body would swap a/b's widget_order (a:0→1,
+    // b:1→0) while leaving c's own (area, widget_order) alone — presence
+    // checks alone can't tell a validate-before-apply refusal from a
+    // fully-applied-then-400'd one, since this endpoint never deletes.
     let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
-    let ids: Vec<u64> = dto["widgets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w["id"].as_u64().unwrap())
-        .collect();
-    assert!(
-        ids.contains(&c_id),
-        "the concurrently-created widget must survive the refused stale reorder: {dto}"
+    let widgets = dto["widgets"].as_array().unwrap();
+    let row = |id: u64| {
+        widgets
+            .iter()
+            .find(|w| w["id"].as_u64().unwrap() == id)
+            .unwrap()
+    };
+    assert_eq!(
+        (row(a_id)["area"].clone(), row(a_id)["widget_order"].clone()),
+        (serde_json::json!("sidebar"), serde_json::json!(0)),
+        "the refused write must not have moved a: {dto}"
+    );
+    assert_eq!(
+        (row(b_id)["area"].clone(), row(b_id)["widget_order"].clone()),
+        (serde_json::json!("sidebar"), serde_json::json!(1)),
+        "the refused write must not have moved b: {dto}"
+    );
+    assert_eq!(
+        (row(c_id)["area"].clone(), row(c_id)["widget_order"].clone()),
+        (serde_json::json!("sidebar"), serde_json::json!(2)),
+        "the concurrently-created widget must survive the refused stale reorder untouched: {dto}"
     );
 }
 
@@ -5421,6 +5590,18 @@ async fn oversized_custom_html_is_rejected_pre_sanitize() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    // The MESSAGE pins which of the two caps fired: this payload is
+    // size-preserved by sanitization (plain "a"s, nothing to strip or
+    // entity-encode), so it ALSO exceeds the post-sanitize cap — without this
+    // assertion, deleting the pre-sanitize guard entirely would still leave
+    // this "_pre_sanitize"-named test green via the post-sanitize one.
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("custom HTML must be at most"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -5444,6 +5625,16 @@ async fn custom_html_that_expands_past_the_cap_after_sanitizing_is_rejected() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    // Symmetric with the pre-sanitize test's message pin — self-verifying
+    // that THIS test's intent (the post-sanitize guard) is what actually
+    // fired, even though 20,000 raw bytes can never trip the pre-cap anyway.
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sanitized HTML exceeds"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -5612,6 +5803,128 @@ async fn empty_schema_kinds_accept_absent_or_empty_config() {
     }
 }
 
+/// MF11's document-replace contract (F2): stored config := schema defaults
+/// OVERLAID WITH the coerced submission — never `coerce_values`' bare merge
+/// output, which leaves an absent key at its stored/default value and an
+/// unknown key untouched. A partial submission to a MULTI-field kind
+/// (`recent_posts`) is the shape that distinguishes the two: replace fills the
+/// un-submitted `show_date` in from the schema default; a bare merge would
+/// leave it simply absent from the map.
+#[tokio::test]
+async fn create_document_replaces_a_partial_config_with_defaults_filled_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, created) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "recent_posts",
+        None,
+        Some(serde_json::json!({ "count": 9 })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    assert_eq!(
+        created["config"],
+        serde_json::json!({ "count": 9, "show_date": false }),
+        "the un-submitted show_date must be filled in from the schema default"
+    );
+
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let row = &dto["widgets"].as_array().unwrap()[0];
+    assert_eq!(
+        row["config"],
+        serde_json::json!({ "count": 9, "show_date": false }),
+        "the STORED row must match the create response exactly: {dto}"
+    );
+}
+
+/// An absent `config` on create (no body key at all) coerces against an EMPTY
+/// submitted map, so the stored config is exactly the schema defaults.
+#[tokio::test]
+async fn create_with_absent_config_stores_exactly_the_schema_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, created) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    assert_eq!(created["config"], serde_json::json!({ "content": "" }));
+}
+
+/// A GHOST key (one the schema doesn't declare) in the submission must be
+/// dropped, never persisted — `coerce_values` already ignores unknown keys,
+/// but this pins it through the FULL document-replace path with full-object
+/// equality (not a per-key `contains`, which a stray extra key would still
+/// pass).
+#[tokio::test]
+async fn create_drops_a_ghost_key_not_declared_by_the_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, created) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "text",
+        None,
+        Some(serde_json::json!({ "content": "x", "ghost": "y" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    assert_eq!(
+        created["config"],
+        serde_json::json!({ "content": "x" }),
+        "a key the schema doesn't declare must not survive — full-object equality, \
+         not a per-key contains"
+    );
+}
+
+/// PUT's config is a document-REPLACE, not a merge: overwriting a widget that
+/// currently stores `{"content": "hello"}` with `config: {}` must clear
+/// `content` back to its schema default, never preserve the old value.
+#[tokio::test]
+async fn update_document_replaces_config_rather_than_merging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, created) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "text",
+        None,
+        Some(serde_json::json!({ "content": "hello" })),
+    )
+    .await;
+    let id = created["id"].as_u64().unwrap();
+    assert_eq!(created["config"], serde_json::json!({ "content": "hello" }));
+
+    let (st, updated) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/widgets/{id}"),
+        &cookie,
+        Some(serde_json::json!({ "expected_rev": 0, "title": "", "config": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{updated}");
+    assert_eq!(
+        updated["config"],
+        serde_json::json!({ "content": "" }),
+        "an empty config PUT must REPLACE the stored content, not merge over it (leaving \
+         \"hello\")"
+    );
+}
+
 /// MF4's admin half end-to-end: the `nav_menu` kind's `EntityRef("menu")` option
 /// list is available even with ZERO nav_menu widgets yet (schema-derived, not
 /// row-derived), and a widget referencing a menu round-trips through create.
@@ -5652,4 +5965,58 @@ async fn composite_get_refs_expose_menu_options_for_nav_menu_kind() {
     .await;
     assert_eq!(st, StatusCode::OK, "{created}");
     assert_eq!(created["config"]["menu"].as_u64(), Some(menu_id));
+}
+
+/// The row-derived MediaPicker half of the refs sidecar: an `image` widget's
+/// stored `media` id resolves into `refs.media` as `{id, url}` (the Inc-3
+/// SPA's thumbnail source); a DANGLING media id (never seeded / since
+/// deleted) is simply ABSENT from `refs.media` rather than erroring.
+#[tokio::test]
+async fn composite_get_refs_expose_media_for_image_kind_and_omit_a_dangling_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let media_id = seed_media(&store, "018f3c2a-7b19-7c44-9e0d-2a1f6b8e5d90")
+        .await
+        .0;
+
+    let (st, created) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "image",
+        None,
+        Some(serde_json::json!({ "media": media_id })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+
+    // A SECOND image widget referencing a media id that was never seeded.
+    let dangling_id: u64 = 999999;
+    let (st, _b) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "image",
+        None,
+        Some(serde_json::json!({ "media": dangling_id })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let media_refs = &dto["refs"]["media"];
+    let entry = &media_refs[media_id.to_string()];
+    assert_eq!(entry["id"].as_u64(), Some(media_id), "{dto}");
+    assert_eq!(
+        entry["url"].as_str(),
+        Some("/media/018f3c2a-7b19-7c44-9e0d-2a1f6b8e5d90"),
+        "{dto}"
+    );
+    assert!(
+        media_refs.get(dangling_id.to_string()).is_none(),
+        "a dangling media id must be ABSENT from refs.media, not erroring: {dto}"
+    );
 }

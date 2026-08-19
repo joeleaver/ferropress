@@ -266,11 +266,15 @@ pub async fn create(
             "the area {area:?} may hold at most {MAX_WIDGETS_PER_AREA} widgets"
         )));
     }
+    // `saturating_add` defends a poisoned row (widget_order == i32::MAX, only
+    // reachable out-of-band — the API itself can never write past 50 per area)
+    // from panicking a debug build or wrapping to i32::MIN in release, which
+    // would silently render the "appended" widget FIRST after the next sort.
     let next_order = in_area
         .iter()
         .map(|o| i32_field(o, "widget_order"))
         .max()
-        .map_or(0, |m| m + 1);
+        .map_or(0, |m| m.saturating_add(1));
 
     let mut fields: FieldMap = FieldMap::new();
     fields.insert("area".to_owned(), Value::String(area.clone()));
@@ -428,7 +432,14 @@ pub async fn reorder(
                 )));
             }
         }
-        validated.insert(area, ids.clone());
+        // Two raw keys that TRIM to the same area (e.g. "sidebar" and " sidebar")
+        // must not silently let the later one clobber the earlier one's list —
+        // that would apply only half the body while returning 200.
+        if validated.insert(area.clone(), ids.clone()).is_some() {
+            return Err(AdminError::BadRequest(format!(
+                "area {area:?} appears more than once in the request"
+            )));
+        }
     }
 
     let _guard = state.widget_lock.lock().await;

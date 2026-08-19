@@ -159,6 +159,13 @@ mod tests {
         // the scheme, so it resolves to plain "javascript:" either way.
         let out = sanitize_widget_html("<a href=\"java\tscript:alert(1)\">go</a>");
         assert!(!out.contains("javascript:"), "{out}");
+        // The tab survives html5ever's serializer, so "javascript:" (contiguous)
+        // never literally appears in the output EVEN IF the href passed through
+        // completely unsanitized — that "contains" check alone is vacuous here
+        // (unlike the untabbed literal in `javascript_and_data_hrefs_are_rejected`).
+        // The real sanitizer drops the href attribute outright; a pass-through
+        // regression would retain it, so this is what actually catches the bypass.
+        assert!(!out.contains("href="), "{out}");
         let out = sanitize_widget_html("<iframe src=\"java\tscript:alert(1)\"></iframe>");
         assert!(!out.contains("javascript:"), "{out}");
         assert!(!out.contains("src="), "{out}");

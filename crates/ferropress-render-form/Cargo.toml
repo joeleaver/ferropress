@@ -3,14 +3,14 @@ name = "ferropress-render-form"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The declarative form-schema DATA + validation layer (site settings; plugin config later). rinch-free by design — the single WidgetKind→edit-UI dispatch lives in the excluded ferropress-form-view crate."
+description = "The declarative form-schema DATA + validation layer (site settings; plugin config later). rinch-free by design — the single ControlKind→edit-UI dispatch lives in the excluded ferropress-form-view crate."
 
 [lints]
 workspace = true
 
 [dependencies]
 # rinch-free by design: this crate holds only the serde schema DATA + the
-# untrusted-input validation. The one WidgetKind→rinch dispatch lives in the
+# untrusted-input validation. The one ControlKind→rinch dispatch lives in the
 # EXCLUDED `ferropress-form-view` crate (rinch is banned from workspace members).
 # ferropress-core supplies `is_safe_href` for URL-format validation.
 ferropress-core = { workspace = true }
