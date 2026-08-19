@@ -37,7 +37,7 @@ use ferropress_render_form::{
     ControlKind, Field, FormSchema, FormSection, SettingRefs, TextFormat,
 };
 
-use crate::values::FormValues;
+use crate::values::{FormValues, OnFormChange};
 
 /// The sink the host invokes with a picked media's `(object id, /media/{uuid} URL)`.
 pub type MediaChosen = Rc<dyn Fn(u64, String)>;
@@ -103,14 +103,23 @@ fn opt_node(value: Option<String>, build: impl FnOnce(String) -> NodeHandle) -> 
 /// current values, and resolved `refs` from `GET /admin/api/settings`; read
 /// `values.snapshot()` on Save. `on_pick_media` wires the `MediaPicker` widget to the
 /// host's file-dialog + upload + library modal (see [`OnPickMedia`]); pass `None`
-/// when a schema uses no `MediaPicker` (the button then no-ops).
+/// when a schema uses no `MediaPicker` (the button then no-ops). `notify` (MF15) fires
+/// on every field write — a host wires it into an unsaved-changes ("dirty") `Signal`;
+/// pass [`OnFormChange::default`] when a form doesn't need one.
 #[component]
 pub fn SchemaForm(
     schema: FormSchema,
     values: FormValues,
     refs: SettingRefs,
     media_picker: OnPickMedia,
+    notify: OnFormChange,
 ) -> NodeHandle {
+    // Install the change-notify listener on THIS mount's `FormValues` handle —
+    // `set` (the single write choke point every field ends up calling) fires it on
+    // every subsequent write. Plain setup code, not reactive: the component body
+    // runs once, so this runs once, before any field ever writes.
+    values.set_notify(notify);
+
     // One reactive state signal per field, seeded from the current value. Created at
     // build time (a component body is a reactive scope). Drives radio/toggle checked
     // and visible_when WITHOUT making text inputs reactive.

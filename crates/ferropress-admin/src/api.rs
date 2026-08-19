@@ -275,7 +275,8 @@ pub enum ApiError {
 /// parse failure (a malformed response body) or a request-BODY construction
 /// failure (`.json(&body)`/`.body(form)`) — both indicate an actual bug, not a
 /// connectivity problem, and stay as `{e}` for that signal.
-const NETWORK_ERROR: &str = "Couldn't reach the server \u{2014} check your connection and try again.";
+const NETWORK_ERROR: &str =
+    "Couldn't reach the server \u{2014} check your connection and try again.";
 
 /// Classify a non-2xx response: a 401 is a session problem, anything else carries
 /// its message.

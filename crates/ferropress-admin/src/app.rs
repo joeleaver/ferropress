@@ -19,7 +19,7 @@ use rinch_web::{Editor, EditorHandle, create_editor};
 use wasm_bindgen_futures::spawn_local;
 
 use ferropress_editor_bridge as bridge;
-use ferropress_form_view::{FormValues, MediaChosen, OnPickMedia, SchemaForm};
+use ferropress_form_view::{FormValues, MediaChosen, OnFormChange, OnPickMedia, SchemaForm};
 use ferropress_render_form::{FormSchema, SettingRefs};
 
 use crate::api::{self, LinkTarget, PostSummary, UserDto};
@@ -1441,6 +1441,11 @@ pub fn app() -> NodeHandle {
                                 values: values,
                                 refs: settings_refs.get(),
                                 media_picker: on_pick_media.get(),
+                                // No-op (MF15): the settings/plugin-config view has no
+                                // dirty guard today (unlike the menu/term editors' own
+                                // beforeunload wiring); this only keeps the call site
+                                // compiling against the new required prop.
+                                notify: OnFormChange::default(),
                             },
                             _ => span {},
                         }
@@ -3704,12 +3709,8 @@ mod tests {
         // ("Engine Room") but never clicked Save — the term's REAL stored
         // name/parent (what the server will actually re-home children under)
         // is still "Sea Stories" / id 1 ("Fiction").
-        let (name, parent) = resolve_delete_term_identity(
-            3,
-            &list,
-            "Renamed In Progress".to_owned(),
-            Some(2),
-        );
+        let (name, parent) =
+            resolve_delete_term_identity(3, &list, "Renamed In Progress".to_owned(), Some(2));
         assert_eq!(name, "Sea Stories");
         assert_eq!(parent, Some(1));
     }
@@ -3717,7 +3718,8 @@ mod tests {
     #[test]
     fn delete_term_identity_falls_back_to_live_when_the_term_is_not_in_the_loaded_list() {
         let list = vec![term(1, "Fiction", None)];
-        let (name, parent) = resolve_delete_term_identity(99, &list, "Only Known Locally".to_owned(), Some(1));
+        let (name, parent) =
+            resolve_delete_term_identity(99, &list, "Only Known Locally".to_owned(), Some(1));
         assert_eq!(name, "Only Known Locally");
         assert_eq!(parent, Some(1));
     }
@@ -3733,7 +3735,9 @@ mod tests {
         );
         assert_eq!(
             msg.as_deref(),
-            Some("Only one category can be assigned to this post \u{2014} uncheck the extras and save again.")
+            Some(
+                "Only one category can be assigned to this post \u{2014} uncheck the extras and save again."
+            )
         );
     }
 
@@ -3745,7 +3749,9 @@ mod tests {
         );
         assert_eq!(
             msg.as_deref(),
-            Some("Only one item can be assigned to this post \u{2014} uncheck the extras and save again.")
+            Some(
+                "Only one item can be assigned to this post \u{2014} uncheck the extras and save again."
+            )
         );
     }
 
@@ -3951,9 +3957,9 @@ fn install_tag_buffer_guard(terms: TermsCtx) {
                     // OUTCOME announced, and "selected, not yet removed" is
                     // itself an outcome the user needs confirmed before
                     // they commit to a second press.
-                    terms
-                        .live_announce
-                        .set(format!("{candidate_name} selected \u{2014} press Backspace again to remove"));
+                    terms.live_announce.set(format!(
+                        "{candidate_name} selected \u{2014} press Backspace again to remove"
+                    ));
                 }
             }
             "ArrowDown" | "ArrowUp" => {
@@ -6116,7 +6122,8 @@ fn delete_term_clicked(tv: TermsViewCtx) {
     // children to the term's REAL stored parent regardless, so a confirm
     // built from the dirty edit would promise a destination the delete
     // won't actually honor. See `resolve_delete_term_identity`'s own doc.
-    let (name, parent) = resolve_delete_term_identity(id, &list, tv.edit_name.get(), tv.edit_parent.get());
+    let (name, parent) =
+        resolve_delete_term_identity(id, &list, tv.edit_name.get(), tv.edit_parent.get());
     // SF14e: name the taxonomy actually being deleted — a Tag's confirm must
     // not say "category". The taxonomy's OWN `label` is already its natural
     // plural (WP convention — "Categories"/"Tags"), so the plural noun is
