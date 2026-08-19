@@ -47,6 +47,7 @@ mod setting_refs;
 mod setting_store;
 pub mod settings;
 pub mod terms;
+pub mod widgets;
 
 #[cfg(test)]
 mod tests;
@@ -353,6 +354,21 @@ pub fn api_routes() -> Router<AppState> {
             get(media::list)
                 .post(media::upload)
                 .layer(DefaultBodyLimit::max(media::MAX_UPLOAD_BYTES + (1 << 20))),
+        )
+        // Widgets: the composite cold-session GET + the split write contract (per-
+        // widget create/update/delete, one whole-board order PUT). Gated on
+        // `ManageWidgets` (Editor+). `MAX_WIDGET_CONFIG_BYTES` (128 KiB) and every
+        // other write's payload (an id-list order PUT, a single widget's title+
+        // config) sit comfortably under axum's default 2 MiB body limit, so — unlike
+        // media above — no route-level `DefaultBodyLimit` override is needed here.
+        .route(
+            "/admin/api/widgets",
+            get(widgets::composite_get).post(widgets::create),
+        )
+        .route("/admin/api/widgets/order", put(widgets::reorder))
+        .route(
+            "/admin/api/widgets/{id}",
+            put(widgets::update).delete(widgets::delete),
         )
 }
 

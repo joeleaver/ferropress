@@ -151,6 +151,18 @@ pub struct AppState {
     /// is never combined with either. Term/page edits are rare, so this is
     /// near-uncontended.
     pub taxonomy_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `Widget`-mutating admin writes (per-widget create/update/delete +
+    /// the whole-board order PUT) so the capacity caps (`MAX_WIDGETS_PER_AREA`/
+    /// `MAX_WIDGETS_TOTAL`) and the order PUT's structural checks are atomic w.r.t.
+    /// a concurrent widget write. ISOLATED — a `Widget` has NO relations, so it
+    /// touches no page, term, or menu row: this lock is NEVER acquired nested with
+    /// [`hierarchy_lock`](Self::hierarchy_lock), [`taxonomy_lock`](Self::taxonomy_lock),
+    /// or [`menu_lock`](Self::menu_lock), and none of those three is ever acquired
+    /// while holding this one — the ONE sanctioned nesting remains
+    /// `hierarchy_lock` → `taxonomy_lock` documented above; this lock joins the
+    /// lock set as a fourth, independent leaf. Widget edits are rare, so this is
+    /// near-uncontended.
+    pub widget_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -176,6 +188,7 @@ impl AppState {
             hierarchy_lock: Arc::new(tokio::sync::Mutex::new(())),
             menu_lock: Arc::new(tokio::sync::Mutex::new(())),
             taxonomy_lock: Arc::new(tokio::sync::Mutex::new(())),
+            widget_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

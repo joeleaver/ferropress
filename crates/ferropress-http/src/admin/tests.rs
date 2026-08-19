@@ -17,7 +17,7 @@ use ferropress_core::store::RhypeStore;
 use ferropress_core::value::{FieldMap, ObjectId, TypeName, Value, now_millis};
 use ferropress_core::{
     Block, BlockKind, BlockTree, Edge, InlineRun, MEDIA_TYPE, PAGE_TYPE, POST_TYPE, REDIRECT_TYPE,
-    SETTING_TYPE, Status, USER_TYPE,
+    SETTING_TYPE, Status, USER_TYPE, WIDGET_TYPE,
 };
 
 use ferropress_blob_localfs::LocalFsBlobStore;
@@ -5008,4 +5008,648 @@ async fn a_page_move_does_not_record_a_redirect_from_an_archive_owned_path() {
             .any(|(from, _)| from == "/category/fiction"),
         "a redirect must NOT be recorded from a path a live term archive owns; redirects: {redirects:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Widgets: the split write contract (Increment 1 backend, S4)
+// ---------------------------------------------------------------------------
+
+/// Seed a `Widget` row DIRECTLY via the store (bypassing the admin API's kind
+/// registry check) — the unknown-kind-row shape MF9 requires the composite GET
+/// to surface, never filter.
+async fn seed_widget_direct(
+    store: &Arc<dyn RhypeStore>,
+    area: &str,
+    widget_order: i32,
+    kind: &str,
+    title: &str,
+    config: serde_json::Value,
+) -> ObjectId {
+    let mut f: FieldMap = HashMap::new();
+    f.insert("area".to_owned(), Value::String(area.to_owned()));
+    f.insert("widget_order".to_owned(), Value::I32(widget_order));
+    f.insert("kind".to_owned(), Value::String(kind.to_owned()));
+    f.insert("title".to_owned(), Value::String(title.to_owned()));
+    f.insert("config".to_owned(), Value::Json(config));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    store
+        .create(&TypeName::from(WIDGET_TYPE), f)
+        .await
+        .expect("seed widget")
+}
+
+/// `POST /admin/api/widgets` through the real API.
+async fn create_widget(
+    state: &AppState,
+    cookie: &str,
+    area: &str,
+    kind: &str,
+    title: Option<&str>,
+    config: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut body = serde_json::json!({ "area": area, "kind": kind });
+    if let Some(t) = title {
+        body["title"] = serde_json::json!(t);
+    }
+    if let Some(c) = config {
+        body["config"] = c;
+    }
+    do_json(state, "POST", "/admin/api/widgets", cookie, Some(body)).await
+}
+
+#[tokio::test]
+async fn widget_crud_roundtrip_and_composite_get_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, created) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "text",
+        Some("My Widget"),
+        Some(serde_json::json!({ "content": "hello" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    assert_eq!(created["area"], "sidebar");
+    assert_eq!(created["kind"], "text");
+    assert_eq!(created["title"], "My Widget");
+    assert_eq!(created["widget_order"], 0);
+    assert_eq!(
+        created["rev"], 0,
+        "no settle-touch: a Widget has no relation to settle"
+    );
+    assert_eq!(created["config"]["content"], "hello");
+    let id = created["id"].as_u64().unwrap();
+
+    let (st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    assert_eq!(st, StatusCode::OK, "{dto}");
+    let widgets = dto["widgets"].as_array().unwrap();
+    assert_eq!(widgets.len(), 1);
+    assert_eq!(widgets[0]["id"].as_u64().unwrap(), id);
+    assert_eq!(dto["kinds"].as_array().unwrap().len(), 12, "{dto}");
+
+    let areas = dto["areas"].as_array().unwrap();
+    let inactive = areas.iter().find(|a| a["key"] == "_inactive").unwrap();
+    assert_eq!(inactive["system"], true);
+    assert_eq!(inactive["declared"], false);
+    assert_eq!(inactive["label"], "Inactive");
+    // A widget's own area isn't theme-declared yet (Inc 1 has no
+    // theme.widget_areas() seam plugged in) — surfaced as stranded, not hidden.
+    let sidebar_row = areas.iter().find(|a| a["key"] == "sidebar").unwrap();
+    assert_eq!(sidebar_row["declared"], false);
+    assert_eq!(sidebar_row["system"], false);
+
+    let (st, updated) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/widgets/{id}"),
+        &cookie,
+        Some(
+            serde_json::json!({ "expected_rev": 0, "title": "Renamed", "config": { "content": "updated" } }),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{updated}");
+    assert_eq!(updated["title"], "Renamed");
+    assert_eq!(updated["config"]["content"], "updated");
+    assert_eq!(updated["rev"], 1);
+    // title+config PUT never touches area/widget_order.
+    assert_eq!(updated["area"], "sidebar");
+    assert_eq!(updated["widget_order"], 0);
+
+    let (st, _b) = do_json(
+        &state,
+        "DELETE",
+        &format!("/admin/api/widgets/{id}"),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(dto["widgets"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn widget_endpoints_require_manage_widgets_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "sub", "hunter2hunter2", "subscriber").await;
+    let cookie = login_cookie(&state, "sub").await;
+
+    let (st, _b) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _b) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _b) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn widget_update_refuses_a_stale_expected_rev_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, created) =
+        create_widget(&state, &cookie, "sidebar", "text", Some("Orig"), None).await;
+    let id = created["id"].as_u64().unwrap();
+    assert_eq!(created["rev"], 0);
+
+    let (st, updated) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/widgets/{id}"),
+        &cookie,
+        Some(serde_json::json!({ "expected_rev": 0, "title": "First edit", "config": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{updated}");
+    assert_eq!(updated["rev"], 1);
+
+    // The SAME stale rev (0) again — refused, 409, unchanged.
+    let (st, conflict) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/widgets/{id}"),
+        &cookie,
+        Some(serde_json::json!({ "expected_rev": 0, "title": "Stale write", "config": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{conflict}");
+
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let row = &dto["widgets"].as_array().unwrap()[0];
+    assert_eq!(
+        row["title"], "First edit",
+        "a stale-rev write must NOT have applied: {dto}"
+    );
+    assert_eq!(
+        row["rev"], 1,
+        "a refused write must not advance the rev: {dto}"
+    );
+}
+
+#[tokio::test]
+async fn order_put_rejects_an_unknown_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "sidebar": [999999] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn order_put_400s_when_a_listed_area_is_missing_a_current_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, a) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let (_st, b) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let a_id = a["id"].as_u64().unwrap();
+    let b_id = b["id"].as_u64().unwrap();
+
+    // Lists "sidebar" but omits `b` — as if the client's view were stale.
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "sidebar": [a_id] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let ids: Vec<u64> = dto["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["id"].as_u64().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&a_id) && ids.contains(&b_id),
+        "neither widget was touched by the refused write: {dto}"
+    );
+}
+
+/// The concurrent-admin shape: admin 2's order-PUT body is built from a view
+/// that predates admin 1's concurrent create of a third widget in the SAME
+/// area — refused (400), never a silent delete of the widget admin 2 never saw.
+#[tokio::test]
+async fn order_put_catches_a_concurrent_add_rather_than_silently_dropping_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, a) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let (_st, b) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let a_id = a["id"].as_u64().unwrap();
+    let b_id = b["id"].as_u64().unwrap();
+
+    // Admin 2's body, captured from the two-widget view — BEFORE admin 1's
+    // concurrent create below.
+    let stale_order_body = serde_json::json!({ "sidebar": [b_id, a_id] });
+
+    let (_st, c) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let c_id = c["id"].as_u64().unwrap();
+
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(stale_order_body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let ids: Vec<u64> = dto["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["id"].as_u64().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&c_id),
+        "the concurrently-created widget must survive the refused stale reorder: {dto}"
+    );
+}
+
+#[tokio::test]
+async fn order_put_moves_across_areas_atomically_and_renumbers_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, a1) = create_widget(&state, &cookie, "a", "text", None, None).await;
+    let (_st, a2) = create_widget(&state, &cookie, "a", "text", None, None).await;
+    let (_st, b1) = create_widget(&state, &cookie, "b", "text", None, None).await;
+    let a1_id = a1["id"].as_u64().unwrap();
+    let a2_id = a2["id"].as_u64().unwrap();
+    let b1_id = b1["id"].as_u64().unwrap();
+
+    // Move a2 from "a" into "b" (ahead of b1), one body covering both areas.
+    let (st, board) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "a": [a1_id], "b": [a2_id, b1_id] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{board}");
+
+    let rows = board.as_array().unwrap();
+    let by_id = |id: u64| {
+        rows.iter()
+            .find(|w| w["id"].as_u64().unwrap() == id)
+            .unwrap()
+    };
+    assert_eq!(by_id(a1_id)["area"], "a");
+    assert_eq!(by_id(a1_id)["widget_order"], 0);
+    assert_eq!(by_id(a2_id)["area"], "b");
+    assert_eq!(by_id(a2_id)["widget_order"], 0);
+    assert_eq!(by_id(b1_id)["area"], "b");
+    assert_eq!(by_id(b1_id)["widget_order"], 1);
+    assert_eq!(rows.len(), 3, "nothing lost: {board}");
+}
+
+#[tokio::test]
+async fn order_put_moves_to_inactive_and_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (_st, w) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    let id = w["id"].as_u64().unwrap();
+
+    let (st, board) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "sidebar": [], "_inactive": [id] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{board}");
+    let row = board
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"].as_u64().unwrap() == id)
+        .unwrap();
+    assert_eq!(row["area"], "_inactive");
+    assert_eq!(row["widget_order"], 0);
+
+    let (st, board) = do_json(
+        &state,
+        "PUT",
+        "/admin/api/widgets/order",
+        &cookie,
+        Some(serde_json::json!({ "_inactive": [], "sidebar": [id] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{board}");
+    let row = board
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"].as_u64().unwrap() == id)
+        .unwrap();
+    assert_eq!(row["area"], "sidebar");
+}
+
+#[tokio::test]
+async fn the_51st_widget_in_an_area_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    for i in 0..50 {
+        let (st, body) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+        assert_eq!(st, StatusCode::OK, "widget {i}: {body}");
+    }
+    let (st, body) = create_widget(&state, &cookie, "sidebar", "text", None, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn oversized_custom_html_is_rejected_pre_sanitize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let huge = "a".repeat(64 * 1024 + 1);
+    let (st, body) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "custom_html",
+        None,
+        Some(serde_json::json!({ "html": huge })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn custom_html_that_expands_past_the_cap_after_sanitizing_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    // Bare `&` entity-encodes to `&amp;` on sanitize (a 5x expansion), so this
+    // stays under the 64 KiB PRE-sanitize cap but crosses it AFTER — exactly the
+    // "sanitization can expand via entity-encoding" hazard MF17 calls out.
+    let raw = "&".repeat(20_000); // 20 KB raw -> up to 100 KB sanitized
+    let (st, body) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "custom_html",
+        None,
+        Some(serde_json::json!({ "html": raw })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn custom_html_sanitizer_strips_a_script_and_the_response_matches_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, created) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "custom_html",
+        None,
+        Some(serde_json::json!({ "html": "<p>hi</p><script>alert(1)</script>" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    let html = created["config"]["html"].as_str().unwrap();
+    assert!(!html.contains("<script"), "{html}");
+    assert!(html.contains("<p>hi</p>"), "{html}");
+
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let row = &dto["widgets"].as_array().unwrap()[0];
+    assert_eq!(
+        row["config"]["html"], created["config"]["html"],
+        "the stored row must match the create response exactly"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_kind_row_is_returned_not_filtered_and_only_deletable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let id = seed_widget_direct(
+        &store,
+        "sidebar",
+        0,
+        "some_future_kind",
+        "Mystery",
+        serde_json::json!({ "whatever": "stays intact" }),
+    )
+    .await;
+
+    let (st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    assert_eq!(st, StatusCode::OK, "{dto}");
+    let row = dto["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"].as_u64().unwrap() == id.0)
+        .expect("an unknown-kind row is present, never filtered out");
+    assert_eq!(row["kind"], "some_future_kind");
+    assert_eq!(row["config"]["whatever"], "stays intact");
+
+    // It cannot be edited...
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/widgets/{}", id.0),
+        &cookie,
+        Some(serde_json::json!({ "expected_rev": 0, "title": "Y", "config": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+    // ...but it CAN always be deleted.
+    let (st, _b) = do_json(
+        &state,
+        "DELETE",
+        &format!("/admin/api/widgets/{}", id.0),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn area_key_hygiene_is_enforced_on_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let too_long = "a".repeat(101);
+    for bad in ["", "   ", too_long.as_str(), "café", "_other"] {
+        let (st, body) = create_widget(&state, &cookie, bad, "text", None, None).await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "area {bad:?} should be rejected: {body}"
+        );
+    }
+    // `_inactive` is the ONE accepted `_`-prefixed key.
+    let (st, body) = create_widget(&state, &cookie, "_inactive", "text", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn create_rejects_a_kind_outside_the_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let (st, body) = create_widget(&state, &cookie, "sidebar", "not_a_real_kind", None, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn title_over_the_length_cap_is_rejected_on_create_and_update() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let long_title = "x".repeat(201);
+    let (st, body) =
+        create_widget(&state, &cookie, "sidebar", "text", Some(&long_title), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+    let (_st, created) = create_widget(&state, &cookie, "sidebar", "text", Some("ok"), None).await;
+    let id = created["id"].as_u64().unwrap();
+    let (st, body) = do_json(
+        &state,
+        "PUT",
+        &format!("/admin/api/widgets/{id}"),
+        &cookie,
+        Some(serde_json::json!({ "expected_rev": 0, "title": long_title, "config": {} })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// pages/search/meta declare EMPTY schemas — document-replace over an empty
+/// schema must yield an empty stored config and accept an absent OR an explicit
+/// empty submitted config without error (never a coerce/validation failure).
+#[tokio::test]
+async fn empty_schema_kinds_accept_absent_or_empty_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, state) = boot(tmp.path());
+    seed_user(&_store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    for kind in ["pages", "search", "meta"] {
+        let (st, created) = create_widget(&state, &cookie, "sidebar", kind, None, None).await;
+        assert_eq!(st, StatusCode::OK, "{kind} (absent config): {created}");
+        assert_eq!(created["config"], serde_json::json!({}), "{kind}");
+
+        let (st, created2) = create_widget(
+            &state,
+            &cookie,
+            "sidebar",
+            kind,
+            None,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{kind} (empty config): {created2}");
+        assert_eq!(created2["config"], serde_json::json!({}), "{kind}");
+    }
+}
+
+/// MF4's admin half end-to-end: the `nav_menu` kind's `EntityRef("menu")` option
+/// list is available even with ZERO nav_menu widgets yet (schema-derived, not
+/// row-derived), and a widget referencing a menu round-trips through create.
+#[tokio::test]
+async fn composite_get_refs_expose_menu_options_for_nav_menu_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, state) = boot(tmp.path());
+    seed_user(&store, "ed", "hunter2hunter2", "editor").await;
+    let cookie = login_cookie(&state, "ed").await;
+
+    let mut f: FieldMap = HashMap::new();
+    f.insert("slug".to_owned(), Value::String("primary".to_owned()));
+    f.insert("name".to_owned(), Value::String("Primary".to_owned()));
+    f.insert("meta".to_owned(), Value::Json(serde_json::json!({})));
+    let menu_id = store
+        .create(&TypeName::from(ferropress_core::MENU_TYPE), f)
+        .await
+        .unwrap()
+        .0;
+
+    let (_st, dto) = do_json(&state, "GET", "/admin/api/widgets", &cookie, None).await;
+    let options = dto["refs"]["entity_options"]["menu"]
+        .as_array()
+        .expect("menu options are present with zero nav_menu widgets");
+    assert!(
+        options.iter().any(|o| o["id"].as_u64() == Some(menu_id)),
+        "{dto}"
+    );
+
+    let (st, created) = create_widget(
+        &state,
+        &cookie,
+        "sidebar",
+        "nav_menu",
+        None,
+        Some(serde_json::json!({ "menu": menu_id })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    assert_eq!(created["config"]["menu"].as_u64(), Some(menu_id));
 }

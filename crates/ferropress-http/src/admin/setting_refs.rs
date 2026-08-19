@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value as JsonValue};
 
 use ferropress_core::value::{ObjectId, TypeName};
-use ferropress_core::{CoreError, MEDIA_TYPE, PAGE_TYPE, Status, media_url};
+use ferropress_core::{CoreError, MEDIA_TYPE, MENU_TYPE, PAGE_TYPE, Status, media_url};
 use ferropress_render_form::{ControlKind, EntityOption, FormSchema, MediaRef, SettingRefs};
 
 use super::settings::SettingsDto;
@@ -45,7 +45,13 @@ pub(crate) async fn build_settings_dto(
 /// Resolve every id-valued widget the schema declares: the candidate list behind each
 /// distinct `EntityRef` entity, and the display data for each `MediaPicker` value
 /// currently set. Fields whose widget is neither are ignored.
-async fn resolve_refs(
+///
+/// `pub(crate)` (not just called via [`build_settings_dto`]) so `admin::widgets`'s
+/// composite GET can route its own `refs` sidecar through this SAME resolver (MF4
+/// admin half) — a widget's config uses the identical bare-id `EntityRef`/
+/// `MediaPicker` encoding settings/plugin config does, so there is exactly one
+/// place that ever turns an id into a display option.
+pub(crate) async fn resolve_refs(
     state: &AppState,
     schema: &FormSchema,
     values: &Map<String, JsonValue>,
@@ -89,10 +95,13 @@ async fn resolve_refs(
     })
 }
 
-/// The pickable options for an `EntityRef` entity. Only `"page"` is supported today:
-/// the PUBLISHED pages (the only ones that render as a public front page), labelled by
-/// title, ordered for a stable list. An unsupported entity yields an empty list, so
-/// the control renders with no choices rather than erroring.
+/// The pickable options for an `EntityRef` entity: `"page"` (the PUBLISHED pages —
+/// the only ones that render as a public front page) or `"menu"` (EVERY nav menu,
+/// unfiltered — a `Widget`'s Nav Menu kind has no publish-state concept the way a
+/// front-page target does; a menu with no items or no location assignment is still
+/// a legal pick, and simply composes to nothing per the widgets design's totality
+/// rule). Both labelled for a stable, deterministic list. An unsupported entity
+/// yields an empty list, so the control renders with no choices rather than erroring.
 async fn resolve_entity_options(
     state: &AppState,
     entity: &str,
@@ -115,6 +124,20 @@ async fn resolve_entity_options(
             opts.sort_by(|a, b| a.label.cmp(&b.label).then(a.id.cmp(&b.id)));
             Ok(opts)
         }
+        "menu" => {
+            let mut opts: Vec<EntityOption> = state
+                .store
+                .scan(&TypeName::from(MENU_TYPE))
+                .await?
+                .iter()
+                .map(|o| EntityOption {
+                    id: o.id.0,
+                    label: menu_label(o),
+                })
+                .collect();
+            opts.sort_by(|a, b| a.label.cmp(&b.label).then(a.id.cmp(&b.id)));
+            Ok(opts)
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -129,6 +152,18 @@ fn page_label(obj: &ferropress_core::value::Object) -> String {
     match str_field(obj, "slug") {
         Some(slug) if !slug.is_empty() => format!("/{slug}"),
         _ => format!("Page #{}", obj.id.0),
+    }
+}
+
+/// A display label for a menu option: its name, falling back to its slug then id.
+fn menu_label(obj: &ferropress_core::value::Object) -> String {
+    let name = str_field(obj, "name").unwrap_or_default();
+    if !name.trim().is_empty() {
+        return name;
+    }
+    match str_field(obj, "slug") {
+        Some(slug) if !slug.is_empty() => slug,
+        _ => format!("Menu #{}", obj.id.0),
     }
 }
 
